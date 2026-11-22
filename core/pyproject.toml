@@ -1,0 +1,29 @@
+[project]
+name = "shiyuan-core"
+version = "0.1.0"
+description = "拾源本地知识工作台 Knowledge Core：授权目录、L0 资产目录与文件名/路径检索"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+shiyuan-core = "shiyuan.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["shiyuan*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

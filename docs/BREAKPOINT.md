@@ -1,0 +1,322 @@
+# 开发断点文档
+
+更新：2026-11-22
+
+## 一、当前基准（已验证）
+
+日常迭代方式（2026-11-22 起）：先只改网页版，用 `cd core && python -m shiyuan` +
+`cd desktop && npm run dev`（http://localhost:1420）验证；**仅在用户明确要求时**才重新打
+PyInstaller sidecar 与 Tauri 安装包。
+
+| 项 | 状态 | 证据 |
+| --- | --- | --- |
+| PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
+| Core 单元/集成测试 | 113 passed | `cd core && python -m pytest -q` |
+| 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
+| 前端单元测试 | 6 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
+| Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
+| 桌面端启动 | 通过 | `npm run tauri dev` 打开窗口「拾源」，WebView2 正常调用 `/api/health`、`/api/stats` |
+| 桌面端安装包 | 完成 | `Shiyuan_0.1.0_x64-setup.exe`（180.2MiB，含多格式解析、监听、OCR 双引擎、PP-OCRv6 small 与 MCP `--mcp` 模式），静默安装后启动可自动拉起 core（`/api/health` 返回 200） |
+
+## 二、已实现范围（M1）
+
+### 数据层（`core/shiyuan/db.py`）
+SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_versions`、
+`source_scan_runs`、`maintenance_events`。PRD §7.1 中的 `parse_artifacts`、`chunks`、
+`index_jobs`、`user_decisions` **故意未建**，避免空表造成"已实现"的错觉。
+
+### 扫描（`core/shiyuan/scanner.py`）
+- 手动/启动触发的完整对账，无实时监听。
+- 同盘移动/改名：按 `st_dev:st_ino` 复用同一 `asset_id`（`asset_locations` 原地更新路径）。
+- 修改：写入新 `content_versions` 行，旧行 `is_current=0`；≤32MB 计算 sha256，更大文件仅存元数据指纹并带 `meta:` 前缀。
+- 删除 → `MISSING`；数据源不可达 → 全部 `OFFLINE` 且不删除记录。
+- 符号链接 / junction 一律跳过，路径必须先通过 `relative_to(root)` 校验。
+
+### 检索（`core/shiyuan/search.py`）
+只用 SQLite `instr(lower(path), token)` 做多关键词 AND 匹配，再在 Python 内打分排序
+（文件名精确 > 前缀 > 包含 > 路径包含）。未引入 FTS5：M1 没有内容层，引入只会增加无人使用的表。
+
+### 接口（`core/shiyuan/api.py`）
+`GET /api/health`、`GET/POST /api/sources`、`POST /api/sources/{id}/scan`、
+`POST /api/sources/{id}/state`、`DELETE /api/sources/{id}`、`GET /api/search`、
+`GET /api/stats`、`GET /api/events`。只监听 127.0.0.1，CORS 白名单仅本地端口。
+
+### 桌面端（`desktop/`）
+两个一级页面，减少导航层级：
+- **检索与对话**：内部分「找文件 / 知识对话」标签；两个视图常驻，切换不会丢失查询结果或对话状态。
+  对话输入区用 sticky 固定在视口底部，消息滚动时不会把输入框推走；会话列表固定在列顶。
+- **数据源与维护**：内部分「数据源 / 维护」标签，分别承载授权目录操作与统计、覆盖、失败任务、维护日志。
+
+浏览器模式与 Tauri 模式通过 `src/tauri.ts` 分流。`src/App.test.tsx` 覆盖：两个一级导航、
+检索/对话与数据源/维护的标签切换、视图常驻不卸载、composer 位于消息列表之后且样式为 sticky、
+切回对话时滚动到最新消息。
+
+### 内容层（M3）
+- `extractors.py`：TXT/MD/代码按文本解码（utf-8 → gb18030 回退）；DOCX 含表格；PDF 按页用 pypdf
+  取文本层；XLSX/XLSM 按工作表取非空行。单文件上限 64MB、总字符上限 200 万。
+- `indexer.py`：`parse_artifacts` + `chunks` + `chunk_fts`（FTS5 trigram）。缓存键为
+  `version_id + PARSER_SIGNATURE`；同一资产只在当前版本上保留块，重建前清除旧版本缓存。
+- 无文本层（扫描件）写入 `state='empty'`，界面显示"无文本层"，绝不伪装成已全文检索。
+- 扫描结束后在同一后台线程继续 `index_pending`，L0 结果先可见，L1 随后补齐。
+- 检索 `search.py`：关键词全部 ≥3 字符走 FTS5，否则退化为 `instr(lower(...))` LIKE 扫描
+  （中文两字词、英文短词可命中，但语料大时更慢）；结果合并后给出 `match`、`snippet`、`page`、`sheet`。
+- 撤权时 `store._purge_content_cache` 同步删除 FTS / chunks / artifacts。
+
+### 解析覆盖扩展（2026-11-22）
+- PDF 主解析换成 PyMuPDF（pypdf 兜底）。单页有效文本少于 8 字符，或替换字符/私用区字符
+  超过 5%，视为异常页并留空，交给 L2 OCR——混合 PDF 因此能逐页补识别。
+- DOCX：正文段落 + 表格 + 页眉/页脚 + 批注（python-docx 1.2 的 comments API）。
+- PPTX：按幻灯片提取形状文字、表格与备注，页码即幻灯片序号；图片内文字由 L2 OCR 补齐。
+- XLSX/XLSM：计算值与公式原文同时保留（`值〔公式：=...〕`），按行拼接单元格，保留行列关系。
+- DOC/PPT/XLS：运行时自动发现 LibreOffice（`SHIYUAN_SOFFICE` 可覆盖，其次 PATH / 注册表 /
+  Program Files），转成 OOXML 到系统临时目录后复用上面的解析器；XLS 转换失败时回退 xlrd，
+  其余转换失败记 `failed`，不碰原件。本机 LibreOffice：`D:\1Bio_Soft\LibreOffice`。
+- PPTX 内嵌图片 OCR：L1 记录 `parse_artifacts.image_count`，L2 按幻灯片识别图片文字
+  （单文件最多 20 张、单张 20MB），结果带幻灯片页码，使用独立 OCR 签名，不使已有 PDF/图片 OCR 失效。
+- 压缩包 ZIP/7Z/RAR：只在临时目录解压，限制 300 个条目、单文件 64MB、总解压 128MB、
+  嵌套 2 层、单包最多解析 20 个文件；拒绝路径穿越、符号链接与加密包，按 SHA-256 去重。
+  RAR 通过 unrar 或系统 bsdtar（Windows 自带 `tar.exe`）解压。
+- EML/MSG：主题、发件人、收件人、时间、纯文本正文（无纯文本时回退 HTML）、附件与嵌套邮件
+  （最多 20 个附件、2 层嵌套）；附件复用压缩包的安全解析与去重逻辑。
+- CAD：DXF 提取图层文字、MTEXT、标注与块属性；DWG 需要 ODA File Converter，
+  通过 `SHIYUAN_ODA_CONVERTER` 指定后自动转 DXF。
+- 音视频：mutagen 读取时长、码率、采样率、分辨率与常用标签，**不转写**；上限 2GB。
+  支持 MP3/FLAC/WAV/M4A/AAC/OGG/OPUS/WMA/AIFF 与 MP4/MOV/WMV 等，其他容器显式报错。
+- 解析签名升级为 `l1.v4`，旧索引在下次「重建正文索引」或重新扫描时自动重解析。
+- 依赖新增：`pymupdf`、`python-pptx`、`xlrd`、`py7zr`、`rarfile`、`extract-msg`、`ezdxf`、`mutagen`。
+
+## 三、当前状态与已知缺口
+
+1. ~~**Python core 需要手动启动**~~：已由 M5 解决。`core/sidecar.py` 经 PyInstaller 打成单文件
+   `shiyuan-core.exe`，Tauri 通过 `bundle.externalBin` 随安装包分发；release 启动时探测
+   `127.0.0.1:8737`，无监听才 spawn sidecar，`RunEvent::Exit` 时 `kill`。开发模式仍不托管。
+2. **单文件 sidecar 启动有解包延迟**：onefile 每次启动需解压到临时目录，首次 `/api/health`
+   约 5–10 秒才可用；前端 10 秒轮询可自行恢复，但窗口初始会显示「未连接」。
+3. **强制结束桌面端会残留核心**：任务管理器结束进程不触发 `RunEvent::Exit`，sidecar 会继续
+   监听 8737；下次启动会复用它（不重复拉起），但用户无法从界面关闭该后台进程。
+4. **数据目录与安装目录分离**：`APP_DIR_NAME` 改为 `ShiyuanData`，避免 NSIS 卸载处理
+   `%LOCALAPPDATA%\Shiyuan` 时波及知识库；README 与文档中的路径已同步。
+5. **扫描进度不可见**：`_running` 是进程内集合，界面只能看到"扫描中"与上次结果；重启会丢失运行态。
+6. **API 默认端口写死 8737**：仅 `SHIYUAN_PORT` 可改，前端代理与 sidecar 探测未同步。
+7. **大文件哈希为元数据指纹**：`meta:size=...;mtime_ns=...` 不能证明内容相同，后续做重复分析时必须排除。
+8. **目录级事件回退整源对账**：新建/删除/改名文件夹时无法只看路径，会触发一次完整扫描；
+   超大目录或网络盘上那次同步会明显变慢。
+9. **网络盘 / SMB 未实测**：watchdog 在共享盘上的事件可靠性未知，目前主要依赖
+   `SHIYUAN_RECONCILE_SECONDS`（默认 600 秒）周期对账兜底。
+10. **MinGW 不支持中文绝对路径**：`ld.exe` / `windres` 按 ANSI 解析 UTF-8 路径，链接期报
+    `cannot find ...rlib: No error`。已用两条措施绕开：构建时把 target 目录放到 ASCII 路径
+    （`CARGO_TARGET_DIR`），`build.rs` 把 `icons/icon.ico` 复制到 `OUT_DIR` 再引用。
+    彻底方案是换 MSVC 工具链。
+11. **短关键词退化为 LIKE 全表扫描**：FTS5 trigram 只索引 ≥3 字符的子串，`样本` 这类两字词
+    走 `instr(lower(text))`，块数量大时会明显变慢；后续可加 bigram 或按需短词索引。
+12. **预算只按文件数计**：默认 500 / 200 个文件/天（`SHIYUAN_DAILY_*_BUDGET`，0 为不限），
+    不统计耗时与字符数；低质量判断是启发式（替换字符占比），只对 PDF 追加 OCR。
+13. **解析覆盖边界**：PDF 复杂版面（多栏、公式、表格结构）仍按纯文本处理，未接 Surya/MinerU；
+    PPTX 只识别位图文字，SmartArt/图表内文字与 EMF/WMF 图片暂不处理；压缩包内只索引支持的类型，
+    不做二进制 MIME 嗅探；MKV/AVI/WebM/FLV 等容器 mutagen 不支持，音视频一律不转写。
+    DOC/PPT/XLS 依赖本机 LibreOffice，RAR 依赖 unrar/bsdtar，DWG 依赖 ODA 转换器；
+    缺少外部工具时相应文件会显式失败（不静默跳过）。
+14. **API Key 明文存储**：唯一防线是 Windows 用户目录权限，未接入系统凭据库或加密；接口不回显只是表面约束。
+15. **对话仍是单轮检索**：会话与历史消息已持久化，但提问不会把上一轮消息作为上下文，
+    追问「那第二个文件呢」仍然无法解析指代。
+16. **语义召回依赖外部服务**：向量由 OpenAI 兼容接口或本机 Ollama 生成，没有内置模型；
+    未开启时行为与纯关键词一致。余弦比对是内存全量扫描，无 ANN 索引，块数上万后会变慢；
+    自定义同义词需手动配置，跨语言提问仍偏弱。
+17. **引用只校验编号**：能发现"没引用"和"引用了不存在的编号"，但无法证明每句话都忠于证据；
+    云端接口失败时直接报错，不会自动降级到本地摘录。
+18. **Windows OCR 依赖系统语言包**：图片与文本 PDF 仍用 Windows OCR；没有中文语言包时这部分不可用，
+    扫描 PDF 可由随包的 RapidOCR 兜底。
+19. **OCR 只保留行坐标**：`chunks.bbox` 有每行 `[x,y,w,h]`，但没有版面/表格结构还原，前端暂不绘制；
+    手写与低质量扫描识别率低；图片无页码，只有行坐标。
+20. **OCR 有单轮上限**：一次最多 200 个文件、每份 PDF 最多 30 页，超出需再次触发；没有预算调度。
+21. **OCR 引擎已可选，但能力仍有限**：`auto` 下整份扫描 PDF 用 PP-OCRv6 small，图片与文本型 PDF 仍是
+    Windows OCR；无手写专项、表格结构与版面还原；RapidOCR 约为 Windows 的 12 倍耗时、3 倍内存。
+22. **向量补建占用扫描线程**：扫描结束后在同一线程里继续 `index_pending` 与 `index_pending_embeddings`，
+    外部接口慢时会明显拉长"扫描中"时间；没有并发限速、失败重试与费用估算。
+23. **MCP 已合入核心 exe**：`shiyuan-core.exe --mcp` 提供 stdio，桌面端默认仍走 HTTP；
+    `--noconsole` 下依赖客户端用管道启动（本机已验证），不再需要单独 exe。
+    MCP 只读、无认证，只走本机 stdio，不应直接暴露为网络服务。
+
+### 数据源合并
+- `store.plan_source_add` 判断新目录与现有授权的关系：
+  - `existing`：同一目录，直接复用；
+  - `covered`：新目录在已授权目录内，返回最近的上级；
+  - `merge`：新目录包含一个或多个已授权子目录，需要合并；
+  - `new`：互不包含。
+- `store.add_source_merged`：新增上级目录时，把子数据源的 `asset_locations.source_id` 改到上级、
+  重算 `rel_path`、把 `index_jobs.source_id` 一并迁移，再删除子 `sources` 行；
+  原文件不动，内容缓存与向量继续复用。排除规则取并集。
+- API `POST /api/sources` 返回 `created / covered_by / merged`；监听器会取消子目录订阅、
+  改为监听上级目录。若子数据源正在扫描，返回 409，避免迁移中并发写库。
+- 前端「数据源」在添加后提示“已自动合并 N 个下级目录到「…」”或“已包含在现有授权中”。
+
+### 实时监听与增量同步（M2）
+- `watcher.py`：watchdog `Observer` 按数据源订阅；事件进入 `PendingBatch`，安静 1.5 秒或累计
+  10 秒后统一处理；目录事件（新建/删除/改名）回退为整源 `scan_source`。
+- `scanner.py` 重构出 `_plan_ops`，完整对账与 `sync_paths` 共用同一套归因（新增/修改/移动/恢复）；
+  `scan_in_background` 用 `request_scan` 保证同一数据源不并发写库，手动扫描与监听器共用。
+- STALE：事件批次处理时先 `store.mark_stale`，同步成功且内容未变则 `restore_location` 恢复
+  AVAILABLE（不产生新版本），内容变化则走 update 写新版本；同步失败保持 STALE，检索不会返回旧内容。
+- 周期对账线程按 `SHIYUAN_RECONCILE_SECONDS`（默认 600）对所有 active 源触发完整对账；
+  `SHIYUAN_WATCH=0` 可整体关闭监听（测试用此开关保证确定性）。
+- 维护日志新增 `watch_started / watch_stopped / watch_failed / sync_completed / sync_failed`。
+
+### 问答与引用（M4）
+- `answer.py`：把问题拆成英文词 + 中文三元组（FTS5 需要 ≥3 字符），先走 FTS `OR` 召回，
+  再在 Python 里按"命中单元数"排序；长问题要求 ≥2 个单元，过严时退回 1 个。
+  每文件最多取 2 块，默认 6 条证据。
+- 三种回答方式：`extractive`（默认，本地摘录，不联网）、`openai`（OpenAI 兼容 /chat/completions）、
+  `ollama`（本机 /api/chat）。云端必须 `allow_cloud=true` 且有 key/model，否则 502 并说明原因。
+- 只发送入选证据（每条 ≤900 字、总量 ≤8000 字），不发送完整文件；HTTP 用标准库 urllib，30 秒超时。
+- 拒答：没有证据时返回 `refused=true / reason=no_evidence`，并附当前内容覆盖（已解析 / 待解析）。
+- 引用校验：正则提取 [n]，缺失时提示"未引用任何证据"，越界编号列入 warning；回答为空视为失败。
+- 设置存 `app_settings`（JSON）；`GET /api/settings/answer` 只返回 `has_key`，永不回显密钥。
+- 前端「对话」视图：单轮提问、回答正文、来源卡片（文件名/页码/工作表/片段/打开）、回答设置面板。
+
+### 对话管理
+- 表：`chat_sessions(session_id, title, created_at, updated_at)`、
+  `chat_messages(message_id, session_id, role, content, payload, created_at)`；
+  `payload` 存助手完整 `AnswerResult`（含引用、覆盖、警告），删除会话级联删除消息。
+- 接口：`GET/POST /api/chat/sessions`、`GET/PATCH/DELETE /api/chat/sessions/{id}`；
+  `POST /api/ask` 增加可选 `session_id`，成功后在服务端保存一轮问答并返回 `session_id`。
+- 标题：首轮提问自动截取（最多 24 字）；可手动改名。
+- 前端「知识对话」：左侧会话列表（新建/切换/改名/删除），右侧按时间渲染历史问答与引用；
+  当前会话 ID 存在 `localStorage["shiyuan.chat.active"]`，切换视图或重进页面后保持选中。
+- 竞态保护：初始会话加载用请求序号与 `initialLoadRef`，用户先点击时不会被异步初始化覆盖。
+- 局限：历史会保存，但提问不带上一轮上下文，仍是单轮检索。
+
+### 多模态与 OCR（M5 补充）
+- 双引擎：`Windows OCR`（系统自带）与 `RapidOCR + PP-OCRv6 small`（随包分发，约 30MB 模型 + onnxruntime）。
+  系统默认仍是 Windows OCR；RapidOCR 只用于“整份扫描 PDF”，图片与文本型 PDF 继续走 Windows。
+- 策略 `app_settings.ocr.policy`：
+  - `auto`（默认）：整份扫描 PDF（`text_pages=0`）→ RapidOCR，缺页/文本型 PDF 与图片 → Windows；
+  - `windows`：全部 Windows OCR；
+  - `rapidocr`：全部 RapidOCR（不可用时回退 Windows）。
+  引擎在文件级路由，L2 签名区分：`l2.v2:windows-ocr:...` / `l2.v2:rapidocr-v6-small:...`。
+- 图片：`BitmapDecoder` 解码后直接识别；RapidOCR 图片/PDF 也走同一 `Section` 管道。
+  PDF：Windows 用 `Windows.Data.Pdf` 渲染，RapidOCR 用 `pypdfium2` 渲染每页，单文件最多 30 页。
+- 识别结果按行归一化（去掉汉字间空格、`1 e-5` → `1e-5`），并保留每行像素坐标
+  `[x, y, w, h]`（`chunks.bbox`，JSON 数组）。
+- 倾斜阅读顺序：RapidOCR 对倾斜长行可能拆成多段并按视觉位置返回；`order_rapid_items`
+  用行的平均角度把坐标旋转到水平系，按基线聚类后再按 x 排序。
+- 混合版式 PDF：L1 记录 `page_count / text_pages`，OCR 只补“缺少文本层”的页
+  （`skip_pages` 为已有文本层的页码）；整份 PDF 文本层质量低时仍全页重识别。
+- 触发方式：`POST /api/sources/{id}/ocr`（界面「OCR 深解析」）。与扫描共用 `scanner.request_scan`，
+  同一数据源不并发；单轮最多处理 200 个文件，剩余数量写回 stats，可再次触发。
+- 设置接口：`GET/PUT /api/settings/ocr`，返回策略与两个引擎的可用性；健康页可切换并显示状态。
+- 覆盖率新增 `ocr_indexed / ocr_pending / ocr_empty / ocr_failed / mixed_pdf / ocr_policy /
+  ocr_available / ocr_engine / ocr_languages`；`mixed_pdf` 只统计 `text_pages > 0`
+  的部分缺页 PDF，整份无文本层的文档归入 `ocr_pending`。
+- 离线引擎基准（2026-11-21，6 张合成样本，本机）：Windows OCR 平均 CER 12.3%、55ms/页、166MB 峰值；
+  RapidOCR + PP-OCRv6 small 平均 CER 0%、646ms/页、547MB 峰值、冷启动 1.6s。
+  Windows OCR 主要输在表格阅读顺序与数字/标点（如 `0.05` → `0·05`）。
+
+### 知识库管理（M6）
+- `index_jobs` 任务账本：每个 `(version_id, stage)` 一条记录，stage 为 `l1` / `l2`，
+  记录 status（running / done / failed / pending）、attempts、error、updated_at。
+  任务只在真正开始解析时 attempts +1。
+- 失败自动重试：每次 `index_pending` / `index_ocr_pending` 开始时，删除 attempts < 3 的失败产物
+  并重新排队；达到 3 次后保留失败记录，等待手动重试。
+- `maintenance.py` 四种操作（均可指定 source_id，也支持全部 active 源）：
+  - `reindex`：清空 L1 产物与 l1 任务，按当前文件重建正文索引；
+  - `retry`：删除失败产物、attempts 归零，重跑 L1 + L2；
+  - `ocr`：清空 L2 产物与 l2 任务，重跑 OCR；
+  - `cleanup`：删除非当前版本的 artifacts / chunks / fts 与孤立任务。
+  操作在后台单线程串行执行，每个源都先 `scanner.request_scan`，避免与扫描并发写库。
+- 接口：`POST /api/maintenance/{reindex|retry|ocr|cleanup}?source_id=`（202），
+  状态与缓存统计并入 `GET /api/stats` 的 `maintenance` 字段
+  （jobs 计数、chunks、artifacts、db_bytes、running）。
+- 前端健康页新增「知识库管理」面板：失败/排队任务、缓存块数、数据库大小、今日预算，
+  四个操作按钮；运行期间按 1.5 秒轮询自动刷新。
+- 每日预算（`budget.py`）：`app_settings.budget` 存 `{date, l1, l2}`，跨天自动归零；
+  `index_pending` / `index_ocr_pending` 开始时按剩余额度处理，超出的留到下一天，并置
+  `budget_exhausted` 写进维护日志。默认 500 / 200 个文件/天，`0` 表示不限。
+- 低质量复核：L1 结果 `quality='low'` 的 PDF 会进入 OCR 候选（与 `state='empty'` 同等对待），
+  OCR 块并入同一检索；覆盖率新增 `low_quality`。
+- 任务列表：`GET /api/jobs?status=&stage=&limit=` 返回任务与文件路径；
+  `POST /api/jobs/{id}/retry` 单文件重试（先清该版本产物、attempts 归零，再只跑这一条），
+  写 `job_retry` 维护日志。健康页「失败任务」面板可逐条重试。
+- 撤权时同步删除该源的 `index_jobs`，不残留任务记录。
+
+### 打包与托管（M5）
+- `core/sidecar.py`：PyInstaller 入口。`--noconsole` 冻结后 `sys.stdout/stderr` 为 `None`，
+  入口先把两者重定向到 `%LOCALAPPDATA%\ShiyuanData\core.log`，否则 uvicorn 日志配置直接崩溃。
+- 单文件构建命令（含 OCR 双引擎）：
+  `python -m PyInstaller --onefile --noconsole --name shiyuan-core --paths core --hidden-import shiyuan.api --hidden-import shiyuan.mcp_server --collect-submodules uvicorn --collect-submodules winsdk --collect-data rapidocr --hidden-import rapidocr.inference_engine.onnxruntime --hidden-import rapidocr.inference_engine.onnxruntime.main --hidden-import rapidocr.inference_engine.onnxruntime.provider_config --collect-binaries onnxruntime --collect-data onnxruntime --exclude-module onnx --exclude-module torch --exclude-module paddle --exclude-module openvino --exclude-module tensorrt --exclude-module jupyter_client --exclude-module ipykernel --exclude-module zmq --exclude-module PyQt5 --exclude-module matplotlib --exclude-module pandas --exclude-module tkinter --collect-all pypdfium2 core/sidecar.py`
+  - **不要用 `--collect-all rapidocr`**：会连带 PyTorch 后端与 CUDA DLL，单文件膨胀到 2.7GB；
+  - 不要收 jupyter/ipykernel/zmq：pyzmq 自带的旧版 `msvcp140/vcruntime140` 会导致
+    `onnxruntime_pybind11_state` 初始化失败（0x8007045A）。
+  - 当前单文件约 185MB；安装包 180.2MiB（含多格式解析、PP-OCRv6 small、onnxruntime 与 MCP 模式）。
+- 产物复制为 `desktop/src-tauri/binaries/shiyuan-core-x86_64-pc-windows-gnu.exe`，
+  `tauri.conf.json` 的 `bundle.externalBin` 引用之（该目录不入库）。
+- 安装版前端 API 基址固定为 `http://127.0.0.1:8737`；不要用相对 `/api`，否则 Tauri 资源服务器
+  会把请求当页面路由并返回 `index.html`，前端报 `Unexpected token '<'`。
+- `src-tauri/src/lib.rs`：release 模式下探测 8737，未监听才 `shell().sidecar("shiyuan-core")`；
+  句柄存 `CoreProcess` 状态，`RunEvent::Exit` 时 `kill`，避免遗留后台服务。
+- 验证：NSIS 静默安装 → 启动 `Shiyuan.exe` → `/api/health` 返回 200 → 静默卸载。
+
+### MCP 服务（`core/shiyuan/mcp_server.py`）
+- stdio JSON-RPC 2.0，支持协议 `2025-06-18 / 2025-03-26 / 2024-11-05`；只读访问桌面端同一个
+  SQLite 库，WAL 下可与桌面端同时运行。不扫描、不解析、不改原件。
+- Tools：`search_knowledge`、`get_document_text`、`list_sources`、`knowledge_stats`；
+  Resources：`shiyuan://sources`、`shiyuan://stats`。
+- 取全文时按类型合并：PDF 缺文本层/低质量页优先用 OCR 块，PPTX 合并幻灯片正文与图片 OCR，
+  其余类型优先 L1；支持按页码 / 工作表过滤与 `max_chars` 截断。
+- 入口：`cd core && python -m shiyuan.mcp_server`；任意目录可用 `python <repo>/core/mcp_server.py`；
+  `--print-config` 输出带当前 Python、core 目录与 `SHIYUAN_HOME` 的客户端配置片段。
+- 已合入 `core/sidecar.py`：`shiyuan-core.exe --mcp` 进入 stdio 模式，默认不带参数仍启动 HTTP 核心；
+  `--noconsole` 冻结后若 `sys.stdin/stdout` 为 None，用 `GetStdHandle` + `open_osfhandle` 兜底管道；
+  冻结模式 `--print-config` 输出 `command=<exe>`、`args=["--mcp"]`。
+  onefile 首次启动需解包，本机实测约 14 秒；MCP 客户端启动超时应设为 ≥30 秒。
+- stdout 只输出协议消息，调试日志走 `SHIYUAN_MCP_DEBUG=1` 的 stderr。
+- 测试 `core/tests/test_mcp.py`：握手、工具、资源、分块选择、stdio 帧、源码/冻结配置（12 项）。
+
+### 召回增强（查询改写 + 可选向量混合召回）
+- `query.py`：`analyze(text)` 返回 `{normalized, core, concepts, variants}`。
+  - 归一化：全角转半角、小写、压缩空白；
+  - 疑问词剥离：先去掉 `？?！!。，,` 等标点，再循环剥离「是多少 / 是什么 / 有哪些 / 怎么 / 如何 / 请问」等尾词；
+  - 概念扩展：英文词、数字、中文 2/3-gram 生成变体；内置同义词表（样本量↔样本数↔样本数量、
+    阈值↔threshold、质控↔QC 等）叠加用户自定义组，组内两两互指，并过滤「的 / 了 / 是」等停用词。
+- `retrieval.py`：统一召回层 `find_chunks()`。变体全部 ≥3 字符时走 FTS5 `OR` 查询，含短词时退化
+  `instr(lower(text), ?)` LIKE OR；再按"命中的概念数 / 变体数"排序，概念数 ≤2 时阈值 1，否则 2。
+  长短变体并存时（如「毒鳍表里有哪些物种」），长词走 FTS、短词（「物种」）再走 LIKE 并合并，
+  避免短词被 FTS5 trigram 的 ≥3 字符限制漏掉。
+  `search` 与 `answer.retrieve` 共用这一层，避免两套评分漂移。
+- 文件名加分：`_name_meta` 在路径命中概念、且命中文件 ≤8 个时，把路径概念数加到正文候选上；
+  问答仍要求正文至少命中 1 个概念，不会仅凭文件名作答。这样「毒鳍表里有哪些物种」能取到
+  `毒鳍.xlsx`，而「量子纠缠实验结论」仍会拒答。
+- `embeddings.py`：`provider = none / openai / ollama`。OpenAI 走 `/embeddings`（需
+  `allow_cloud=true` 与 key），Ollama 默认 `http://127.0.0.1:11434`，优先 `/api/embed`，
+  失败回退 `/api/embeddings`。向量以 float32 BLOB 存 `chunk_embeddings(chunk_id, model, dim, vector)`。
+  - 补建：扫描结束后自动补建；健康页「补建向量索引」与 `POST /api/maintenance/embed` 手动触发。
+  - 清理旧版本时同步删除孤立向量；换模型后旧模型向量不参与检索（按 model 过滤）。
+- 混合合并：关键词与向量结果按 location 去重，相似度转成加分（`120 + similarity*100`），
+  搜索项新增 `semantic` 布尔、`match="semantic"`；响应新增
+  `rewritten / vector_used / vector_model / vector_error`，前端显示"已按改写后的查询「…」检索"。
+  问答证据同样可来自语义命中，引用卡标「语义」。
+- 设置：`GET/PUT /api/settings/embedding`（key 只回显 `has_key`，与回答设置同一套校验逻辑）。
+  默认 `provider=none`，未开启时行为与旧版一致。
+- 自定义同义词：`GET/PUT /api/settings/query`，`app_settings.query` 存 `{custom: [[词, …], …]}`；
+  每组至少 2 个词、单词语长 ≤32、最多 50 组，空组自动丢弃；`query.synonym_map` 把自定义组与
+  内置词表合并（组内互指），搜索与问答共用。前端「对话 → 回答设置 → 自定义同义词」按行编辑。
+- 引用版本与时间：`retrieval.ChunkHit` 与语义命中都带 `version_id / mtime_ns`；
+  `answer.Evidence` 写入 `version_id / mtime`，证据标题追加「更新于 YYYY-MM-DD HH:MM」，
+  引用卡新增 `version_id / mtime`，前端显示「更新于 …」，提示词要求涉及时间条件时说明采用版本。
+- 测试：`core/tests/test_recall.py` 12 项（疑问词剥离/同义词、同义词命中、改写提示、自定义同义词、
+  引用版本时间、授权与密钥隐藏、向量构建计数、语义-only 命中合并、问答语义证据、API 设置与补建、
+  未启用 400、同义词接口校验）。
+
+## 四、禁止操作
+
+- 不要在扫描中删除或重命名用户的原始文件；本项目对用户文件只读。
+- 不要把 `parse_artifacts` / `chunks` 等未实现表提前建出来充数。
+- 不要在 M1 引入向量库或嵌入式模型，先保证目录层可测。
+- 不要绕过 `store.validate_root` 直接写 `sources` 表。
+
+## 五、下一步（建议顺序）
+
+1. 召回增强剩余项：向量 ANN 或本地小模型、跨语言改写、短词索引。
+2. OCR 效果提升：手写识别、表格结构与版面还原、真实扫描件基准；按耗时/预算调度引擎。
+3. 对话增强：多轮上下文、引用跳转与对话导出。
+4. 预算与任务：按耗时/字符数计量、任务取消与优先级、低质量文本的二次解析器。
+5. 打包优化：按需下载 OCR 组件、`--onedir` 资源分发、压缩启动延迟与安装体积。

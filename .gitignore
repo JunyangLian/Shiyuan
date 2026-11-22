@@ -1,0 +1,26 @@
+# node / 前端
+node_modules/
+dist/
+*.local
+
+# rust
+target/
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# pyinstaller 产物
+core/build/
+*.spec
+
+# Tauri sidecar 产物（由 core/dist 复制而来，不入库）
+desktop/src-tauri/binaries/
+
+# 本地数据
+*.db
+*.db-wal
+*.db-shm
