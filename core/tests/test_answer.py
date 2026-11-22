@@ -127,6 +127,37 @@ def test_folder_question_answers_with_subfolder_list(conn, tmp_path):
     assert "2 个可检索文件" in result["answer"]
 
 
+def test_folder_question_prefers_folder_named_in_query(conn, tmp_path):
+    root = tmp_path / "大学"
+    (root / "大二" / "课程A").mkdir(parents=True)
+    (root / "大一" / "1大二课程设计").mkdir(parents=True)
+    (root / "大二" / "课程A" / "笔记.md").write_text("课程A笔记", encoding="utf-8")
+    (root / "大一" / "1大二课程设计" / "代码.java").write_text("class A {}", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "大二有哪些课程")
+
+    assert result["reason"] == "folder_overview"
+    assert "「大二」" in result["answer"]
+    assert "1大二课程设计" not in result["answer"]
+
+
+def test_where_is_file_question_returns_path_hit(conn, tmp_path):
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "课程表.md").write_text("周一 高等数学；周二 大学物理。", encoding="utf-8")
+    (root / "笔记.md").write_text("随手记：今天下雨，课程表还没改。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "我的课程表在哪")
+
+    assert result["citations"][0]["name"] == "课程表.md"
+
+
 def test_howto_question_prefers_readme(conn, tmp_path):
     root = tmp_path / "工具"
     root.mkdir()

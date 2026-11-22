@@ -492,9 +492,12 @@ _FOLDER_INTENT = (
     re.compile(r"^(?=.*(?:里面?|中|内))(?:.*?)(?:有|包括|包含)(?:什么|哪些)"),
 )
 
-# 「放在哪个文件夹 / 存在哪里 / 路径是什么」问的是位置，只按路径命中最稳妥。
+# 「放在哪个文件夹 / 存在哪里 / 课程表在哪」问的是位置，只按路径命中最稳妥。
 _PATH_INTENT = re.compile(
-    r"哪(?:个)?(?:文件夹|目录|盘)|放在哪|存在哪|保存在哪|存放(?:在)?哪|路径|位置在哪"
+    r"哪(?:个)?(?:文件夹|目录|盘)"
+    r"|(?:放在|存放|保存在|存在|放到|存到)(?:了)?哪"
+    r"|(?:文件|资料|表格|图片|课件|报告|作业|试卷|单据|记录|数据|课程表|截图|照片|发票|收据|合同)"
+    r"[^。？?]{0,6}?哪(?:里|儿)?"
 )
 
 
@@ -517,19 +520,22 @@ def _like_prefix(value: str) -> str:
 def _best_folder(conn: sqlite3.Connection, analysis: dict, *,
                  source_id: str | None, ext: str | None) -> retrieval.PathMatch | None:
     matches = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    core = re.sub(r"\s+", "", (analysis.get("core") or "")).lower()
     best: retrieval.PathMatch | None = None
-    best_key: tuple[int, int, int] | None = None
+    best_key: tuple[int, int, int, int] | None = None
     for match in matches.values():
-        if not match.folder_path or not match.folder_specific:
+        if not match.specific_folder_path or not match.specific_folder:
             continue
-        folder = (match.folder or "").lower()
+        folder = (match.specific_folder or "").lower()
         hit_len = 0
         for concept in analysis["concepts"]:
             for variant in concept["variants"]:
                 if (len(variant) >= 2 and variant in folder
                         and not retrieval.is_generic_term(variant)):
                     hit_len = max(hit_len, len(variant))
-        key = (hit_len, -len(folder), match.score)
+        # 「大二有哪些课程」应回到「大二」，而不是名字里恰好连着「大二课程」的子目录。
+        in_query = 1 if folder and folder in core else 0
+        key = (in_query, hit_len, -len(folder), match.score)
         if best_key is None or key > best_key:
             best_key = key
             best = match
@@ -537,7 +543,7 @@ def _best_folder(conn: sqlite3.Connection, analysis: dict, *,
 
 
 def _folder_overview(conn: sqlite3.Connection, match: retrieval.PathMatch) -> str | None:
-    folder = (match.folder_path or "").rstrip("\\/")
+    folder = (match.specific_folder_path or match.folder_path or "").rstrip("\\/")
     if not folder:
         return None
     prefix = folder + "\\"

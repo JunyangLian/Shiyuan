@@ -22,6 +22,7 @@ _GENERIC_PATH_TERMS = {
     "实验", "数据", "记录", "报告", "总结", "笔记", "论文", "文档", "结果",
     "处理", "文件", "资料", "表格", "分析", "研究", "内容", "项目", "工作",
     "附件", "备份", "副本", "新建", "未命名", "图片", "照片",
+    "课程", "科目", "作业", "考试", "试卷", "课件", "讲义", "习题", "章节",
 }
 
 
@@ -123,6 +124,8 @@ class PathMatch:
     specific: bool
     folder_path: str | None = None
     folder_specific: bool = False
+    specific_folder: str | None = None
+    specific_folder_path: str | None = None
 
 
 def _relative_path(path: str, root: str | None) -> str:
@@ -137,7 +140,7 @@ def _relative_path(path: str, root: str | None) -> str:
     return path or ""
 
 
-def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | None, int, bool, bool]:
+def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | None, int, bool, bool, str | None, int]:
     """路径匹配评分：文件夹名与文件名都参与，越深的文件夹命中越具体。
 
     path 应当是数据源内的相对路径；根目录名不参与打分。
@@ -145,7 +148,7 @@ def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | N
     lowered = (path or "").lower()
     parts = [part for part in re.split(r"[\\/]+", lowered) if part]
     if not parts:
-        return 0, 0, 0, False, None, -1, False, False
+        return 0, 0, 0, False, None, -1, False, False, None, -1
     name = parts[-1]
     folders = parts[:-1]
 
@@ -158,6 +161,9 @@ def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | N
     best_folder: str | None = None
     best_folder_index = -1
     best_folder_score = 0.0
+    specific_folder: str | None = None
+    specific_folder_index = -1
+    specific_folder_score = 0.0
 
     for concept in analysis["concepts"]:
         concept_hit = False
@@ -181,6 +187,10 @@ def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | N
                 if variant not in _GENERIC_PATH_TERMS:
                     specific = True
                     folder_specific = True
+                    if weight > specific_folder_score:
+                        specific_folder_score = weight
+                        specific_folder = folder
+                        specific_folder_index = depth
                 if weight > best_folder_score:
                     best_folder_score = weight
                     best_folder = folder
@@ -201,7 +211,8 @@ def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | N
         if len(part) >= 2 and part != core and part in name:
             score += 60
     return (score, matched_concepts, matched_variants, name_matched,
-            best_folder, best_folder_index, specific, folder_specific)
+            best_folder, best_folder_index, specific, folder_specific,
+            specific_folder, specific_folder_index)
 
 
 def path_matches(conn: sqlite3.Connection, analysis: dict, *,
@@ -236,14 +247,17 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
         root = row["root_uri"] or ""
         relative = _relative_path(row["path"], root)
         (score, concepts, matched_variants, name_matched,
-         folder, folder_index, specific, folder_specific) = _path_score(
-            relative, analysis)
+         folder, folder_index, specific, folder_specific,
+         specific_folder, specific_folder_index) = _path_score(relative, analysis)
         if score <= 0:
             continue
-        folder_path = None
-        if folder is not None and folder_index >= 0:
-            parts = [part for part in re.split(r"[\\/]+", relative) if part]
-            folder_path = root.rstrip("\\/") + "\\" + "\\".join(parts[:folder_index + 1])
+        parts = [part for part in re.split(r"[\\/]+", relative) if part]
+
+        def folder_abs(index: int) -> str | None:
+            if index < 0:
+                return None
+            return root.rstrip("\\/") + "\\" + "\\".join(parts[:index + 1])
+
         matches[row["location_id"]] = PathMatch(
             location_id=row["location_id"],
             asset_id=row["asset_id"],
@@ -254,8 +268,10 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
             name_matched=name_matched,
             folder=folder,
             specific=specific,
-            folder_path=folder_path,
+            folder_path=folder_abs(folder_index),
             folder_specific=folder_specific,
+            specific_folder=specific_folder,
+            specific_folder_path=folder_abs(specific_folder_index),
         )
     return matches
 

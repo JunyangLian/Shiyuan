@@ -48,6 +48,7 @@ QUESTION_PHRASES = (
     re.compile(r"为什么"),
     re.compile(r"多少(?:个|份|篇|条|次|张)?"),
     re.compile(r"(?:里面?|中|内)都"),
+    re.compile(r"在?哪(?:里|儿)?$"),
 )
 
 # 句尾方位词不参与检索：「专利里」→「专利」。

@@ -10,7 +10,7 @@
 ```
 core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            数据源、扫描/监听、L1 解析、L2 OCR、检索、问答引用、HTTP 接口
-  tests/              170 项用例：扫描 / 监听 / 索引 / 检索 / 问答 / OCR / 维护 / 召回 / 安全 / 基线
+  tests/              172 项用例：扫描 / 监听 / 索引 / 检索 / 问答 / OCR / 维护 / 召回 / 安全 / 基线
   benchmarks/         10 万级目录扫描基准
 desktop/              Tauri v2 + React + TypeScript 桌面端
   src/                检索与对话、数据源与维护两个整合页面
@@ -210,7 +210,7 @@ MCP 服务不会触发扫描；新文件仍需要先在桌面端完成扫描与�
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 170 passed（另需 pip install pytest httpx）
+cd core; python -m pytest -q          # 172 passed（另需 pip install pytest httpx）
 cd desktop; npm test                  # 14 passed（Vitest + jsdom + Testing Library）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先按上文设置 CARGO_TARGET_DIR
