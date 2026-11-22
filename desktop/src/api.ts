@@ -1,3 +1,5 @@
+import { isTauri } from "./tauri";
+
 export interface ScanRun {
   run_id: string;
   state: "running" | "done" | "failed";
@@ -252,11 +254,60 @@ export interface MaintenanceEvent {
 // 开发模式下同样可用（FastAPI CORS 允许 localhost:1420）。
 const API_BASE = "http://127.0.0.1:8737";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+let apiToken: string | null = null;
+let tokenPromise: Promise<string> | null = null;
+
+const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+async function readApiToken(): Promise<string> {
+  if (apiToken) return apiToken;
+  if (!tokenPromise) {
+    tokenPromise = (async () => {
+      // 安装版 onefile 启动需要解包，给核心最多 30 秒写入令牌。
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        try {
+          let token = "";
+          if (isTauri()) {
+            const { invoke } = await import("@tauri-apps/api/core");
+            token = (await invoke<string>("api_token")).trim();
+          } else {
+            const response = await fetch("/__shiyuan_token", { cache: "no-store" });
+            if (response.ok) token = (await response.text()).trim();
+          }
+          if (token) {
+            apiToken = token;
+            return token;
+          }
+        } catch {
+          /* 核心尚未写入令牌时继续重试 */
+        }
+        await wait(250);
+      }
+      throw new Error("无法获取本地核心访问令牌，请确认桌面端或核心已启动");
+    })();
+  }
+  try {
+    return await tokenPromise;
+  } finally {
+    tokenPromise = null;
+  }
+}
+
+async function request<T>(path: string, init?: RequestInit, retry = true): Promise<T> {
+  const token = await readApiToken();
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+      ...(init?.headers ?? {}),
+    },
   });
+  if (response.status === 401 && retry) {
+    // 核心重启后令牌会变；清缓存并重取一次。
+    apiToken = null;
+    return request<T>(path, init, false);
+  }
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {

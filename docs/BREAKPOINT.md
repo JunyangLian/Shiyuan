@@ -8,15 +8,21 @@
 `cd desktop && npm run dev`（http://localhost:1420）验证；**仅在用户明确要求时**才重新打
 PyInstaller sidecar 与 Tauri 安装包。
 
+本地测试/构建临时目录统一放仓库 `.tmp/`（已 gitignore），不写 C 盘：
+`$env:TMP=$env:TEMP="<repo>\\.tmp\\tmp"`，`$env:PYINSTALLER_CONFIG_DIR="<repo>\\.tmp\\pyinstaller"`；
+`scan_benchmark.py` 默认也使用 `.tmp/scan-*`。
+
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 113 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 124 passed | `cd core && python -m pytest -q` |
+| 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
+| 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
 | 前端单元测试 | 6 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
-| 桌面端启动 | 通过 | `npm run tauri dev` 打开窗口「拾源」，WebView2 正常调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `Shiyuan_0.1.0_x64-setup.exe`（180.2MiB，含多格式解析、监听、OCR 双引擎、PP-OCRv6 small 与 MCP `--mcp` 模式），静默安装后启动可自动拉起 core（`/api/health` 返回 200） |
+| 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
+| 桌面端安装包 | 完成 | `Shiyuan_0.1.0_x64-setup.exe`（180.25MiB，含多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），静默安装后 `/api/health` 无令牌 401、带令牌 200 |
 
 ## 二、已实现范围（M1）
 
@@ -85,18 +91,45 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 - 解析签名升级为 `l1.v4`，旧索引在下次「重建正文索引」或重新扫描时自动重解析。
 - 依赖新增：`pymupdf`、`python-pptx`、`xlrd`、`py7zr`、`rarfile`、`extract-msg`、`ezdxf`、`mutagen`。
 
+### 本机安全与评测基线（2026-11-22）
+- **API 访问令牌**：核心启动时用 `secrets.token_urlsafe(32)` 生成（可用 `SHIYUAN_API_TOKEN` 固定），
+  写入 `app_home/api-token`；`require_api_token` 中间件对除 OPTIONS 外的 `/api/*` 校验
+  `Authorization: Bearer` 或 `X-Shiyuan-Token`，失败返回 401。`SHIYUAN_API_AUTH=0` 仅供测试。
+- **CORS 收紧**：只允许 `http://localhost:1420`、`http://127.0.0.1:1420`、
+  `http://tauri.localhost`、`https://tauri.localhost`、`tauri://localhost`；CORS 作为最外层，
+  401 也带跨域头。测试覆盖无令牌、错令牌、两种头、允许/拒绝来源与 401 的 ACAO。
+- **前端取令牌**：Tauri 新增 `api_token` 命令按 `SHIYUAN_HOME` / `LOCALAPPDATA\ShiyuanData`
+  读取文件；`api.ts` 缓存令牌，401 时清缓存重取一次；浏览器开发模式由 Vite
+  `/__shiyuan_token` 读取同一文件。首次启动最多重试 30 秒。
+- **单实例**：`shiyuan/instance.py` 用命名互斥量 `Local\ShiyuanHttpCore-{port}` 防止两个 HTTP
+  核心同时写令牌；sidecar 与 `python -m shiyuan` 共用，MCP 模式不受影响。
+- **API Key / DPAPI**：`secrets_store.py` 用 `CryptProtectData`（固定 entropy，绑定当前 Windows 用户）
+  加密，密文前缀 `dpapi:v1:`；answer/embedding 读取时解密，保存时加密；启动迁移旧明文并
+  `secure_delete` + `VACUUM`。本机真实库已确认两项均为 `dpapi:v1:`。
+- **扫描 follow-up**：`request_scan` 在忙碌时写 `_followup[source_id]`，`release_scan` 取到后自动
+  再拉起一轮扫描；覆盖「事件晚于本轮枚举」的窗口，测试覆盖忙碌释放与无 pending 两种情况。
+- **检索基线**：`test_retrieval_benchmark.py` 生成 120 篇唯一标记文档、140 道题
+  （40 文件名、40 正文标记、40 中文两字短词、20 自然语言），当前 R@1=1.000、R@5=1.000、MRR=1.000。
+  同时修复了正文命中在最终打分时丢失 `concepts/variants`、同分后被 mtime 排序淹没的问题。
+  该语料是合成唯一标记，不能替代真实用户问句；下一步应补充真实标注。
+- **扫描基线**：`core/benchmarks/scan_benchmark.py --files 2000` 首次 2.12s（943 files/s）、
+  二次 0.56s；默认目录放在仓库 `.tmp/`，不写 C 盘。10 万文件需在本机按需跑。
+- 测试：后端 124 passed（新增 API 认证 3、DPAPI 4、单实例 1、检索基线 1）。
+
 ## 三、当前状态与已知缺口
 
 1. ~~**Python core 需要手动启动**~~：已由 M5 解决。`core/sidecar.py` 经 PyInstaller 打成单文件
    `shiyuan-core.exe`，Tauri 通过 `bundle.externalBin` 随安装包分发；release 启动时探测
    `127.0.0.1:8737`，无监听才 spawn sidecar，`RunEvent::Exit` 时 `kill`。开发模式仍不托管。
 2. **单文件 sidecar 启动有解包延迟**：onefile 每次启动需解压到临时目录，首次 `/api/health`
-   约 5–10 秒才可用；前端 10 秒轮询可自行恢复，但窗口初始会显示「未连接」。
+   约 10–15 秒才可用；前端令牌获取最多重试 30 秒，窗口初始短暂显示「未连接」后自动恢复。
 3. **强制结束桌面端会残留核心**：任务管理器结束进程不触发 `RunEvent::Exit`，sidecar 会继续
-   监听 8737；下次启动会复用它（不重复拉起），但用户无法从界面关闭该后台进程。
+   监听 8737；下次启动会复用它（不重复拉起）。命名互斥量已避免同一端口出现两个 HTTP 核心，
+   但用户仍无法从界面关闭该后台进程。
 4. **数据目录与安装目录分离**：`APP_DIR_NAME` 改为 `ShiyuanData`，避免 NSIS 卸载处理
    `%LOCALAPPDATA%\Shiyuan` 时波及知识库；README 与文档中的路径已同步。
-5. **扫描进度不可见**：`_running` 是进程内集合，界面只能看到"扫描中"与上次结果；重启会丢失运行态。
+5. **扫描进度不可见**：`_running` 与 follow-up 都是进程内状态，界面只能看到"扫描中"与上次结果；
+   重启会丢失运行态；若进程在 follow-up 前崩溃，仍要等周期对账补齐。
 6. **API 默认端口写死 8737**：仅 `SHIYUAN_PORT` 可改，前端代理与 sidecar 探测未同步。
 7. **大文件哈希为元数据指纹**：`meta:size=...;mtime_ns=...` 不能证明内容相同，后续做重复分析时必须排除。
 8. **目录级事件回退整源对账**：新建/删除/改名文件夹时无法只看路径，会触发一次完整扫描；
@@ -116,7 +149,8 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
     不做二进制 MIME 嗅探；MKV/AVI/WebM/FLV 等容器 mutagen 不支持，音视频一律不转写。
     DOC/PPT/XLS 依赖本机 LibreOffice，RAR 依赖 unrar/bsdtar，DWG 依赖 ODA 转换器；
     缺少外部工具时相应文件会显式失败（不静默跳过）。
-14. **API Key 明文存储**：唯一防线是 Windows 用户目录权限，未接入系统凭据库或加密；接口不回显只是表面约束。
+14. ~~**API Key 明文存储**~~：已用 Windows DPAPI 加密（`dpapi:v1:`），启动时自动迁移旧明文并
+    `secure_delete` + `VACUUM`；同一 Windows 用户下的进程仍可调用 DPAPI，不能替代独立账户隔离。
 15. **对话仍是单轮检索**：会话与历史消息已持久化，但提问不会把上一轮消息作为上下文，
     追问「那第二个文件呢」仍然无法解析指代。
 16. **语义召回依赖外部服务**：向量由 OpenAI 兼容接口或本机 Ollama 生成，没有内置模型；
@@ -315,7 +349,8 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 
 ## 五、下一步（建议顺序）
 
-1. 召回增强剩余项：向量 ANN 或本地小模型、跨语言改写、短词索引。
+1. 检索可靠性：补充 100–200 道真实用户问句与目标文件标注，再依据基线决定 ANN、Reranker
+   或本地小模型；当前合成基线已满分，不能据此判断真实语料。
 2. OCR 效果提升：手写识别、表格结构与版面还原、真实扫描件基准；按耗时/预算调度引擎。
 3. 对话增强：多轮上下文、引用跳转与对话导出。
 4. 预算与任务：按耗时/字符数计量、任务取消与优先级、低质量文本的二次解析器。

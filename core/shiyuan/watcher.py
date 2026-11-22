@@ -209,7 +209,7 @@ class WatcherManager:
 
     def _run_sync(self, source_id: str, paths: list[str], full: bool) -> None:
         if not scanner.request_scan(source_id):
-            # 已有一轮对账在跑：它本身会覆盖这批变更，不重复排队。
+            # 已有一轮在跑：request_scan 已记录 follow-up，结束后会自动补扫。
             return
         try:
             conn = db.connect(self.store_path)

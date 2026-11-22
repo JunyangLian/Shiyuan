@@ -16,7 +16,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 
-from . import embeddings, indexer, query, retrieval, store
+from . import embeddings, indexer, query, retrieval, secrets_store, store
 
 SETTINGS_KEY = "answer"
 PROVIDERS = {"extractive", "openai", "ollama"}
@@ -56,6 +56,11 @@ def load_settings(conn: sqlite3.Connection) -> dict:
     except (TypeError, ValueError):
         settings["top_k"] = 6
     settings["allow_cloud"] = bool(settings["allow_cloud"])
+    if settings.get("api_key"):
+        try:
+            settings["api_key"] = secrets_store.unprotect(settings["api_key"])
+        except secrets_store.SecretError:
+            settings["api_key"] = ""
     return settings
 
 
@@ -86,7 +91,7 @@ def update_settings(conn: sqlite3.Connection, payload: dict) -> dict:
     if payload.get("clear_key"):
         settings["api_key"] = ""
     elif payload.get("api_key"):
-        settings["api_key"] = str(payload["api_key"]).strip()
+        settings["api_key"] = secrets_store.protect(str(payload["api_key"]).strip())
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES (?, ?)"
         " ON CONFLICT(key) DO UPDATE SET value = excluded.value",

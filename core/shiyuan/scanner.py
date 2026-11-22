@@ -36,6 +36,7 @@ DEFAULT_EXCLUDES = {
 }
 
 _running: set[str] = set()
+_followup: dict[str, bool] = {}
 _running_lock = threading.Lock()
 
 
@@ -49,9 +50,10 @@ def is_running(source_id: str) -> bool:
 
 
 def request_scan(source_id: str) -> bool:
-    """占用某数据源的同步权；已有任务在跑时返回 False，避免并发写同一批记录。"""
+    """占用某数据源的同步权；已有任务在跑时记录 follow-up，结束后自动补扫。"""
     with _running_lock:
         if source_id in _running:
+            _followup[source_id] = True
             return False
         _running.add(source_id)
         return True
@@ -60,6 +62,10 @@ def request_scan(source_id: str) -> bool:
 def release_scan(source_id: str) -> None:
     with _running_lock:
         _running.discard(source_id)
+        pending = _followup.pop(source_id, False)
+    if pending:
+        # 扫描期间到达的文件事件可能晚于本轮枚举；结束前再补一轮增量。
+        scan_in_background(source_id)
 
 
 def scan_in_background(source_id: str) -> bool:

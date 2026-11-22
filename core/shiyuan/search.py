@@ -61,6 +61,8 @@ def _content_hits(conn: sqlite3.Connection, text: str, analysis: dict, *,
             "sheet": hit.sheet,
             "level": "L2" if hit.ocr else "L1",
             "bbox": hit.bbox,
+            "concepts": hit.concepts,
+            "variants": hit.variants,
         }
     return hits
 
@@ -181,7 +183,11 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
         semantic = vector_hits.get(location_id)
         name_matched = score > 0
         if content:
+            # 正文候选必须保留 retrieval 的概念/变体命中数，否则同分后会被
+            # mtime 排序淹没（例如唯一编号被近期文件挤出前 5）。
             score += 150 + 10 * min(len(tokens), 5)
+            score += 30 * int(content.get("concepts", 0))
+            score += 4 * int(content.get("variants", 0))
         if semantic:
             score += 120 + int(semantic["similarity"] * 100)
         merged = content

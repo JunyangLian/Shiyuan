@@ -26,6 +26,18 @@ def db_path() -> Path:
     return app_home() / "shiyuan.db"
 
 
+def api_token_path() -> Path:
+    """本机 API 的进程级访问令牌；桌面端通过 Tauri 命令读取。"""
+    return app_home() / "api-token"
+
+
+def api_auth_enabled() -> bool:
+    """默认开启；测试或显式排障时可设 SHIYUAN_API_AUTH=0。"""
+    return os.environ.get("SHIYUAN_API_AUTH", "1").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
 def watch_enabled() -> bool:
     """实时监听开关；测试与排障可用 SHIYUAN_WATCH=0 关闭。"""
     return os.environ.get("SHIYUAN_WATCH", "1").strip().lower() not in {"0", "false", "off", "no"}

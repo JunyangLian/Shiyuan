@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use tauri::{Manager, RunEvent};
@@ -18,12 +19,28 @@ fn core_is_running() -> bool {
     std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
 }
 
+/// 读取核心启动时写入的进程级访问令牌，交给前端放进 Authorization 头。
+#[tauri::command]
+fn api_token() -> Result<String, String> {
+    let base = if let Ok(home) = std::env::var("SHIYUAN_HOME") {
+        PathBuf::from(home)
+    } else if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        PathBuf::from(local).join("ShiyuanData")
+    } else {
+        return Err("无法确定应用数据目录".to_string());
+    };
+    std::fs::read_to_string(base.join("api-token"))
+        .map(|value| value.trim().to_string())
+        .map_err(|err| format!("读取本地访问令牌失败：{err}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![api_token])
         .setup(|app| {
             // 调试模式下由开发者自行启动核心（npm run core），安装包运行时才托管 sidecar；
             // 若已有核心在监听（例如上一进程残留），则直接复用，不重复拉起。

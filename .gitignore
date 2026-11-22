@@ -13,8 +13,13 @@ __pycache__/
 .venv/
 venv/
 
+# 本地临时目录（测试、构建、解包都放这里）
+.tmp/
+
 # pyinstaller 产物
+build/
 core/build/
+*.dist/
 *.spec
 
 # Tauri sidecar 产物（由 core/dist 复制而来，不入库）

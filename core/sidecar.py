@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+import traceback
 from pathlib import Path
 
 # 源码直接运行时，保证 core/ 在 sys.path 中（冻结后此路径无效但无害）。
@@ -29,16 +31,38 @@ def _bind_log_streams() -> None:
         sys.stderr = log_file
 
 
+def _log_bootstrap_error() -> None:
+    """--noconsole 没有 stderr，启动期异常写入应用目录，便于安装版排障。"""
+    try:
+        path = app_home() / "bootstrap-error.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            traceback.print_exc(file=handle)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    args = sys.argv[1:]
-    if "--mcp" in args or "--print-config" in args:
-        # MCP 模式必须保留真实 stdout，不能重定向到日志文件。
-        from shiyuan.mcp_server import main as mcp_main
+    try:
+        args = sys.argv[1:]
+        if "--mcp" in args or "--print-config" in args:
+            # MCP 模式必须保留真实 stdout，不能重定向到日志文件。
+            from shiyuan.mcp_server import main as mcp_main
 
-        mcp_main([arg for arg in args if arg != "--mcp"])
-    else:
-        _bind_log_streams()
-        from shiyuan import api  # noqa: F401  让打包工具收集 HTTP 应用
-        from shiyuan.__main__ import main
+            mcp_main([arg for arg in args if arg != "--mcp"])
+        else:
+            from shiyuan.instance import acquire_http_instance
 
-        main()
+            port = int(os.environ.get("SHIYUAN_PORT", "8737"))
+            if not acquire_http_instance(port):
+                raise SystemExit(0)
+            _bind_log_streams()
+            from shiyuan import api  # noqa: F401  让打包工具收集 HTTP 应用
+            from shiyuan.__main__ import main
+
+            main()
+    except SystemExit:
+        raise
+    except BaseException:
+        _log_bootstrap_error()
+        raise

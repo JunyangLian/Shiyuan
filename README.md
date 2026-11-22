@@ -2,7 +2,7 @@
 
 > 你的文件按原来的方式保存，知识库自己生长。
 
-当前进度：**M1 目录层 + M2 实时监听 + M3 内容检索 + M4 问答引用 + M5 多模态（OCR）+ M6 知识库管理 + 召回增强 + Windows 安装包**。
+当前进度：**M1 目录层 + M2 实时监听 + M3 内容检索 + M4 问答引用 + M5 多模态（OCR）+ M6 知识库管理 + 召回增强 + 多格式解析 + MCP + 本机安全加固 + Windows 安装包**。
 产品需求与技术设计见 [docs/PRD.md](docs/PRD.md)，开发断点见 [docs/BREAKPOINT.md](docs/BREAKPOINT.md)。
 
 ## 目录结构
@@ -10,9 +10,10 @@
 ```
 core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            数据源、扫描/监听、L1 解析、L2 OCR、检索、问答引用、HTTP 接口
-  tests/              72 项用例：扫描 / 监听 / 索引 / 检索 / 问答 / OCR / 维护 / 召回 / API
+  tests/              124 项用例：扫描 / 监听 / 索引 / 检索 / 问答 / OCR / 维护 / 召回 / 安全 / 基线
+  benchmarks/         10 万级目录扫描基准
 desktop/              Tauri v2 + React + TypeScript 桌面端
-  src/                搜索、对话、数据源、健康四个界面
+  src/                检索与对话、数据源与维护两个整合页面
   src-tauri/          Rust 外壳（dialog / opener / shell 插件）
 docs/                 PRD、断点文档
 ```
@@ -46,7 +47,35 @@ npm run tauri dev
 - `SHIYUAN_WATCH=0` 可关闭监听，只保留手动扫描；
 - `SHIYUAN_RECONCILE_SECONDS=600` 调整周期对账间隔（最小 30 秒），兜住休眠、网络盘与事件丢失；
 - `SHIYUAN_DAILY_PARSE_BUDGET=500` / `SHIYUAN_DAILY_OCR_BUDGET=200` 控制每日解析与 OCR 的文件数上限（0 表示不限制）；
-- 目录级事件（新建/删除/改名文件夹）会退化为对该数据源的一次完整对账。
+- 目录级事件（新建/删除/改名文件夹）会退化为对该数据源的一次完整对账；
+- 扫描期间到达的事件会记为 follow-up，当前扫描结束后自动再补一轮，不丢事件。
+
+## 本机安全边界
+
+- **API 访问令牌**：核心启动时生成进程级令牌，写入 `%LOCALAPPDATA%\ShiyuanData\api-token`；
+  桌面端通过 Tauri `api_token` 命令读取，浏览器开发模式由 Vite `/__shiyuan_token` 转发。
+  除 OPTIONS 预检外，所有 `/api/*` 缺少或带错令牌都返回 401。
+- **CORS**：只允许 `localhost:1420`、`127.0.0.1:1420` 与 Tauri 来源，不再放行任意 localhost 端口。
+- `SHIYUAN_API_AUTH=0` 只用于测试/排障，不要长期关闭。
+- 令牌文件对当前 Windows 用户可读，能挡住其他用户和误连的网页，但不能替代系统级隔离；
+  同一用户下的恶意进程仍可读取。
+- **API Key 加密**：回答/Embedding 的 Key 使用 Windows DPAPI 加密后写入 SQLite，
+  前缀 `dpapi:v1:`；旧版明文在核心启动时自动迁移，并用 `secure_delete` + `VACUUM` 清理旧页。
+- 核心使用命名互斥量保证同一端口只有一个 HTTP 实例，避免重复写令牌。
+
+## 检索与扫描基线
+
+```powershell
+cd core
+# 120 篇文档 / 140 道题（文件名、正文唯一标记、中文两字短词、自然语言）
+python -m pytest tests/test_retrieval_benchmark.py -q -s
+
+# 目录级全量对账；10 万文件请按需调大 --files
+python benchmarks/scan_benchmark.py --files 2000
+```
+
+当前结果：检索 R@1=1.000、R@5=1.000、MRR=1.000（合成唯一标记语料；真实用户语料仍需补充标注）；
+2000 个文件首次扫描约 2.12s（943 files/s），二次对账约 0.56s。
 
 ## 打包 Windows 安装包
 
@@ -55,6 +84,11 @@ npm run tauri dev
 ```powershell
 # 1. 生成 core 可执行文件（约 185MB，需先 pip install pyinstaller）
 cd core
+$root = Split-Path (Get-Location) -Parent
+$env:TMP = Join-Path $root ".tmp\tmp"
+$env:TEMP = $env:TMP
+$env:PYINSTALLER_CONFIG_DIR = Join-Path $root ".tmp\pyinstaller"
+New-Item -ItemType Directory -Path $env:TMP, $env:PYINSTALLER_CONFIG_DIR -Force | Out-Null
 python -m PyInstaller --onefile --noconsole --name shiyuan-core --paths . `
   --hidden-import shiyuan.api --hidden-import shiyuan.mcp_server `
   --collect-submodules uvicorn --collect-submodules winsdk `

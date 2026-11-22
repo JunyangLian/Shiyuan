@@ -5,24 +5,74 @@
 
 from __future__ import annotations
 
+import hmac
+import os
+import secrets
 import sqlite3
 import threading
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import (__version__, answer, chat, config, db, embeddings, indexer, maintenance, ocr,
-               query, scanner, search, store, watcher)
+               query, scanner, search, secrets_store, store, watcher)
 from .config import db_path
+
+
+def _request_token(request: Request) -> str:
+    authorization = request.headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return request.headers.get("x-shiyuan-token", "").strip()
+
+
+def _write_api_token(token: str) -> None:
+    path = config.api_token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".api-token.{os.getpid()}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(temp, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(token)
+    os.replace(temp, path)
+
+
+def _prepare_api_token(app: FastAPI) -> None:
+    if not config.api_auth_enabled():
+        app.state.api_token = None
+        return
+    token = os.environ.get("SHIYUAN_API_TOKEN", "").strip() or secrets.token_urlsafe(32)
+    app.state.api_token = token
+    _write_api_token(token)
+
+
+def _remove_api_token(app: FastAPI) -> None:
+    token = getattr(app.state, "api_token", None)
+    if not token:
+        return
+    try:
+        path = config.api_token_path()
+        if path.read_text(encoding="utf-8").strip() == token:
+            path.unlink()
+    except OSError:
+        pass
+    app.state.api_token = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     conn = db.connect()
     db.init_db(conn)
+    if os.name == "nt":
+        try:
+            secrets_store.migrate_app_settings(conn)
+        except Exception:
+            pass  # 迁移失败不应阻止核心启动；下次启动会重试
     conn.close()
+    _prepare_api_token(app)
     manager = None
     if config.watch_enabled():
         manager = watcher.WatcherManager(db_path())
@@ -33,14 +83,40 @@ async def lifespan(app: FastAPI):
     finally:
         if manager is not None:
             manager.stop()
+        _remove_api_token(app)
 
 
 app = FastAPI(title="拾源 Knowledge Core", version=__version__, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_api_token(request: Request, call_next):
+    """本机 API 默认要求进程级访问令牌；OPTIONS 预检交给 CORS。"""
+    if request.method == "OPTIONS" or not config.api_auth_enabled():
+        return await call_next(request)
+    expected = getattr(request.app.state, "api_token", None)
+    supplied = _request_token(request)
+    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
+        return JSONResponse(
+            {"detail": "未授权：缺少或无效的本地访问令牌"},
+            status_code=401,
+        )
+    return await call_next(request)
+
+
+# CORS 必须最后添加，作为最外层中间件，保证 401 响应也带跨域头。
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^(http://(localhost|127\.0\.0\.1):\d+|http://tauri\.localhost|https://tauri\.localhost)$",
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        "tauri://localhost",
+    ],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Shiyuan-Token"],
+    allow_credentials=False,
 )
 
 

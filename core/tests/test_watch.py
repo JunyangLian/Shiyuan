@@ -27,6 +27,34 @@ def _prepare(conn, tmp_path: Path):
     return root, target, source["source_id"]
 
 
+def test_scan_followup_is_triggered_after_busy_release(monkeypatch):
+    source_id = "src_followup_test"
+    started: list[str] = []
+    monkeypatch.setattr(scanner, "scan_in_background", lambda sid: started.append(sid))
+
+    assert scanner.request_scan(source_id) is True
+    assert scanner.request_scan(source_id) is False
+    assert scanner.is_running(source_id) is True
+
+    scanner.release_scan(source_id)
+    assert started == [source_id]
+    assert scanner.is_running(source_id) is False
+
+    scanner.release_scan(source_id)
+    assert started == [source_id]
+
+
+def test_release_without_pending_does_not_rescan(monkeypatch):
+    source_id = "src_no_followup_test"
+    started: list[str] = []
+    monkeypatch.setattr(scanner, "scan_in_background", lambda sid: started.append(sid))
+
+    assert scanner.request_scan(source_id) is True
+    scanner.release_scan(source_id)
+    assert started == []
+    assert scanner.is_running(source_id) is False
+
+
 def test_sync_paths_updates_content_and_reindexes(conn, tmp_path):
     root, target, source_id = _prepare(conn, tmp_path)
     time.sleep(0.01)
