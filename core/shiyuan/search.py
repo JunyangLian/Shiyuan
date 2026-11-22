@@ -158,6 +158,7 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
     for location_id, row in name_rows.items():
         path_match = path_index.get(location_id)
         score = path_match.score if path_match else 0
+        score += retrieval.name_prior(row["path"], analysis)
         content = content_hits.get(location_id)
         semantic = vector_hits.get(location_id)
         name_matched = path_match is not None

@@ -10,7 +10,7 @@
 ```
 core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            数据源、扫描/监听、L1 解析、L2 OCR、检索、问答引用、HTTP 接口
-  tests/              124 项用例：扫描 / 监听 / 索引 / 检索 / 问答 / OCR / 维护 / 召回 / 安全 / 基线
+  tests/              170 项用例：扫描 / 监听 / 索引 / 检索 / 问答 / OCR / 维护 / 召回 / 安全 / 基线
   benchmarks/         10 万级目录扫描基准
 desktop/              Tauri v2 + React + TypeScript 桌面端
   src/                检索与对话、数据源与维护两个整合页面
@@ -47,6 +47,7 @@ npm run tauri dev
 - `SHIYUAN_WATCH=0` 可关闭监听，只保留手动扫描；
 - `SHIYUAN_RECONCILE_SECONDS=600` 调整周期对账间隔（最小 30 秒），兜住休眠、网络盘与事件丢失；
 - `SHIYUAN_DAILY_PARSE_BUDGET=500` / `SHIYUAN_DAILY_OCR_BUDGET=200` 控制每日解析与 OCR 的文件数上限（0 表示不限制）；
+- `SHIYUAN_MODEL_TIMEOUT=60` 调整云端/本地模型单次回答的超时秒数（推理模型可调到 120）。
 - 目录级事件（新建/删除/改名文件夹）会退化为对该数据源的一次完整对账；
 - 扫描期间到达的事件会记为 follow-up，当前扫描结束后自动再补一轮，不丢事件。
 
@@ -110,7 +111,7 @@ cd ..\desktop
 npm run tauri build
 ```
 
-产物：`D:\cargo-target\shiyuan\release\bundle\nsis\Shiyuan_0.1.1_x64-setup.exe`（约 180MB，
+产物：`D:\cargo-target\shiyuan\release\bundle\nsis\Shiyuan_0.1.2_x64-setup.exe`（约 180MB，
 含多格式解析、监听、Windows OCR、PP-OCRv6 small 与 MCP `--mcp` 模式）。
 `desktop/src-tauri/binaries/` 是构建产物，不入库；新克隆仓库需先执行第 1 步。
 
@@ -209,8 +210,8 @@ MCP 服务不会触发扫描；新文件仍需要先在桌面端完成扫描与�
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 113 passed（另需 pip install pytest httpx）
-cd desktop; npm test                  # 6 passed（Vitest + jsdom + Testing Library）
+cd core; python -m pytest -q          # 170 passed（另需 pip install pytest httpx）
+cd desktop; npm test                  # 14 passed（Vitest + jsdom + Testing Library）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先按上文设置 CARGO_TARGET_DIR
 ```
@@ -242,7 +243,10 @@ cd desktop/src-tauri; cargo check     # 先按上文设置 CARGO_TARGET_DIR
 - 问答与引用：先在本机检索证据，默认「本地摘录」（不联网）；可切换 OpenAI 兼容接口或 Ollama。
   回答带 [n] 引用，引用缺失/越界会提示；没有证据直接拒答，并说明当前内容覆盖。
 - 对话管理：会话与消息保存在本机数据库，左侧可新建/切换/改名/删除对话；切换页面或重启后
-  历史问答和引用仍在。当前每个问题仍独立检索，不会把上一轮消息作为上下文。
+  历史问答和引用仍在。同一会话里，追问（如「那第三章呢」「它的环境变量怎么配」）会把上一轮
+  问题并进检索；上一轮只涉及一个数据源时会自动收窄到该数据源。
+- 目录概览：问「大三下有哪些课」「pilot_batches 里有什么」时，直接按文件夹汇总子目录与文件数，
+  不再拿零散正文片段硬答；问「放在哪个文件夹」时只按具体路径命中，找不到就拒答。
 - 问答会结合文件名/路径加分（仅在命中少量文件时启用），因此「毒鳍表里有哪些物种」这类
   按文件名提问也能取到正文证据；两字关键词会用 LIKE 兜底，不会被长词挤出召回。
 - 云端调用默认关闭，需在「对话 → 回答设置」中显式授权；只发送入选的证据片段，不上传整个文件。
@@ -266,7 +270,8 @@ cd desktop/src-tauri; cargo check     # 先按上文设置 CARGO_TARGET_DIR
 - **OCR 只保留行坐标，不还原版面**：结果是“按行文本 + 每行 bbox”，没有表格结构、版面还原或手写专项；
   扫描 PDF 用 PP-OCRv6 small，图片与文本 PDF 仍用 Windows OCR；两者都不联网。
 - **内置本地大模型**：安装包不含模型；Ollama 需用户自行安装并启动。
-- **会话记忆**：对话历史会保存，但提问不会自动带上上一轮上下文，也不能追问"那第二个文件呢"。
+- **会话记忆**：只把最近一轮问题当作检索上下文（用于「那第三章呢」这类追问），
+  不保留完整对话状态，也不能跨会话记忆；一句话里同时指代多个对象时仍可能选错。
 - **跨盘移动**：仍会被识别为「新增 + 失联」，不做自动合并。
 - **网络盘 / SMB**：未实测 watchdog 在这些路径上的事件可靠性，主要依赖周期对账。
 - **目录级变更**：新建/删除/改名文件夹会整源重扫一次，目录很大时那次同步会明显变慢。

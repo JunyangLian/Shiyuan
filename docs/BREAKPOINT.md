@@ -22,7 +22,7 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 前端单元测试 | 6 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `Shiyuan_0.1.1_x64-setup.exe`（约 180MiB，含多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），静默安装后 `/api/health` 无令牌 401、带令牌 200 |
+| 桌面端安装包 | 完成 | `Shiyuan_0.1.2_x64-setup.exe`（约 180MiB，含多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），静默安装后 `/api/health` 无令牌 401、带令牌 200 |
 
 ## 二、已实现范围（M1）
 
@@ -341,6 +341,24 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 - 测试：`core/tests/test_recall.py` 12 项（疑问词剥离/同义词、同义词命中、改写提示、自定义同义词、
   引用版本时间、授权与密钥隐藏、向量构建计数、语义-only 命中合并、问答语义证据、API 设置与补建、
   未启用 400、同义词接口校验）。
+
+## 三点五、本轮（v0.1.2）检索与对话修复
+
+- `query.py`：新增疑问结构清理（`写了什么 / 有哪些 / 怎么用 / 放在哪个文件夹` 等），
+  按「的」切词，剥句尾方位词；新增 `howto / intro` 意图；证据门槛按「最大词」计算，
+  避免 `创新 / 新点 / 创新点` 这类 gram 膨胀把真正的专利文档过滤掉。
+- `retrieval.py`：路径打分改用数据源内相对路径，数据源根目录名不再让整源文件加分；
+  新增 `name_prior`（README / 使用说明优先，论文模板 / 撰写规范后置）；新增
+  `maximal`（最大词命中数）与 `focus`（追问本轮词加权）排序；`path_only=True` 时
+  只认具体路径命中，通用目录词不算。
+- `answer.py`：多轮追问把上一轮问题并入检索（上一轮只涉及一个数据源时收窄到该源）；
+  证据片段截到关键词附近；同一文件最多 1 条、同一家族最多 2 条证据；新增目录概览
+  `folder_overview`；提示词注入当天日期，模型超时可用 `SHIYUAN_MODEL_TIMEOUT`
+  调整（默认 60 秒）。
+- `chat.py`：`recent_questions` / `recent_answer_sources`。
+- 实测：「那第三章呢 / 那第四章呢」能回到论文对应章节；「大三下有哪些课」列出 8 门课；
+  「专利的创新点」回到两份专利文件，不再被查重报告挤占；「怎么运行测试」优先 README。
+- 测试：后端 170 项通过。
 
 ## 四、禁止操作
 

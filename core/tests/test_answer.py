@@ -96,6 +96,113 @@ def test_conversational_fillers_are_not_search_terms():
     assert "那个" not in analysis["variants"]
 
 
+def test_question_words_in_the_middle_are_removed():
+    analysis = query.analyze("MISA 跑了什么参数")
+
+    assert analysis["core"] == "misa 参数"
+    assert "跑" not in analysis["variants"]
+    assert "跑了" not in analysis["variants"]
+    assert "什么" not in analysis["variants"]
+
+    assert query.analyze("专利里写了什么")["core"] == "专利"
+    assert query.analyze("我毕业论文写了什么")["core"] == "我毕业论文"
+
+
+def test_folder_question_answers_with_subfolder_list(conn, tmp_path):
+    root = tmp_path / "大学"
+    (root / "大三" / "系统工程").mkdir(parents=True)
+    (root / "大三" / "云计算").mkdir(parents=True)
+    (root / "大三" / "系统工程" / "课件.md").write_text("系统工程课件", encoding="utf-8")
+    (root / "大三" / "云计算" / "笔记.md").write_text("云计算笔记", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "大三学了哪些课程")
+
+    assert result["reason"] == "folder_overview"
+    assert result["citations"] == []
+    assert "系统工程" in result["answer"]
+    assert "云计算" in result["answer"]
+    assert "2 个可检索文件" in result["answer"]
+
+
+def test_howto_question_prefers_readme(conn, tmp_path):
+    root = tmp_path / "工具"
+    root.mkdir()
+    (root / "README.md").write_text(
+        "# 单据助手\n\n中文名：单据助手。\n\n## 安装\npip install -r requirements.txt\n",
+        encoding="utf-8")
+    rows = ["单据编号,金额"] + [f"单据{i},100" for i in range(200)]
+    (root / "data.csv").write_text("\n".join(rows), encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "单据助手怎么用")
+
+    assert result["citations"][0]["name"] == "README.md"
+
+
+def test_intro_question_prefers_readme(conn, tmp_path):
+    root = tmp_path / "工具"
+    root.mkdir()
+    (root / "README.md").write_text(
+        "# 单据助手\n\n这是一个整理单据的小工具。", encoding="utf-8")
+    rows = ["单据编号,金额"] + [f"单据{i},100" for i in range(200)]
+    (root / "data.csv").write_text("\n".join(rows), encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "单据助手是做什么的")
+
+    assert result["citations"][0]["name"] == "README.md"
+
+
+def test_followup_question_uses_previous_topic(conn, tmp_path):
+    root = tmp_path / "资料"
+    (root / "论文").mkdir(parents=True)
+    (root / "其他").mkdir(parents=True)
+    (root / "论文" / "初稿.md").write_text(
+        "论文题目：本地知识检索。\n\n第三章 研究方法\n本文采用问卷调查与访谈相结合的方法。",
+        encoding="utf-8")
+    (root / "其他" / "笔记.md").write_text(
+        "阅读笔记：第三章读起来有点晦涩，准备下周再读。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "那第三章呢", history=["我想看看论文写了什么"])
+
+    assert result["context_used"] == "我想看看论文写了什么"
+    assert result["citations"][0]["name"] == "初稿.md"
+
+
+def test_followup_stays_in_previous_source(conn, tmp_path):
+    tool_root = tmp_path / "工具资料"
+    tool_root.mkdir()
+    (tool_root / "README.md").write_text(
+        "# 单据助手\n\n## 配置\n\n在 .env 中设置 OPENAI_API_KEY 与 OPENAI_BASE_URL。",
+        encoding="utf-8")
+    course_root = tmp_path / "课程资料"
+    course_root.mkdir()
+    (course_root / "笔记.md").write_text(
+        "课程笔记：环境变量是操作系统提供的键值对。", encoding="utf-8")
+    tool = store.add_source(conn, tool_root)
+    course = store.add_source(conn, course_root)
+    for source in (tool, course):
+        scanner.scan_source(conn, source["source_id"])
+        indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "那环境变量怎么配",
+                        history=["单据助手怎么用"],
+                        anchor_sources=[tool["source_id"]])
+
+    assert result["citations"]
+    assert all(item["path"].startswith(str(tool_root)) for item in result["citations"])
+
+
 def test_cloud_answer_requires_explicit_consent(conn, indexed):
     answer.update_settings(conn, {"provider": "openai", "model": "gpt-test", "api_key": "sk-test"})
 
@@ -173,6 +280,40 @@ def client(tmp_path, monkeypatch):
         yield test_client
 
 
+def test_path_question_requires_a_path_hit(conn, tmp_path):
+    root = tmp_path / "资料"
+    (root / "数据").mkdir(parents=True)
+    (root / "数据" / "笔记.md").write_text(
+        "这里记录了一些普通的实验数据，与测序无关。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "转录组数据放在哪个文件夹")
+
+    assert result["refused"] is True
+    assert result["citations"] == []
+
+
+def test_filename_subject_outranks_generic_content(conn, tmp_path):
+    root = tmp_path / "实验"
+    root.mkdir()
+    (root / "专利说明.md").write_text(
+        "本发明公开了一种基于全基因组混池测序的性别决定区定位方法。",
+        encoding="utf-8")
+    (root / "论文笔记.md").write_text(
+        "创新点：本文提出了三个创新点，创新点一是指标体系，创新点二是模型。"
+        "创新点分析还需要继续打磨。",
+        encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "专利的创新点是什么")
+
+    assert result["citations"][0]["name"] == "专利说明.md"
+
+
 def test_api_ask_and_settings(client, tmp_path):
     root = tmp_path / "资料"
     root.mkdir()
@@ -217,3 +358,41 @@ def test_api_ask_and_settings(client, tmp_path):
 
     bad = client.put("/api/settings/answer", json={"provider": "nope"})
     assert bad.status_code == 400
+
+
+def test_api_followup_question_stays_in_previous_source(client, tmp_path):
+    tool_root = tmp_path / "工具"
+    tool_root.mkdir()
+    (tool_root / "README.md").write_text(
+        "# 单据助手\n\n这是一个整理单据的小工具。\n\n## 环境变量\n"
+        "在 .env 里配置 OPENAI_API_KEY 与 OPENAI_BASE_URL。",
+        encoding="utf-8")
+    course_root = tmp_path / "课程"
+    course_root.mkdir()
+    (course_root / "笔记.md").write_text(
+        "课程笔记：环境变量是操作系统提供的键值对，可用于配置程序。", encoding="utf-8")
+
+    for root in (tool_root, course_root):
+        source_id = client.post("/api/sources", json={"root": str(root)}).json()["source_id"]
+        client.post(f"/api/sources/{source_id}/scan")
+        client.put("/api/inventory/policies", json={
+            "source_id": source_id, "policies": {"md": "standard_parse"},
+        })
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if not client.get("/api/sources").json()["items"][0]["scanning"]:
+                break
+            time.sleep(0.05)
+
+    session = client.post("/api/chat/sessions", json={"title": "追问"}).json()
+    first = client.post("/api/ask", json={
+        "question": "单据助手怎么用", "session_id": session["session_id"],
+    }).json()
+    assert first["citations"][0]["name"] == "README.md"
+
+    second = client.post("/api/ask", json={
+        "question": "那环境变量怎么配", "session_id": session["session_id"],
+    }).json()
+    assert second["context_used"] == "单据助手怎么用"
+    assert second["citations"]
+    assert all(item["path"].startswith(str(tool_root)) for item in second["citations"])

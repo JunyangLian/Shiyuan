@@ -445,8 +445,12 @@ def run_ask(payload: AskPayload, conn: sqlite3.Connection = Depends(get_conn)) -
     if payload.session_id and chat.get_session(conn, payload.session_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     try:
+        history = chat.recent_questions(conn, payload.session_id) if payload.session_id else []
+        anchor_sources = (chat.recent_answer_sources(conn, payload.session_id)
+                          if payload.session_id else [])
         result = answer.ask(conn, payload.question, source_id=payload.source_id,
-                            ext=payload.ext, top_k=payload.top_k)
+                            ext=payload.ext, top_k=payload.top_k, history=history,
+                            anchor_sources=anchor_sources)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except answer.AnswerError as exc:

@@ -98,6 +98,51 @@ def list_messages(conn: sqlite3.Connection, session_id: str) -> list[dict]:
     return messages
 
 
+def recent_questions(conn: sqlite3.Connection, session_id: str,
+                     limit: int = 2) -> list[str]:
+    """最近几轮的用户问题，按时间倒序；用于解析「那第三章呢」这类追问。"""
+    rows = conn.execute(
+        "SELECT content FROM chat_messages"
+        " WHERE session_id = ? AND role = 'user'"
+        " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (session_id, max(1, min(limit, 5))),
+    ).fetchall()
+    return [row["content"] for row in rows if (row["content"] or "").strip()]
+
+
+def recent_answer_sources(conn: sqlite3.Connection, session_id: str,
+                          limit: int = 3) -> list[str]:
+    """上一轮回答引用涉及的来源，用于把追问限定在同一批资料里。"""
+    row = conn.execute(
+        "SELECT payload FROM chat_messages"
+        " WHERE session_id = ? AND role = 'assistant'"
+        " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return []
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return []
+    paths = [item.get("path") for item in payload.get("citations", [])
+             if isinstance(item, dict) and item.get("path")]
+    if not paths:
+        return []
+    sources: list[str] = []
+    for start in range(0, len(paths), 100):
+        batch = paths[start:start + 100]
+        placeholders = ",".join("?" for _ in batch)
+        for hit in conn.execute(
+            "SELECT DISTINCT source_id FROM asset_locations"
+            f" WHERE path IN ({placeholders})",
+            batch,
+        ):
+            if hit["source_id"] not in sources:
+                sources.append(hit["source_id"])
+    return sources[:limit]
+
+
 def append_exchange(conn: sqlite3.Connection, session_id: str, question: str,
                     result: dict) -> None:
     """保存一轮问答：用户问题 + 助手完整结果。"""

@@ -718,11 +718,13 @@ def dedupe_chunk_hits(conn: sqlite3.Connection, hits: list) -> list:
     deduped = []
     for group_hits in groups.values():
         group_hits.sort(key=lambda hit: (
-            -(hit.concepts * 10 + min(hit.path_score, 300)),
+            -(hit.focus * 120 + hit.maximal * 10 + min(hit.path_score, 300)),
+            -hit.concepts,
             -hit.variants,
             -len(hit.text),
         ))
         representative = group_hits[0]
+        representative.focus = max(getattr(hit, "focus", 0) for hit in group_hits)
         info = mapping.get(representative.asset_id)
         representative.family_id = info["family_id"] if info else None
         representative.family_size = info["family_size"] if info else 1
@@ -745,7 +747,8 @@ def dedupe_chunk_hits(conn: sqlite3.Connection, hits: list) -> list:
         representative.sources = sources
         deduped.append(representative)
     deduped.sort(key=lambda hit: (
-        -(hit.concepts * 10 + min(hit.path_score, 300)),
+        -(hit.focus * 120 + hit.maximal * 10 + min(hit.path_score, 300)),
+        -hit.concepts,
         -hit.variants,
         -len(hit.text),
     ))

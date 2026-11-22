@@ -21,6 +21,9 @@ STOP_TERMS = {
     "你还", "还记", "记得", "得那", "那个", "这个", "这些", "那些",
     "个单", "据助", "我想", "想看", "看看", "知道", "的单",
     "里有", "有什", "里有什", "有什么", "里有什么", "里面有什么",
+    # 疑问代词与泛动词：留下会把「什么/哪些」当正文关键词，召回大量无关文档。
+    "哪些", "哪个", "哪几", "多少", "几个", "什么", "怎么", "如何", "为什么",
+    "写", "写了", "做", "做了", "跑", "跑了", "说", "讲", "看", "介绍", "总结", "概括",
 }
 
 PREFIXES = ("请问", "帮我找", "帮我查", "帮我", "麻烦", "我想找", "我想查",
@@ -28,6 +31,53 @@ PREFIXES = ("请问", "帮我找", "帮我查", "帮我", "麻烦", "我想找",
             "那个", "这个", "请找")
 TAILS = ("是多少呢", "是多少", "是什么", "有哪些", "有哪几个", "怎么样", "怎么办",
          "为什么", "如何", "吗", "呢", "吧", "？", "?")
+
+# 疑问句中间的口语结构：只去掉疑问部分，保留真正的主体词。
+# 例如「专利里写了什么」→「专利里」，「MISA 跑了什么参数」→「MISA 参数」。
+QUESTION_PHRASES = (
+    re.compile(
+        r"(?:有|包含|包括|收录|记录|提到|写|讲|说|做|跑|用|干|搞|学|修|看|列|放|存|画|整|拍|录)"
+        r"(?:了|过)?(?:些)?(?:什么|哪些|啥)"
+    ),
+    re.compile(r"(?:怎么|怎样|如何)(?:用|做|弄|操作|使用|处理|配置|设置|看|查)?"),
+    # 位置问句要整体去掉，否则「文件/放在」会变成通用检索词。
+    re.compile(r"(?:放在|存放|保存|存在|放到|存到|保存在)(?:了)?哪(?:个)?(?:文件夹|目录|盘)?"),
+    re.compile(r"(?:在)?哪(?:个)?(?:文件夹|目录|盘)(?:里|中|内)?"),
+    re.compile(r"(?:是|有)(?:什么|谁|哪里|哪儿|哪个|哪几种?)"),
+    re.compile(r"哪(?:些|个|几|里|儿)"),
+    re.compile(r"为什么"),
+    re.compile(r"多少(?:个|份|篇|条|次|张)?"),
+    re.compile(r"(?:里面?|中|内)都"),
+)
+
+# 句尾方位词不参与检索：「专利里」→「专利」。
+_LOCATIVE_TAIL = re.compile(r"(?:里面?|里边?|中|内)$")
+
+# 「怎么用 / 如何配置 / 使用教程」这类问题优先给说明类文档。
+_HOWTO = re.compile(
+    r"(?:怎么|怎样|如何|咋)(?:用|使用|操作|配置|设置|安装|运行|启动|跑|做|弄)"
+    r"|(?:使用说明|操作说明|快速上手|快速开始|使用手册|入门教程|教程|指南)"
+)
+
+# 「X 是做什么的 / 有什么用」优先给说明类文档。
+_INTRO = re.compile(r"(?:是|做|干)(?:什么|啥|嘛)(?:的)?|干什么|有什么用|介绍一下|介绍下")
+
+
+def _strip_locative(value: str) -> str:
+    while len(value) > 2:
+        trimmed = _LOCATIVE_TAIL.sub("", value)
+        if trimmed == value:
+            break
+        value = trimmed
+    return value
+
+
+def _remove_question_phrases(value: str) -> str:
+    """去掉句子中间的疑问结构，保留主体词。"""
+    for pattern in QUESTION_PHRASES:
+        value = pattern.sub("", value)
+    value = " ".join(value.split())
+    return _strip_locative(value.strip("，,。.；;：:！!？?、 "))
 
 SYNONYMS = {
     "样本量": ["样本数", "样本数量", "case数"],
@@ -74,12 +124,10 @@ def strip_question(text: str) -> str:
 
 def analyze(text: str, synonyms: dict[str, list[str]] | None = None) -> dict:
     normalized = normalize(text)
-    core = strip_question(normalized)
+    core = _remove_question_phrases(strip_question(normalized))
     table = synonyms if synonyms is not None else SYNONYMS
-
     seen: set[str] = set()
     concepts: list[dict] = []
-
     def add(term: str) -> None:
         term = term.strip()
         if not term or term in seen or term in STOP_TERMS or len(concepts) >= MAX_CONCEPTS:
@@ -94,11 +142,16 @@ def analyze(text: str, synonyms: dict[str, list[str]] | None = None) -> dict:
     for word in re.findall(r"[a-z0-9_]{2,}", core):
         add(word)
     for run in re.findall(r"[\u4e00-\u9fff]+", core):
-        if len(run) <= 6:
-            add(run)
-        for size in (2, 3):
-            for index in range(len(run) - size + 1):
-                add(run[index:index + size])
+        # 「的」通常只是连接词，按它切开可避免「鱼的候选」这类跨词 gram。
+        for part in re.split("的", run):
+            part = _strip_locative(part)
+            if not part:
+                continue
+            if len(part) <= 6:
+                add(part)
+            for size in (2, 3):
+                for index in range(len(part) - size + 1):
+                    add(part[index:index + size])
 
     variants: list[str] = []
     for concept in concepts:
@@ -110,6 +163,8 @@ def analyze(text: str, synonyms: dict[str, list[str]] | None = None) -> dict:
         "core": core,
         "concepts": concepts,
         "variants": variants[:48],
+        "howto": bool(_HOWTO.search(normalized)),
+        "intro": bool(_INTRO.search(normalized)),
     }
 
 
@@ -129,9 +184,24 @@ def rank(text: str, analysis: dict) -> tuple[int, int]:
     return concepts_hit, variants_hit
 
 
+def maximal_terms(analysis: dict) -> list[dict]:
+    """去掉被更长词包含的 gram，只留语义单元。"""
+    concepts = analysis["concepts"]
+    terms = [concept["term"] for concept in concepts]
+    return [
+        concept for concept in concepts
+        if not any(concept["term"] != other and concept["term"] in other
+                   for other in terms)
+    ]
+
+
 def minimum_concepts(analysis: dict) -> int:
-    count = len(analysis["concepts"])
-    return 1 if count <= 2 else 2
+    """按“最大词”而不是全部 gram 计算门槛。
+
+    「专利的创新点」会生成 专利/创新点/创新/新点 四个 gram，但它们其实只有两个
+    语义单元；若按 4 个算，必须同时命中两个词才算证据，专利文档反而被过滤掉。
+    """
+    return 1 if len(maximal_terms(analysis)) <= 2 else 2
 
 
 # ---------------------------------------------------------------- 自定义同义词
