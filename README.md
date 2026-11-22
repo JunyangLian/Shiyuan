@@ -110,7 +110,7 @@ cd ..\desktop
 npm run tauri build
 ```
 
-产物：`D:\cargo-target\shiyuan\release\bundle\nsis\Shiyuan_0.1.0_x64-setup.exe`（约 180MB，
+产物：`D:\cargo-target\shiyuan\release\bundle\nsis\Shiyuan_0.1.1_x64-setup.exe`（约 180MB，
 含多格式解析、监听、Windows OCR、PP-OCRv6 small 与 MCP `--mcp` 模式）。
 `desktop/src-tauri/binaries/` 是构建产物，不入库；新克隆仓库需先执行第 1 步。
 
