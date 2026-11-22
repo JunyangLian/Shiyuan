@@ -316,9 +316,11 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
   长短变体并存时（如「毒鳍表里有哪些物种」），长词走 FTS、短词（「物种」）再走 LIKE 并合并，
   避免短词被 FTS5 trigram 的 ≥3 字符限制漏掉。
   `search` 与 `answer.retrieve` 共用这一层，避免两套评分漂移。
-- 文件名加分：`_name_meta` 在路径命中概念、且命中文件 ≤8 个时，把路径概念数加到正文候选上；
-  问答仍要求正文至少命中 1 个概念，不会仅凭文件名作答。这样「毒鳍表里有哪些物种」能取到
-  `毒鳍.xlsx`，而「量子纠缠实验结论」仍会拒答。
+- 路径加分：`retrieval.path_matches` 把完整路径（文件夹名 + 文件名）纳入召回，按命中概念数、
+  文件夹层级和文件名位置评分；文件夹名命中时会以该文件首段正文作为证据，但单靠
+  「实验 / 数据 / 记录 / 报告」等通用目录词不会构成证据。`search` 结果新增 `matched_folder`。
+  这样「pilot_batches 里有什么」「2026-07 的单据处理结果」能命中对应文件夹，
+  而「量子纠缠实验结论」仍会拒答。
 - `embeddings.py`：`provider = none / openai / ollama`。OpenAI 走 `/embeddings`（需
   `allow_cloud=true` 与 key），Ollama 默认 `http://127.0.0.1:11434`，优先 `/api/embed`，
   失败回退 `/api/embeddings`。向量以 float32 BLOB 存 `chunk_embeddings(chunk_id, model, dim, vector)`。

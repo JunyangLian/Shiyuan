@@ -5,7 +5,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from shiyuan import answer, db, embeddings, indexer, query, scanner, search, store
+from shiyuan import answer, db, embeddings, indexer, query, retrieval, scanner, search, store
 
 
 @pytest.fixture()
@@ -64,6 +64,29 @@ def test_question_tail_does_not_block_content_search(conn, tmp_path):
 
     assert hits["total"] == 1
     assert hits["rewritten"] == "样本量"
+
+
+def test_search_matches_folder_and_file_names(conn, tmp_path):
+    root = tmp_path / "资料"
+    batch = root / "pilot_batches" / "2026-07"
+    batch.mkdir(parents=True)
+    (batch / "处理结果.md").write_text("本月共有 12 张单据。", encoding="utf-8")
+    (root / "无关.md").write_text("大学语文复习资料。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    hits = search.search(conn, "pilot_batches 里有什么")
+    assert hits["items"]
+    assert hits["items"][0]["name"] == "处理结果.md"
+    assert hits["items"][0]["matched_folder"] == "pilot_batches"
+
+    by_name = search.search(conn, "处理结果")
+    assert by_name["items"][0]["name"] == "处理结果.md"
+
+    # 正文不含“pilot_batches”，但文件夹名命中时仍应进入问答召回。
+    chunks = retrieval.find_chunks(conn, "pilot_batches 里有什么")
+    assert any(hit.path.endswith("处理结果.md") for hit in chunks)
 
 
 def test_custom_synonyms_are_used(conn, tmp_path):
@@ -172,6 +195,16 @@ def test_api_embedding_settings_and_build(client, tmp_path, monkeypatch):
     (root / "a.md").write_text("样本量 42\n", encoding="utf-8")
     source_id = client.post("/api/sources", json={"root": str(root)}).json()["source_id"]
     client.post(f"/api/sources/{source_id}/scan")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not client.get("/api/sources").json()["items"][0]["scanning"]:
+            break
+        time.sleep(0.05)
+
+    confirmed = client.put("/api/inventory/policies", json={
+        "source_id": source_id, "policies": {"md": "standard_parse"},
+    })
+    assert confirmed.status_code == 200
     deadline = time.time() + 10
     while time.time() < deadline:
         if not client.get("/api/sources").json()["items"][0]["scanning"]:

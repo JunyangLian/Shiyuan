@@ -2,13 +2,23 @@ import { useCallback, useEffect, useState } from "react";
 import { api, formatTime } from "../api";
 import type { Source } from "../api";
 import { pickDirectory } from "../tauri";
+import type { InventorySource } from "./InventoryView";
 
-export default function SourcesView({ embedded = false }: { embedded?: boolean }) {
+export default function SourcesView({
+  embedded = false,
+  onOpenInventory,
+  onOpenResults,
+}: {
+  embedded?: boolean;
+  onOpenInventory?: (source: InventorySource) => void;
+  onOpenResults?: (source: InventorySource) => void;
+}) {
   const [sources, setSources] = useState<Source[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [hoveredSource, setHoveredSource] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -35,16 +45,26 @@ export default function SourcesView({ embedded = false }: { embedded?: boolean }
     setNotice(null);
     try {
       const created = await api.addSource(picked);
+      const target: InventorySource = {
+        source_id: created.source_id,
+        label: created.label,
+        root_uri: created.root_uri,
+      };
+      if (created.covered_by) {
+        setNotice(`该目录已包含在「${created.label}」中，直接使用现有授权。`);
+        await load();
+        onOpenInventory?.(target);
+        return;
+      }
       await api.scan(created.source_id);
       if (created.merged.length > 0) {
         setNotice(
           `已自动合并 ${created.merged.length} 个下级目录到「${created.root_uri}」，` +
-          "原文件不会移动。",
+          "原文件不会移动。正在做初次盘点…",
         );
-      } else if (created.covered_by) {
-        setNotice(`该目录已包含在「${created.root_uri}」中，直接使用现有授权。`);
       }
       await load();
+      onOpenInventory?.(target);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -115,6 +135,16 @@ export default function SourcesView({ embedded = false }: { embedded?: boolean }
         {sources.map((source) => {
           const run = source.stats.last_run;
           const isBusy = busy === source.source_id;
+          const paused = source.state === "paused";
+          const running = source.scanning && !paused;
+          const hovering = hoveredSource === source.source_id;
+          const deepLabel = running
+            ? hovering
+              ? "暂停解析"
+              : "解析中"
+            : paused
+              ? "继续解析"
+              : "深度解析";
           return (
             <li key={source.source_id} className="source-card">
               <div className="source-main">
@@ -148,31 +178,72 @@ export default function SourcesView({ embedded = false }: { embedded?: boolean }
               </div>
               <div className="source-actions">
                 <button
-                  className="primary small"
+                  className={`scan-icon${source.scanning ? " spinning" : ""}`}
                   disabled={isBusy || source.scanning}
+                  title={source.scanning ? "扫描中…" : "扫描"}
+                  aria-label={source.scanning ? "扫描中" : "扫描"}
                   onClick={() => void runAction(source.source_id, () => api.scan(source.source_id))}
                 >
-                  扫描
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                    <path d="M21 3v6h-6" />
+                  </svg>
                 </button>
                 <button
-                  className="ghost small"
-                  disabled={isBusy || source.scanning}
-                  title="用系统本机 OCR 解析扫描件 PDF 与图片"
-                  onClick={() => void runAction(source.source_id, () => api.ocr(source.source_id))}
-                >
-                  OCR 深解析
-                </button>
-                <button
-                  className="ghost small"
-                  disabled={isBusy}
-                  onClick={() =>
-                    void runAction(source.source_id, () =>
-                      api.setState(source.source_id, source.state === "paused" ? "active" : "paused"),
-                    )
+                  className={
+                    `ghost small strong deep-parse` +
+                    `${running ? " running" : ""}` +
+                    `${running && hovering ? " stopping" : ""}` +
+                    `${paused ? " paused" : ""}`
                   }
+                  disabled={isBusy}
+                  title={
+                    running
+                      ? "暂停当前解析"
+                      : paused
+                        ? "继续解析"
+                        : "选择文件类型与策略，然后开始深度解析"
+                  }
+                  onMouseEnter={() => setHoveredSource(source.source_id)}
+                  onMouseLeave={() => setHoveredSource(null)}
+                  onFocus={() => setHoveredSource(source.source_id)}
+                  onBlur={() => setHoveredSource(null)}
+                  onClick={() => {
+                    if (running) {
+                      void runAction(source.source_id, () =>
+                        api.setState(source.source_id, "paused"),
+                      );
+                      return;
+                    }
+                    if (paused) {
+                      void runAction(source.source_id, async () => {
+                        await api.setState(source.source_id, "active");
+                        if (!source.scanning) await api.scan(source.source_id);
+                      });
+                      return;
+                    }
+                    onOpenInventory?.(source);
+                  }}
                 >
-                  {source.state === "paused" ? "恢复" : "暂停"}
+                  {deepLabel}
                 </button>
+                {onOpenResults && (
+                  <button
+                    className="ghost small"
+                    disabled={isBusy}
+                    onClick={() => onOpenResults(source)}
+                  >
+                    解析结果
+                  </button>
+                )}
                 <button className="ghost small danger" disabled={isBusy} onClick={() => remove(source)}>
                   撤销授权
                 </button>

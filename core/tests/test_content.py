@@ -331,6 +331,44 @@ def client(tmp_path, monkeypatch):
         yield test_client
 
 
+def test_protected_sheet_is_marked_but_still_indexed(conn, tmp_path):
+    import openpyxl
+
+    root = tmp_path / "表格"
+    root.mkdir()
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "数据"
+    sheet["A1"] = "样本量 42"
+    sheet.protection.sheet = True
+    workbook.save(root / "受保护.xlsx")
+
+    _scan_and_index(conn, root)
+
+    assert search.search(conn, "工作表受保护")["total"] >= 1
+    assert search.search(conn, "样本量 42")["total"] >= 1
+
+
+def test_office_lock_files_are_skipped(conn, tmp_path):
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "~$锁.docx").write_bytes(b"lock")
+    (root / "正常.md").write_text("正常内容", encoding="utf-8")
+
+    source = store.add_source(conn, root)
+    result = scanner.scan_source(conn, source["source_id"])
+
+    assert result["seen"] == 1
+    assert result["skipped"] == 1
+    row = conn.execute(
+        "SELECT files_skipped, skip_reasons FROM source_scan_runs"
+        " WHERE source_id = ? ORDER BY started_at DESC LIMIT 1",
+        (source["source_id"],),
+    ).fetchone()
+    assert row["files_skipped"] == 1
+    assert "office_lock" in row["skip_reasons"]
+
+
 def test_api_scan_indexes_content_before_finishing(client, tmp_path):
     root = tmp_path / "资料"
     root.mkdir()
@@ -338,6 +376,16 @@ def test_api_scan_indexes_content_before_finishing(client, tmp_path):
     source_id = client.post("/api/sources", json={"root": str(root)}).json()["source_id"]
     assert client.post(f"/api/sources/{source_id}/scan").status_code == 202
 
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not client.get("/api/sources").json()["items"][0]["scanning"]:
+            break
+        time.sleep(0.05)
+
+    confirmed = client.put("/api/inventory/policies", json={
+        "source_id": source_id, "policies": {"md": "standard_parse"},
+    })
+    assert confirmed.status_code == 200
     deadline = time.time() + 10
     while time.time() < deadline:
         if not client.get("/api/sources").json()["items"][0]["scanning"]:

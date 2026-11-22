@@ -242,7 +242,7 @@ def client(tmp_path, monkeypatch):
         yield test_client
 
 
-def test_api_deep_scan_runs_ocr(client, tmp_path, monkeypatch):
+def test_first_ingest_runs_ocr(client, tmp_path, monkeypatch):
     _fake_engine(monkeypatch)
     monkeypatch.setattr(ocr, "extract_image",
                         lambda path: [ocr.Section(text="报表里写着 火烈鸟", page=None)])
@@ -258,16 +258,17 @@ def test_api_deep_scan_runs_ocr(client, tmp_path, monkeypatch):
             break
         time.sleep(0.05)
 
-    started = client.post(f"/api/sources/{source_id}/ocr")
-    assert started.status_code == 202
-    assert started.json()["pending"] == 1
-
+    confirmed = client.put("/api/inventory/policies", json={
+        "source_id": source_id, "policies": {"png": "deep_parse"},
+    })
+    assert confirmed.status_code == 200
     deadline = time.time() + 10
     while time.time() < deadline:
         if not client.get("/api/sources").json()["items"][0]["scanning"]:
             break
         time.sleep(0.05)
 
+    # 确认策略后的建库应在扫描流程内自动完成 L2 OCR，而不是等用户再点一次深度解析。
     hits = client.get("/api/search", params={"q": "火烈鸟"}).json()
     assert hits["total"] == 1
     assert hits["items"][0]["index_level"] == "L2"
@@ -345,3 +346,56 @@ def test_ocr_policy_settings_default_and_validation(client, monkeypatch):
     saved = client.put("/api/settings/ocr", json={"policy": "rapidocr"})
     assert saved.status_code == 200
     assert saved.json()["policy"] == "rapidocr"
+
+
+def test_oversized_image_is_downscaled_or_tiled(tmp_path):
+    from PIL import Image
+
+    wide = tmp_path / "wide.png"
+    Image.new("RGB", (12000, 1000), "white").save(wide)
+    tiles = ocr._windows_tiles(wide)
+    try:
+        assert len(tiles) == 1
+        assert tiles[0][0] != wide
+        with Image.open(tiles[0][0]) as image:
+            assert max(image.size) <= ocr.WINDOWS_MAX_IMAGE_DIM
+    finally:
+        for _, _, _, temp in tiles:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
+
+    huge = tmp_path / "huge.png"
+    Image.new("RGB", (21000, 1000), "white").save(huge)
+    tiles = ocr._windows_tiles(huge)
+    try:
+        assert len(tiles) >= 3
+        for path, _, _, temp in tiles:
+            assert path == temp
+            with Image.open(path) as image:
+                assert max(image.size) <= ocr.WINDOWS_TILE_SIZE
+    finally:
+        for _, _, _, temp in tiles:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
+
+
+def test_empty_image_is_empty_not_failed(conn, tmp_path, monkeypatch):
+    _fake_engine(monkeypatch)
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "empty.png").write_bytes(b"")
+
+    source_id = _scan_and_index(conn, root)
+    result = indexer.index_ocr_pending(conn, source_id)
+
+    assert result["empty"] == 1
+    assert result["failed"] == 0
+    assert search.stats(conn)["coverage"]["ocr_empty"] == 1
+
+
+def test_file_lock_error_detection():
+    assert indexer._is_file_lock_error(
+        Exception("The process cannot access the file because it is being used by another process")
+    )
+    assert indexer._is_file_lock_error(Exception("另一个程序正在使用此文件"))
+    assert not indexer._is_file_lock_error(Exception("Package not found"))

@@ -15,10 +15,11 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from . import db, embeddings, indexer, store
+from . import db, embeddings, indexer, ingest, inventory, store
 
 MAX_HASH_BYTES = 32 * 1024 * 1024
 
@@ -37,6 +38,7 @@ DEFAULT_EXCLUDES = {
 
 _running: set[str] = set()
 _followup: dict[str, bool] = {}
+_followup_force: dict[str, bool] = {}
 _running_lock = threading.Lock()
 
 
@@ -49,11 +51,14 @@ def is_running(source_id: str) -> bool:
         return source_id in _running
 
 
-def request_scan(source_id: str) -> bool:
+def request_scan(source_id: str, force_parse: bool = False) -> bool:
     """占用某数据源的同步权；已有任务在跑时记录 follow-up，结束后自动补扫。"""
     with _running_lock:
         if source_id in _running:
             _followup[source_id] = True
+            _followup_force[source_id] = (
+                _followup_force.get(source_id, False) or force_parse
+            )
             return False
         _running.add(source_id)
         return True
@@ -63,35 +68,139 @@ def release_scan(source_id: str) -> None:
     with _running_lock:
         _running.discard(source_id)
         pending = _followup.pop(source_id, False)
+        force = _followup_force.pop(source_id, False)
     if pending:
         # 扫描期间到达的文件事件可能晚于本轮枚举；结束前再补一轮增量。
-        scan_in_background(source_id)
+        if force:
+            scan_in_background(source_id, force_parse=True)
+        else:
+            scan_in_background(source_id)
 
 
-def scan_in_background(source_id: str) -> bool:
-    """目录对账 + 内容解析放到后台线程；接口与监听器共用这一个入口。"""
-    if not request_scan(source_id):
+def scan_in_background(source_id: str, *, force_parse: bool = False) -> bool:
+    """目录对账 + 内容解析放到后台线程；接口与监听器共用这一个入口。
+
+    force_parse 用于手动扫描 / 保存策略：即使关闭了持续自动解析也立即执行。
+    """
+    if not request_scan(source_id, force_parse):
         return False
-    threading.Thread(target=_run_pipeline, args=(source_id,),
+    threading.Thread(target=_run_pipeline, args=(source_id, force_parse),
                      name=f"sync-{source_id}", daemon=True).start()
     return True
 
 
-def _run_pipeline(source_id: str) -> None:
+def _run_pipeline(source_id: str, force_parse: bool = False) -> None:
     try:
         conn = db.connect()
         try:
-            scan_source(conn, source_id)
+            result = scan_source(conn, source_id)
+            source = store.get_source(conn, source_id)
+            if source is None:
+                return
+            if result.get("state") == "done":
+                store.mark_ingest_stage(conn, source_id, "l0")
+
+            first_ingest = source["full_coverage_at"] is None
+            if first_ingest and not inventory.is_confirmed(conn, source_id):
+                store.log_event(
+                    conn, "inventory_ready", source_id,
+                    detail=json.dumps({"state": result.get("state")}, ensure_ascii=False),
+                    outcome="ok",
+                )
+                conn.commit()
+                return
+            allowed_exts = inventory.allowed_exts(conn, source_id)
+            settings = ingest.load(conn)
+            pause = lambda: ingest.paused(conn)
+            delay = ingest.delay_for(settings["profile"])
+            batch = ingest.batch_for(settings["profile"])
+
+            if first_ingest:
+                # 首次建库：不设文件总量上限，直到 L1 队列为空或被用户暂停。
+                l1 = indexer.index_pending(
+                    conn, source_id, batch=batch, ignore_budget=True,
+                    pause_check=pause, row_delay=delay,
+                    allowed_exts=allowed_exts,
+                )
+                if (not l1["paused"]
+                        and indexer.pending_count(
+                            conn, source_id, allowed_exts=allowed_exts) == 0):
+                    store.mark_ingest_stage(conn, source_id, "l1")
+
+                if not l1["paused"] and not pause():
+                    ocr_result = indexer.index_ocr_pending(
+                        conn, source_id, limit=10 ** 9, ignore_budget=True,
+                        pause_check=pause, row_delay=delay,
+                        allowed_exts=allowed_exts,
+                    )
+                    if not ocr_result.get("available"):
+                        store.log_event(
+                            conn, "ocr_unavailable", source_id,
+                            detail=ocr_result.get("message") or "没有可用的 OCR 引擎",
+                            outcome="skipped",
+                        )
+                        store.mark_ingest_stage(conn, source_id, "l2")
+                    elif (not ocr_result.get("paused")
+                          and indexer.ocr_pending_count(
+                              conn, source_id, allowed_exts=allowed_exts) == 0):
+                        store.mark_ingest_stage(conn, source_id, "l2")
+
+                store.refresh_full_coverage(conn, source_id)
+                try:
+                    embeddings.index_pending(conn, source_id, limit=10 ** 6)
+                except Exception:
+                    pass
+                store.refresh_full_coverage(conn, source_id)
+            else:
+                # 日常维护：只处理变化，继续受每日预算限速。
+                if not force_parse and (
+                        ingest.paused(conn) or not settings.get("auto_parse", True)):
+                    return
+                indexer.index_pending(conn, source_id, batch=batch,
+                                      allowed_exts=allowed_exts)
+                try:
+                    indexer.index_ocr_pending(conn, source_id,
+                                              allowed_exts=allowed_exts)
+                except Exception:
+                    pass
+                try:
+                    embeddings.index_in_new_connection(source_id)
+                except Exception:
+                    pass
         finally:
             conn.close()
-        indexer.index_pending_in_new_connection(source_id)
-        # 配置了语义检索时顺手补建向量；失败不影响目录/正文结果。
+    except Exception as exc:
+        # 后台线程不能静默死掉；记录失败原因，下一次扫描或重启会继续。
         try:
-            embeddings.index_in_new_connection(source_id)
+            log_conn = db.connect()
+            try:
+                store.log_event(
+                    log_conn, "sync_failed", source_id,
+                    detail=str(exc)[:400], outcome="error",
+                )
+                log_conn.commit()
+            finally:
+                log_conn.close()
         except Exception:
             pass
     finally:
         release_scan(source_id)
+
+
+def resume_incomplete_sources() -> list[str]:
+    """启动或恢复时，把所有首次建库未完成的数据源重新排入后台。"""
+    conn = db.connect()
+    try:
+        if ingest.paused(conn):
+            return []
+        rows = store.list_incomplete_sources(conn)
+    finally:
+        conn.close()
+    started: list[str] = []
+    for row in rows:
+        if scan_in_background(row["source_id"]):
+            started.append(row["source_id"])
+    return started
 
 
 def _hash_file(path: Path, size: int, mtime_ns: int) -> str:
@@ -112,7 +221,8 @@ def _native_id(st: os.stat_result) -> str | None:
     return f"{st.st_dev}:{st.st_ino}"
 
 
-def _walk(root: Path, excludes: set[str], errors: list[str]) -> Iterator[tuple[Path, os.stat_result]]:
+def _walk(root: Path, excludes: set[str], errors: list[str],
+          skipped: dict[str, int]) -> Iterator[tuple[Path, os.stat_result]]:
     stack = [root]
     while stack:
         current = stack.pop()
@@ -123,15 +233,22 @@ def _walk(root: Path, excludes: set[str], errors: list[str]) -> Iterator[tuple[P
             continue
         for entry in entries:
             try:
+                if entry.name.startswith("~$"):
+                    # Office 打开文件时生成的属主/锁文件，不是用户内容。
+                    skipped["office_lock"] += 1
+                    continue
                 if entry.is_symlink():
                     # 符号链接 / junction 一律跳过，防止越过授权范围。
+                    skipped["symlink"] += 1
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     if entry.name.lower() in excludes:
+                        skipped["excluded_dir"] += 1
                         continue
                     stack.append(Path(entry.path))
                 elif entry.is_file(follow_symlinks=False):
                     if entry.name.lower() in excludes:
+                        skipped["excluded_file"] += 1
                         continue
                     # Windows 上 DirEntry.stat() 不填充文件索引，必须用 os.stat 取 stable ID。
                     yield Path(entry.path), os.stat(entry.path, follow_symlinks=False)
@@ -150,9 +267,10 @@ def _record(root: Path, path: Path, st: os.stat_result) -> dict:
     }
 
 
-def _collect_records(root: Path, excludes: set[str], errors: list[str]) -> list[dict]:
+def _collect_records(root: Path, excludes: set[str], errors: list[str],
+                     skipped: dict[str, int]) -> list[dict]:
     records = []
-    for path, st in _walk(root, excludes, errors):
+    for path, st in _walk(root, excludes, errors, skipped):
         try:
             records.append(_record(root, path, st))
         except ValueError:
@@ -260,13 +378,16 @@ def _start_run(conn: sqlite3.Connection, source_id: str) -> str:
     return run_id
 
 
-def _finish_run(conn: sqlite3.Connection, run_id: str, state: str, counters: dict, message: str) -> None:
+def _finish_run(conn: sqlite3.Connection, run_id: str, state: str, counters: dict,
+                message: str, skipped: int = 0, skip_reasons: str | None = None) -> None:
     conn.execute(
         "UPDATE source_scan_runs SET state = ?, files_seen = ?, files_new = ?, files_updated = ?,"
-        " files_moved = ?, files_missing = ?, errors = ?, message = ?, finished_at = ?"
+        " files_moved = ?, files_missing = ?, files_skipped = ?, skip_reasons = ?,"
+        " errors = ?, message = ?, finished_at = ?"
         " WHERE run_id = ?",
         (state, counters["seen"], counters["new"], counters["updated"], counters["moved"],
-         counters["missing"], counters["errors"], message, store.now_iso(), run_id),
+         counters["missing"], skipped, skip_reasons, counters["errors"], message,
+         store.now_iso(), run_id),
     )
     conn.commit()
 
@@ -275,8 +396,12 @@ def scan_source(conn: sqlite3.Connection, source_id: str) -> dict:
     source = store.get_source(conn, source_id)
     if source is None:
         raise ScanError("数据源不存在")
-    counters = {"seen": 0, "new": 0, "updated": 0, "moved": 0, "missing": 0, "errors": 0}
+    counters = {"seen": 0, "new": 0, "updated": 0, "moved": 0, "missing": 0,
+                "skipped": 0, "errors": 0}
     errors: list[str] = []
+    skipped: dict[str, int] = {
+        "symlink": 0, "excluded_dir": 0, "excluded_file": 0, "office_lock": 0,
+    }
     root = Path(source["root_uri"])
     if not root.is_dir():
         run_id = _start_run(conn, source_id)
@@ -289,13 +414,17 @@ def scan_source(conn: sqlite3.Connection, source_id: str) -> dict:
 
     run_id = _start_run(conn, source_id)
     excludes = DEFAULT_EXCLUDES | {name.lower() for name in json.loads(source["excludes"] or "[]")}
-    records = _collect_records(root, excludes, errors)
+    records = _collect_records(root, excludes, errors, skipped)
     counters["seen"] = len(records)
+    counters["skipped"] = sum(skipped.values())
+    skip_reasons = json.dumps({key: value for key, value in skipped.items() if value},
+                              ensure_ascii=False)
 
     if not records and errors:
         offline = store.mark_source_offline(conn, source_id)
         conn.commit()
-        _finish_run(conn, run_id, "failed", counters, errors[0])
+        _finish_run(conn, run_id, "failed", counters, errors[0],
+                    counters["skipped"], skip_reasons)
         store.log_event(conn, "scan_failed", source_id, detail=errors[0], outcome=f"offline={offline}")
         conn.commit()
         return {"run_id": run_id, "state": "failed", "offline": offline, **counters}
@@ -314,12 +443,12 @@ def scan_source(conn: sqlite3.Connection, source_id: str) -> dict:
     )
     store.log_event(
         conn, "scan_completed", source_id,
-        detail=json.dumps(counters, ensure_ascii=False),
+        detail=json.dumps({**counters, "skip_reasons": skipped}, ensure_ascii=False),
         outcome="ok",
     )
     conn.commit()
     _finish_run(conn, run_id, "done", counters,
-                errors[0] if errors else "")
+                errors[0] if errors else "", counters["skipped"], skip_reasons)
     return {"run_id": run_id, "state": "done", **counters, "errors_detail": errors[:20]}
 
 
@@ -345,6 +474,8 @@ def sync_paths(conn: sqlite3.Connection, source_id: str, paths: Iterable[str]) -
         except ValueError:
             continue
         if any(part.lower() in excludes for part in rel_parts) or path.is_symlink():
+            continue
+        if any(part.startswith("~$") for part in rel_parts):
             continue
         try:
             st = os.stat(path, follow_symlinks=False)

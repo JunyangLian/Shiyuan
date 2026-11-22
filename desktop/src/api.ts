@@ -30,6 +30,7 @@ export interface Source {
   state: "active" | "paused";
   health: string;
   last_scan_at: string | null;
+  l0_completed_at: string | null;
   excludes: string;
   stats: SourceStats;
   scanning: boolean;
@@ -55,6 +56,19 @@ export interface SearchItem {
   bbox: number[][] | null;
   source_id: string;
   source_label: string;
+  family_id?: string | null;
+  family_size?: number;
+  family_title?: string;
+  version_label?: string | null;
+  matched_folder?: string | null;
+  family_versions?: {
+    asset_id: string;
+    location_id: string | null;
+    path: string | null;
+    name: string | null;
+    rel_path?: string | null;
+    version_label: string;
+  }[];
 }
 
 export interface SearchResponse {
@@ -115,6 +129,222 @@ export interface MaintenanceInfo {
   };
 }
 
+export interface IngestSettings {
+  profile: "quiet" | "balanced" | "fast";
+  paused: boolean;
+  auto_parse: boolean;
+  profiles: { key: "quiet" | "balanced" | "fast"; label: string }[];
+}
+
+export interface UpdateActivity {
+  name: string | null;
+  path: string;
+  source_id: string;
+  source_label: string;
+  stage: "L1" | "L2";
+  state: string;
+  quality: string | null;
+  chars: number;
+  created_at: string;
+}
+
+export interface UpdateFailure {
+  job_id: string;
+  name: string | null;
+  path: string;
+  source_id: string;
+  source_label: string;
+  stage: string;
+  attempts: number;
+  error: string | null;
+  updated_at: string;
+}
+
+export interface UpdateOverview {
+  auto_parse: boolean;
+  paused: boolean;
+  profile: "quiet" | "balanced" | "fast";
+  watcher_running: boolean;
+  watch_enabled: boolean;
+  last_sync_at: string | null;
+  summary: {
+    pending_l1: number;
+    pending_l2: number;
+    parsed_24h: number;
+    failed: number;
+    sources: number;
+    awaiting_policy: number;
+  };
+  recent: UpdateActivity[];
+  failures: UpdateFailure[];
+  generated_at: string;
+}
+
+export type ContentPolicy = "deep_parse" | "standard_parse" | "metadata_only" | "exclude_content";
+
+export interface InventoryFileType {
+  ext: string;
+  label: string;
+  count: number;
+  bytes: number;
+  effective_count: number;
+  effective_bytes: number;
+  system_excluded_count: number;
+  system_excluded_bytes: number;
+  count_pct: number;
+  bytes_pct: number;
+  category: string;
+  recommended_policy: ContentPolicy;
+  selected_policy: ContentPolicy | null;
+  confidence: "high" | "medium" | "low";
+  reasons: string[];
+  subcategories: Record<string, number>;
+  samples: { path: string; size: number }[];
+}
+
+export interface InventoryFileTypes {
+  items: InventoryFileType[];
+  policies: Record<string, ContentPolicy>;
+  confirmed: boolean;
+  total_files: number;
+  total_bytes: number;
+  effective_files: number;
+  effective_bytes: number;
+  system_excluded_files: number;
+  system_excluded_bytes: number;
+  generated_at: string;
+  rules_version: string;
+}
+
+export type ExternalPreset = "codex" | "claude_code" | "deepseek" | "custom";
+export type ExternalTransport = "mcp" | "http";
+
+export interface ExternalClient {
+  client_id: string;
+  name: string;
+  preset: ExternalPreset;
+  preset_label: string;
+  preset_hint: string;
+  transport: ExternalTransport;
+  transport_label: string;
+  state: string;
+  created_at: string;
+  last_test_at: string | null;
+  last_status: "ok" | "failed" | null;
+  last_error: string | null;
+  call_count: number;
+  last_call_at: string | null;
+}
+
+export interface ExternalClientConfig {
+  client_id: string;
+  name: string;
+  preset: ExternalPreset;
+  transport: ExternalTransport;
+  mcp: {
+    command: string;
+    args: string[];
+    cwd: string | null;
+    env: Record<string, string>;
+    snippet: string;
+  } | null;
+  http: {
+    base_url: string;
+    authorization: string;
+    endpoints: { method: string; path: string; description: string }[];
+  } | null;
+  notes: string[];
+}
+
+export type ParseResultStatus =
+  | "ok"
+  | "failed"
+  | "empty"
+  | "pending"
+  | "locked"
+  | "unsupported";
+
+export interface ParseResultItem {
+  location_id: string;
+  version_id: string;
+  name: string;
+  path: string;
+  rel_path: string;
+  ext: string;
+  size: number;
+  status: ParseResultStatus;
+  stage: "L1" | "L2" | "L1+L2" | null;
+  chars: number;
+  pages: number;
+  quality: string | null;
+  message: string | null;
+  error: string | null;
+  attempts: number;
+  updated_at: string | null;
+}
+
+export interface ParseResults {
+  source_id: string;
+  summary: {
+    total: number;
+    parsed: number;
+    failed: number;
+    empty: number;
+    pending: number;
+    locked: number;
+    unsupported: number;
+  };
+  items: ParseResultItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  generated_at: string;
+}
+
+export interface ExternalTestResult {
+  client_id: string;
+  ok: boolean;
+  status: "ok" | "failed";
+  message: string;
+  latency_ms: number;
+}
+
+export interface FullCoverageSource {
+  source_id: string;
+  label: string;
+  root_uri: string;
+  created_at: string;
+  l0_completed_at: string | null;
+  l1_completed_at: string | null;
+  l2_completed_at: string | null;
+  full_coverage_at: string | null;
+  full_coverage_seconds: number | null;
+}
+
+export interface FullCoverage {
+  complete: boolean;
+  started_at: string | null;
+  completed_at: string | null;
+  time_to_full_coverage_seconds: number | null;
+  elapsed_seconds: number | null;
+  l0_complete: boolean;
+  l1_complete: boolean;
+  l2_complete: boolean;
+  l0_completed_at: string | null;
+  l1_completed_at: string | null;
+  l2_completed_at: string | null;
+  l0_seconds: number | null;
+  l1_seconds: number | null;
+  l2_seconds: number | null;
+  pending_l1: number;
+  pending_l2: number;
+  failed: number;
+  ocr_failed: number;
+  unsupported: number;
+  excluded: number;
+  sources: FullCoverageSource[];
+}
+
 export interface OverviewStats {
   files: { available: number; missing: number; offline: number; stale: number };
   by_ext: { ext: string; count: number }[];
@@ -125,6 +355,10 @@ export interface OverviewStats {
     state: string;
     health: string;
     last_scan_at: string | null;
+    l0_completed_at: string | null;
+    l1_completed_at: string | null;
+    l2_completed_at: string | null;
+    full_coverage_at: string | null;
     available: number;
     stale: number;
   }[];
@@ -136,11 +370,13 @@ export interface OverviewStats {
     content_pending: number;
     content_empty: number;
     content_failed: number;
+    content_locked: number;
     content_unsupported: number;
     low_quality: number;
     ocr_indexed: number;
     ocr_empty: number;
     ocr_failed: number;
+    ocr_locked: number;
     ocr_pending: number;
     mixed_pdf: number;
     ocr_policy: "auto" | "windows" | "rapidocr";
@@ -150,11 +386,14 @@ export interface OverviewStats {
     ocr_message: string | null;
   };
   maintenance: MaintenanceInfo;
+  ingest: IngestSettings;
+  full_coverage: FullCoverage;
 }
 
 export interface Citation {
   n: number;
   chunk_id: string;
+  asset_id: string;
   location_id: string;
   name: string;
   path: string;
@@ -166,6 +405,17 @@ export interface Citation {
   version_id: string;
   mtime: string | null;
   bbox: number[][] | null;
+  family_id?: string | null;
+  family_size?: number;
+  family_title?: string;
+  version_label?: string | null;
+  sources?: {
+    asset_id: string;
+    location_id: string | null;
+    path: string | null;
+    name: string | null;
+    version_label: string;
+  }[];
 }
 
 export interface AnswerResult {
@@ -173,7 +423,7 @@ export interface AnswerResult {
   answer: string;
   refused: boolean;
   reason: string | null;
-  provider: "extractive" | "openai" | "ollama";
+  provider: "extractive" | "openai" | "ollama" | "library";
   model: string | null;
   citations: Citation[];
   evidence_count: number;
@@ -248,6 +498,99 @@ export interface MaintenanceEvent {
   detail: string | null;
   outcome: string | null;
   timestamp: string;
+}
+
+export interface DocumentFamilySummary {
+  family_id: string;
+  title: string;
+  confidence: string;
+  size: number;
+  members: {
+    asset_id: string;
+    version_label: string;
+    similarity: number;
+    path: string | null;
+  }[];
+}
+
+export interface DocumentFamilyMember {
+  asset_id: string;
+  location_id: string | null;
+  path: string | null;
+  name: string | null;
+  rel_path: string | null;
+  version_label: string;
+}
+
+export interface FamilyContentSource {
+  chunk_id: string;
+  asset_id: string;
+  location_id: string | null;
+  path: string | null;
+  name: string | null;
+}
+
+export interface FamilyContentGroup {
+  content_group_id: string;
+  normalized_hash: string;
+  text: string;
+  created_at: string;
+  sources: FamilyContentSource[];
+}
+
+export interface DocumentFamilyDetail {
+  family: {
+    family_id: string;
+    title: string;
+    confidence: string;
+    rules_version: string;
+    created_at: string;
+    updated_at: string;
+  };
+  members: DocumentFamilyMember[];
+  content_groups: FamilyContentGroup[];
+}
+
+export interface FamilyDiffItem {
+  content_group_id: string;
+  text: string;
+  sources: {
+    asset_id: string;
+    name: string | null;
+    path: string | null;
+    version_label: string;
+  }[];
+}
+
+export interface FamilyDiffChange {
+  similarity: number;
+  left: FamilyDiffItem;
+  right: FamilyDiffItem;
+}
+
+export interface FamilyDiff {
+  family_id: string;
+  family_title: string;
+  left: { asset_id: string; name: string | null; path: string | null; version_label: string };
+  right: { asset_id: string; name: string | null; path: string | null; version_label: string };
+  summary: {
+    left_groups: number;
+    right_groups: number;
+    shared: number;
+    removed: number;
+    added: number;
+    modified: number;
+  };
+  shared: FamilyDiffItem[];
+  removed: FamilyDiffItem[];
+  added: FamilyDiffItem[];
+  modified: FamilyDiffChange[];
+  truncated: {
+    shared: boolean;
+    removed: boolean;
+    added: boolean;
+    modified: boolean;
+  };
 }
 
 // 安装版由 Tauri 资源服务器加载，相对 /api 会返回 index.html；直接访问本机核心。
@@ -398,6 +741,97 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload),
     }),
+  ingestSettings: () => request<IngestSettings>("/api/settings/ingest"),
+  saveIngestSettings: (payload: {
+    profile?: string;
+    paused?: boolean;
+    auto_parse?: boolean;
+  }) =>
+    request<IngestSettings>("/api/settings/ingest", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  updatesOverview: () => request<UpdateOverview>("/api/updates/overview"),
+  checkUpdates: () =>
+    request<{ started: string[] }>("/api/updates/check", { method: "POST" }),
+  rebuildFamilies: () =>
+    request<{ state: string }>("/api/families/rebuild", { method: "POST" }),
+  documentFamilies: (limit = 50) =>
+    request<{ items: DocumentFamilySummary[] }>(`/api/families?limit=${limit}`),
+  documentFamily: (id: string, limit = 1000) =>
+    request<DocumentFamilyDetail>(`/api/families/${id}?limit=${limit}`),
+  documentFamilyMembers: (id: string) =>
+    request<{
+      family_id: string;
+      title: string;
+      confidence: string;
+      members: DocumentFamilyMember[];
+    }>(`/api/families/${id}/members`),
+  familyMembersByAsset: (assetId: string) =>
+    request<{
+      family_id: string;
+      title: string;
+      confidence: string;
+      members: DocumentFamilyMember[];
+    }>(`/api/families/by-asset/${encodeURIComponent(assetId)}/members`),
+  familyDiff: (
+    id: string,
+    leftAssetId: string,
+    rightAssetId: string,
+    limit = 200,
+  ) => {
+    const params = new URLSearchParams({
+      left_asset_id: leftAssetId,
+      right_asset_id: rightAssetId,
+      limit: String(limit),
+    });
+    return request<FamilyDiff>(`/api/families/${id}/diff?${params.toString()}`);
+  },
+  inventoryFileTypes: (sourceId?: string) =>
+    request<InventoryFileTypes>(
+      `/api/inventory/file-types${sourceId ? `?source_id=${encodeURIComponent(sourceId)}` : ""}`,
+    ),
+  saveInventoryPolicies: (sourceId: string, policies: Record<string, ContentPolicy>) =>
+    request<{
+      source_id: string;
+      policies: Record<string, ContentPolicy>;
+      confirmed: boolean;
+      started: boolean;
+    }>("/api/inventory/policies", {
+      method: "PUT",
+      body: JSON.stringify({ source_id: sourceId, policies }),
+    }),
+  sourceParseResults: (
+    sourceId: string,
+    options: { status?: string; limit?: number; offset?: number } = {},
+  ) => {
+    const params = new URLSearchParams({
+      limit: String(options.limit ?? 100),
+      offset: String(options.offset ?? 0),
+    });
+    if (options.status && options.status !== "all") params.set("status", options.status);
+    return request<ParseResults>(
+      `/api/sources/${sourceId}/parse-results?${params.toString()}`,
+    );
+  },
+  externalClients: () => request<{ items: ExternalClient[] }>("/api/external/clients"),
+  createExternalClient: (payload: {
+    name?: string;
+    preset: ExternalPreset;
+    transport?: ExternalTransport;
+  }) =>
+    request<{ client: ExternalClient }>("/api/external/clients", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  deleteExternalClient: (id: string) =>
+    request<{ client_id: string; deleted: boolean }>(`/api/external/clients/${id}`, {
+      method: "DELETE",
+    }),
+  externalClientConfig: (id: string) =>
+    request<ExternalClientConfig>(`/api/external/clients/${id}/config`),
+  testExternalClient: (id: string) =>
+    request<ExternalTestResult>(`/api/external/clients/${id}/test`, { method: "POST" }),
   events: (limit = 30) => request<{ items: MaintenanceEvent[] }>(`/api/events?limit=${limit}`),
   maintenance: (
     action: "reindex" | "retry" | "ocr" | "cleanup" | "embed",

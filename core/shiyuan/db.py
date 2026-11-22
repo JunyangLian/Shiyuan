@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS sources (
     state        TEXT NOT NULL DEFAULT 'active',
     health       TEXT NOT NULL DEFAULT 'unknown',
     last_scan_at TEXT,
+    l0_completed_at TEXT,
+    l1_completed_at TEXT,
+    l2_completed_at TEXT,
+    full_coverage_at TEXT,
     created_at   TEXT NOT NULL
 );
 
@@ -72,6 +76,8 @@ CREATE TABLE IF NOT EXISTS source_scan_runs (
     files_updated INTEGER NOT NULL DEFAULT 0,
     files_moved   INTEGER NOT NULL DEFAULT 0,
     files_missing INTEGER NOT NULL DEFAULT 0,
+    files_skipped INTEGER NOT NULL DEFAULT 0,
+    skip_reasons  TEXT,
     errors        INTEGER NOT NULL DEFAULT 0,
     message       TEXT,
     started_at    TEXT NOT NULL,
@@ -185,6 +191,71 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session
     ON chat_messages(session_id, created_at);
+
+-- 文档家族：同一份知识内容的不同版本文件。成员仍各自保留独立资产与路径。
+CREATE TABLE IF NOT EXISTS document_families (
+    family_id            TEXT PRIMARY KEY,
+    title                TEXT NOT NULL,
+    recommended_asset_id TEXT,
+    confidence           TEXT NOT NULL DEFAULT 'medium',
+    rules_version        TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS document_family_members (
+    family_id    TEXT NOT NULL,
+    asset_id     TEXT NOT NULL,
+    version_label TEXT,
+    similarity   REAL,
+    is_recommended INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT,
+    PRIMARY KEY (family_id, asset_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_family_members_asset
+    ON document_family_members(asset_id);
+
+-- 家族内段落级内容分组：相同段落只存一份，来源保留到 chunk。
+CREATE TABLE IF NOT EXISTS family_content_groups (
+    content_group_id    TEXT PRIMARY KEY,
+    family_id           TEXT NOT NULL,
+    normalized_hash     TEXT NOT NULL,
+    representative_text TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    UNIQUE (family_id, normalized_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_groups_family
+    ON family_content_groups(family_id);
+
+CREATE TABLE IF NOT EXISTS family_content_sources (
+    content_group_id TEXT NOT NULL,
+    chunk_id         TEXT NOT NULL,
+    asset_id         TEXT NOT NULL,
+    location_id      TEXT,
+    PRIMARY KEY (content_group_id, chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_sources_group
+    ON family_content_sources(content_group_id);
+
+-- 外部 Agent 连接：Codex / Claude Code / DeepSeek Harness 等本机客户端。
+-- token 用 DPAPI 保护；列表接口永不回显明文，只有配置接口按需解密。
+CREATE TABLE IF NOT EXISTS external_clients (
+    client_id    TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    preset       TEXT NOT NULL,
+    transport    TEXT NOT NULL,            -- mcp / http
+    token        TEXT NOT NULL,
+    state        TEXT NOT NULL DEFAULT 'active',
+    created_at   TEXT NOT NULL,
+    last_test_at TEXT,
+    last_status  TEXT,                     -- ok / failed
+    last_error   TEXT,
+    call_count   INTEGER NOT NULL DEFAULT 0,
+    last_call_at TEXT
+);
 """
 
 
@@ -192,7 +263,7 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     target = Path(path) if path is not None else db_path()
     # FastAPI 的同步依赖可能在线程池的不同线程里初始化与收尾，连接不能沿用
     # sqlite3 默认的同线程限制；每个连接仍只服务单次请求，不跨请求共享。
-    conn = sqlite3.connect(str(target), timeout=10.0, check_same_thread=False)
+    conn = sqlite3.connect(str(target), timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -203,6 +274,16 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
 def _ensure_columns(conn: sqlite3.Connection) -> None:
     """给旧数据库补列：CREATE IF NOT EXISTS 不会修改已存在的表。"""
     additions = {
+        "sources": {
+            "l0_completed_at": "TEXT",
+            "l1_completed_at": "TEXT",
+            "l2_completed_at": "TEXT",
+            "full_coverage_at": "TEXT",
+        },
+        "source_scan_runs": {
+            "files_skipped": "INTEGER NOT NULL DEFAULT 0",
+            "skip_reasons": "TEXT",
+        },
         "parse_artifacts": {
             "page_count": "INTEGER NOT NULL DEFAULT 0",
             "text_pages": "INTEGER NOT NULL DEFAULT 0",

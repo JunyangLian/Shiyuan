@@ -16,9 +16,11 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
-from . import (__version__, answer, chat, config, db, embeddings, indexer, maintenance, ocr,
-               query, scanner, search, secrets_store, store, watcher)
+from . import (__version__, answer, chat, config, db, embeddings, external, families,
+               indexer, ingest, inventory, maintenance, ocr, query, scanner, search,
+               secrets_store, store, updates, watcher)
 from .config import db_path
 
 
@@ -78,6 +80,10 @@ async def lifespan(app: FastAPI):
         manager = watcher.WatcherManager(db_path())
         manager.start()
     app.state.watcher = manager
+    # 首次建库未完成的数据源在重启后自动续跑；已有队列在数据库里，不会重复解析。
+    scanner.resume_incomplete_sources()
+    # 文档家族在后台重建，不阻塞核心启动。
+    families.rebuild_async()
     try:
         yield
     finally:
@@ -89,19 +95,43 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="拾源 Knowledge Core", version=__version__, lifespan=lifespan)
 
 
+_EXTERNAL_GET_PATHS = {
+    "/api/health", "/api/sources", "/api/search", "/api/stats", "/api/events", "/api/jobs",
+}
+_EXTERNAL_POST_PATHS = {"/api/ask"}
+
+
 @app.middleware("http")
 async def require_api_token(request: Request, call_next):
-    """本机 API 默认要求进程级访问令牌；OPTIONS 预检交给 CORS。"""
+    """本机 API 默认要求访问令牌；外部 Agent 令牌只能读检索、问答与统计。"""
     if request.method == "OPTIONS" or not config.api_auth_enabled():
         return await call_next(request)
     expected = getattr(request.app.state, "api_token", None)
     supplied = _request_token(request)
-    if not expected or not supplied or not hmac.compare_digest(supplied, expected):
-        return JSONResponse(
-            {"detail": "未授权：缺少或无效的本地访问令牌"},
-            status_code=401,
-        )
-    return await call_next(request)
+    if expected and supplied and hmac.compare_digest(supplied, expected):
+        return await call_next(request)
+
+    if supplied:
+        client = await run_in_threadpool(external.authenticate, supplied)
+        if client is not None:
+            path = request.url.path
+            method = request.method.upper()
+            allowed = (
+                (method == "GET" and path in _EXTERNAL_GET_PATHS)
+                or (method == "POST" and path in _EXTERNAL_POST_PATHS)
+            )
+            if not allowed:
+                return JSONResponse(
+                    {"detail": "外部 Agent 令牌只允许只读检索、问答与统计"},
+                    status_code=403,
+                )
+            request.state.external_client = client
+            return await call_next(request)
+
+    return JSONResponse(
+        {"detail": "未授权：缺少或无效的本地访问令牌"},
+        status_code=401,
+    )
 
 
 # CORS 必须最后添加，作为最外层中间件，保证 401 响应也带跨域头。
@@ -164,6 +194,23 @@ class OcrSettingsPayload(BaseModel):
     policy: str | None = None
 
 
+class IngestSettingsPayload(BaseModel):
+    profile: str | None = None
+    paused: bool | None = None
+    auto_parse: bool | None = None
+
+
+class InventoryPoliciesPayload(BaseModel):
+    source_id: str | None = None
+    policies: dict[str, str]
+
+
+class ExternalClientPayload(BaseModel):
+    name: str | None = Field(default=None, max_length=40)
+    preset: str
+    transport: str = "mcp"
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "version": __version__, "db": str(db_path())}
@@ -180,6 +227,10 @@ def list_sources(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
             "state": row["state"],
             "health": row["health"],
             "last_scan_at": row["last_scan_at"],
+            "l0_completed_at": row["l0_completed_at"],
+            "l1_completed_at": row["l1_completed_at"],
+            "l2_completed_at": row["l2_completed_at"],
+            "full_coverage_at": row["full_coverage_at"],
             "excludes": row["excludes"],
             "stats": store.source_stats(conn, row["source_id"]),
             "scanning": scanner.is_running(row["source_id"]),
@@ -249,7 +300,7 @@ def delete_source(source_id: str, request: Request,
 def start_scan(source_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     if store.get_source(conn, source_id) is None:
         raise HTTPException(status_code=404, detail="数据源不存在")
-    if not scanner.scan_in_background(source_id):
+    if not scanner.scan_in_background(source_id, force_parse=True):
         raise HTTPException(status_code=409, detail="该数据源正在扫描")
     return {"source_id": source_id, "state": "running"}
 
@@ -289,6 +340,104 @@ def run_search(q: str = "", limit: int = 50, offset: int = 0,
 @app.get("/api/stats")
 def run_stats(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     return search.stats(conn)
+
+
+@app.get("/api/inventory/dry-run")
+def inventory_dry_run(source_id: str | None = None, sample_limit: int = 5,
+                      conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """盘点分类 dry-run：只读现有资产，不写分类或策略。"""
+    if source_id and store.get_source(conn, source_id) is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    return inventory.dry_run(conn, source_id=source_id,
+                             sample_limit=max(1, min(sample_limit, 20)))
+
+
+@app.get("/api/inventory/file-types")
+def inventory_file_types(source_id: str | None = None, sample_limit: int = 2,
+                         conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """按扩展名聚合，供 File types 选择界面使用。"""
+    if source_id and store.get_source(conn, source_id) is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    return inventory.file_types(conn, source_id=source_id,
+                               sample_limit=max(1, min(sample_limit, 10)))
+
+
+@app.get("/api/inventory/policies")
+def get_inventory_policies(source_id: str | None = None,
+                           conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    if source_id and store.get_source(conn, source_id) is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    return {
+        "source_id": source_id,
+        "policies": inventory.load_policies(conn, source_id),
+        "confirmed": inventory.is_confirmed(conn, source_id) if source_id else False,
+    }
+
+
+@app.put("/api/inventory/policies")
+def put_inventory_policies(payload: InventoryPoliciesPayload,
+                           conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    if payload.source_id and store.get_source(conn, payload.source_id) is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    try:
+        normalized = inventory.save_policies(
+            conn, payload.policies, source_id=payload.source_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    started = False
+    if payload.source_id:
+        started = scanner.scan_in_background(payload.source_id, force_parse=True)
+    return {
+        "source_id": payload.source_id,
+        "policies": normalized,
+        "confirmed": True,
+        "started": started,
+    }
+
+
+@app.get("/api/external/clients")
+def list_external_clients(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    return {"items": external.list_clients(conn)}
+
+
+@app.post("/api/external/clients", status_code=201)
+def create_external_client(payload: ExternalClientPayload,
+                           conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        client = external.create_client(
+            conn, preset=payload.preset, transport=payload.transport, name=payload.name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"client": client}
+
+
+@app.delete("/api/external/clients/{client_id}")
+def delete_external_client(client_id: str,
+                           conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return external.delete_client(conn, client_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="外部连接不存在") from exc
+
+
+@app.get("/api/external/clients/{client_id}/config")
+def get_external_client_config(client_id: str,
+                               conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return external.client_config(conn, client_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="外部连接不存在") from exc
+
+
+@app.post("/api/external/clients/{client_id}/test")
+def test_external_client(client_id: str,
+                         conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return external.test_client(conn, client_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="外部连接不存在") from exc
 
 
 @app.post("/api/ask")
@@ -412,6 +561,162 @@ def put_ocr_settings(payload: OcrSettingsPayload,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/settings/ingest")
+def get_ingest_settings(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    return ingest.public_settings(conn)
+
+
+@app.put("/api/settings/ingest")
+def put_ingest_settings(payload: IngestSettingsPayload,
+                        conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        result = ingest.update(
+            conn, profile=payload.profile, paused=payload.paused,
+            auto_parse=payload.auto_parse,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result.get("paused") is False:
+        scanner.resume_incomplete_sources()
+    return ingest.public_settings(conn)
+
+
+@app.get("/api/updates/overview")
+def updates_overview(request: Request,
+                     conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    manager = getattr(request.app.state, "watcher", None)
+    return updates.overview(
+        conn, watcher_running=manager is not None,
+        watch_enabled=config.watch_enabled(),
+    )
+
+
+@app.post("/api/updates/check")
+def updates_check(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """手动触发一次全量检查；即使关闭自动解析，也立即执行一轮。"""
+    started = [
+        row["source_id"] for row in store.list_sources(conn)
+        if row["state"] == "active"
+        and scanner.scan_in_background(row["source_id"], force_parse=True)
+    ]
+    return {"started": started}
+
+
+@app.post("/api/families/rebuild")
+def rebuild_document_families() -> dict:
+    started = families.rebuild_async()
+    return {"state": "running" if started else "already_running"}
+
+
+@app.get("/api/families")
+def list_document_families(limit: int = 50,
+                           conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    limit = max(1, min(limit, 200))
+    rows = conn.execute(
+        "SELECT f.family_id, f.title, f.confidence,"
+        " COUNT(m.asset_id) AS size"
+        " FROM document_families f"
+        " JOIN document_family_members m ON m.family_id = f.family_id"
+        " GROUP BY f.family_id ORDER BY size DESC, f.title LIMIT ?",
+        (limit,),
+    ).fetchall()
+    items = []
+    for row in rows:
+        members = conn.execute(
+            "SELECT m.asset_id, m.version_label, m.similarity, l.path"
+            " FROM document_family_members m"
+            " LEFT JOIN asset_locations l ON l.asset_id = m.asset_id AND l.location_id = ("
+            "  SELECT l2.location_id FROM asset_locations l2"
+            "  WHERE l2.asset_id = m.asset_id AND l2.availability = 'AVAILABLE'"
+            "  ORDER BY l2.path LIMIT 1)"
+            " WHERE m.family_id = ? ORDER BY l.path",
+            (row["family_id"],),
+        ).fetchall()
+        items.append({
+            "family_id": row["family_id"],
+            "title": row["title"],
+            "confidence": row["confidence"],
+            "size": row["size"],
+            "members": [dict(member) for member in members],
+        })
+    return {"items": items}
+
+
+@app.get("/api/families/{family_id}")
+def get_document_family(family_id: str, limit: int = 200,
+                        conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    row = conn.execute(
+        "SELECT family_id, title, confidence, rules_version, created_at, updated_at"
+        " FROM document_families WHERE family_id = ?",
+        (family_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="文档家族不存在")
+    return {
+        "family": dict(row),
+        "members": families.family_members(conn, family_id),
+        "content_groups": families.content_groups(
+            conn, family_id, max(1, min(limit, 1000))
+        ),
+    }
+
+
+@app.get("/api/families/{family_id}/members")
+def get_document_family_versions(family_id: str,
+                                 conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """只返回家族成员，供引用里的“N 个关联版本”展开查看。"""
+    row = conn.execute(
+        "SELECT family_id, title, confidence FROM document_families WHERE family_id = ?",
+        (family_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="文档家族不存在")
+    return {
+        "family_id": row["family_id"],
+        "title": row["title"],
+        "confidence": row["confidence"],
+        "members": families.family_members(conn, family_id),
+    }
+
+
+@app.get("/api/families/by-asset/{asset_id}/members")
+def get_document_family_versions_by_asset(asset_id: str,
+                                          conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """按文件解析当前家族，兼容家族重建后旧引用里的 family_id 失效。"""
+    row = conn.execute(
+        "SELECT f.family_id, f.title, f.confidence"
+        " FROM document_family_members m"
+        " JOIN document_families f ON f.family_id = m.family_id"
+        " WHERE m.asset_id = ?",
+        (asset_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="该文件目前不属于任何文档家族")
+    return {
+        "family_id": row["family_id"],
+        "title": row["title"],
+        "confidence": row["confidence"],
+        "members": families.family_members(conn, row["family_id"]),
+    }
+
+
+@app.get("/api/families/{family_id}/diff")
+def diff_document_family(family_id: str,
+                         left_asset_id: str = Query(min_length=1),
+                         right_asset_id: str = Query(min_length=1),
+                         limit: int = 200,
+                         conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """对比家族内两个版本：共享、新增、删除、近似修改；不判断版本优劣。"""
+    try:
+        return families.diff_versions(
+            conn, family_id, left_asset_id, right_asset_id, limit,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/events")
 def list_events(limit: int = 20, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     rows = conn.execute(
@@ -426,6 +731,22 @@ def list_events(limit: int = 20, conn: sqlite3.Connection = Depends(get_conn)) -
 def list_index_jobs(status: str | None = None, stage: str | None = None, limit: int = 50,
                     conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     return {"items": indexer.list_jobs(conn, status=status, stage=stage, limit=limit)}
+
+
+@app.get("/api/sources/{source_id}/parse-results")
+def source_parse_results(source_id: str, status: str | None = None,
+                         limit: int = 100, offset: int = 0,
+                         conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """按数据源查看逐文件解析结果：成功、失败、无文本、待解析、不支持。"""
+    if store.get_source(conn, source_id) is None:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    allowed = {"all", "ok", "failed", "empty", "pending", "locked", "unsupported"}
+    if status and status not in allowed:
+        raise HTTPException(status_code=400, detail="未知的解析状态")
+    return indexer.parse_results(
+        conn, source_id, status=status,
+        limit=max(1, min(limit, 500)), offset=max(0, offset),
+    )
 
 
 @app.post("/api/jobs/{job_id}/retry")

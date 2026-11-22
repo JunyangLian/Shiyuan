@@ -5,7 +5,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from shiyuan import answer, db, indexer, scanner, store
+from shiyuan import answer, db, indexer, query, scanner, store
 
 
 @pytest.fixture()
@@ -26,6 +26,19 @@ def indexed(conn, tmp_path):
     scanner.scan_source(conn, source["source_id"])
     indexer.index_pending(conn, source["source_id"])
     return root, source["source_id"]
+
+
+def test_library_overview_uses_corpus_stats(conn, indexed):
+    assert answer._is_library_overview("你现在有什么") is True
+    assert answer._is_library_overview("知识库里有多少文件") is True
+    assert answer._is_library_overview("项目A 的最终样本量是多少") is False
+
+    result = answer.ask(conn, "你现在有什么")
+
+    assert result["provider"] == "library"
+    assert result["citations"] == []
+    assert "2 个可检索文件" in result["answer"]
+    assert "文件类型：md 2" in result["answer"]
 
 
 def test_extractive_answer_cites_evidence(conn, indexed):
@@ -55,6 +68,32 @@ def test_no_evidence_refuses(conn, indexed):
     assert result["citations"] == []
     assert "没有找到足够证据" in result["answer"]
     assert result["coverage"]["content_indexed"] >= 2
+
+
+def test_source_recall_answers_authorized_source_question(conn, tmp_path):
+    root = tmp_path / "小微商户月度单据整理助手"
+    root.mkdir()
+    (root / "单据处理报告.md").write_text("本月处理单据 42 张。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "你还记得那个单据助手吗")
+
+    assert result["provider"] == "library"
+    assert result["reason"] == "source_recall"
+    assert "小微商户月度单据整理助手" in result["answer"]
+    assert "1 个可检索文件" in result["answer"]
+    assert result["citations"] == []
+
+
+def test_conversational_fillers_are_not_search_terms():
+    analysis = query.analyze("你还记得那个单据助手吗")
+
+    assert "单据" in analysis["variants"]
+    assert "助手" in analysis["variants"]
+    assert "记得" not in analysis["variants"]
+    assert "那个" not in analysis["variants"]
 
 
 def test_cloud_answer_requires_explicit_consent(conn, indexed):
@@ -141,6 +180,17 @@ def test_api_ask_and_settings(client, tmp_path):
     source_id = client.post("/api/sources", json={"root": str(root)}).json()["source_id"]
     assert client.post(f"/api/sources/{source_id}/scan").status_code == 202
 
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not client.get("/api/sources").json()["items"][0]["scanning"]:
+            break
+        time.sleep(0.05)
+
+    # 初次扫描只做 L0；确认策略后才会继续 L1/L2。
+    confirmed = client.put("/api/inventory/policies", json={
+        "source_id": source_id, "policies": {"md": "standard_parse"},
+    })
+    assert confirmed.status_code == 200
     deadline = time.time() + 10
     while time.time() < deadline:
         if not client.get("/api/sources").json()["items"][0]["scanning"]:

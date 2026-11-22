@@ -9,28 +9,10 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime
 
-from . import embeddings, indexer, maintenance, query, retrieval
+from . import embeddings, families, indexer, ingest, maintenance, query, retrieval
 
 MAX_CANDIDATES = 5000
 SNIPPET_WIDTH = 120
-
-
-def _score(name_l: str, path_l: str, tokens: list[str], query_l: str) -> int:
-    score = 0
-    if name_l == query_l:
-        score += 1000
-    elif name_l.startswith(query_l):
-        score += 500
-    elif query_l in name_l:
-        score += 300
-    if query_l in path_l:
-        score += 60
-    for token in tokens:
-        if token in name_l:
-            score += 30
-        elif token in path_l:
-            score += 5
-    return score
 
 
 def _snippet(text: str, tokens: list[str]) -> str:
@@ -67,11 +49,12 @@ def _content_hits(conn: sqlite3.Connection, text: str, analysis: dict, *,
     return hits
 
 
-def _to_item(row: sqlite3.Row, *, match: str, content: dict | None) -> dict:
+def _to_item(row: sqlite3.Row, *, match: str, content: dict | None,
+             family: dict | None = None, matched_folder: str | None = None) -> dict:
     path = row["path"]
     name = path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
     directory = path[: len(path) - len(name)].rstrip("\\/")
-    return {
+    item = {
         "location_id": row["location_id"],
         "asset_id": row["asset_id"],
         "name": name,
@@ -92,20 +75,33 @@ def _to_item(row: sqlite3.Row, *, match: str, content: dict | None) -> dict:
         "bbox": content.get("bbox") if content else None,
         "source_id": row["source_id"],
         "source_label": row["source_label"],
+        "matched_folder": matched_folder,
     }
+    if family:
+        item.update({
+            "family_id": family["family_id"],
+            "family_size": family["family_size"],
+            "family_title": family["family_title"],
+            "version_label": family["version_label"],
+        })
+    return item
 
 
 def _fetch_locations(conn: sqlite3.Connection, location_ids: list[str]) -> dict[str, sqlite3.Row]:
     if not location_ids:
         return {}
-    placeholders = ",".join("?" for _ in location_ids)
-    rows = conn.execute(
-        f"SELECT l.*, s.label AS source_label FROM asset_locations l"
-        f" JOIN sources s ON s.source_id = l.source_id"
-        f" WHERE l.location_id IN ({placeholders})",
-        location_ids,
-    ).fetchall()
-    return {row["location_id"]: row for row in rows}
+    rows: dict[str, sqlite3.Row] = {}
+    for start in range(0, len(location_ids), 500):
+        batch = location_ids[start:start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            f"SELECT l.*, s.label AS source_label FROM asset_locations l"
+            f" JOIN sources s ON s.source_id = l.source_id"
+            f" WHERE l.location_id IN ({placeholders})",
+            batch,
+        ):
+            rows[row["location_id"]] = row
+    return rows
 
 
 def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0,
@@ -120,25 +116,9 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
 
     analysis = query.analyze(text, synonyms=query.synonym_map(conn))
     rewritten = analysis["core"] if analysis["core"] and analysis["core"] != text.lower() else None
-    tokens = [token.lower() for token in text.split() if token]
-    query_l = " ".join(tokens)
-    sql = [
-        "SELECT l.*, s.label AS source_label FROM asset_locations l",
-        "JOIN sources s ON s.source_id = l.source_id",
-        "WHERE s.state = 'active' AND l.availability = 'AVAILABLE'",
-    ]
-    params: list[str] = []
-    if source_id:
-        sql.append("AND l.source_id = ?")
-        params.append(source_id)
-    if ext:
-        sql.append("AND l.ext = ?")
-        params.append(ext.lower().lstrip("."))
-    for token in tokens:
-        sql.append("AND instr(lower(l.path), ?) > 0")
-        params.append(token)
-    sql.append(f"LIMIT {MAX_CANDIDATES}")
-    name_rows = {row["location_id"]: row for row in conn.execute(" ".join(sql), params)}
+    # 路径（文件夹名 + 文件名）和正文使用同一套查询概念，避免只搜正文漏掉目录信息。
+    path_index = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    name_rows = _fetch_locations(conn, list(path_index))
 
     content_hits = _content_hits(conn, text, analysis, source_id=source_id, ext=ext)
 
@@ -176,16 +156,15 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
 
     scored = []
     for location_id, row in name_rows.items():
-        path_l = row["path"].lower()
-        name_l = path_l.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-        score = _score(name_l, path_l, tokens, query_l)
+        path_match = path_index.get(location_id)
+        score = path_match.score if path_match else 0
         content = content_hits.get(location_id)
         semantic = vector_hits.get(location_id)
-        name_matched = score > 0
+        name_matched = path_match is not None
         if content:
             # 正文候选必须保留 retrieval 的概念/变体命中数，否则同分后会被
             # mtime 排序淹没（例如唯一编号被近期文件挤出前 5）。
-            score += 150 + 10 * min(len(tokens), 5)
+            score += 150
             score += 30 * int(content.get("concepts", 0))
             score += 4 * int(content.get("variants", 0))
         if semantic:
@@ -198,15 +177,43 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
             else "semantic" if semantic else "name"
         scored.append((score, row, match, merged))
     scored.sort(key=lambda item: (-item[0], -item[1]["mtime_ns"]))
+    family_info = families.family_map(conn)
+    if family_info:
+        grouped: dict[str, list[tuple]] = {}
+        passthrough: list[tuple] = []
+        for entry in scored:
+            info = family_info.get(entry[1]["asset_id"])
+            if info is None:
+                passthrough.append(entry)
+            else:
+                grouped.setdefault(info["family_id"], []).append(entry)
+        aggregated = list(passthrough)
+        for family_id, entries in grouped.items():
+            entries.sort(key=lambda item: (-item[0], -item[1]["mtime_ns"]))
+            # 代表项只是本次匹配度最高的一条，不代表“推荐版本”。
+            aggregated.append((*entries[0], family_id))
+        scored = sorted(
+            aggregated, key=lambda item: (-item[0], -item[1]["mtime_ns"]))
     window = scored[offset: offset + limit]
+    items = []
+    for entry in window:
+        _, row, match, content = entry[:4]
+        family = family_info.get(row["asset_id"])
+        path_match = path_index.get(row["location_id"])
+        item = _to_item(
+            row, match=match, content=content, family=family,
+            matched_folder=path_match.folder if path_match else None,
+        )
+        if len(entry) == 5:
+            item["family_versions"] = families.family_members(conn, entry[4])
+        items.append(item)
     return {
         "query": text,
         "total": len(scored),
-        "items": [_to_item(row, match=match, content=content)
-                  for _, row, match, content in window],
+        "items": items,
         "index_level": "L1",
         "content_hits": len(content_hits),
-        "truncated": len(name_rows) >= MAX_CANDIDATES,
+        "truncated": len(path_index) >= MAX_CANDIDATES,
         "rewritten": rewritten,
         "vector_used": vector_used,
         "vector_model": vector_model,
@@ -243,6 +250,10 @@ def stats(conn: sqlite3.Connection) -> dict:
             "state": row["state"],
             "health": row["health"],
             "last_scan_at": row["last_scan_at"],
+            "l0_completed_at": row["l0_completed_at"],
+            "l1_completed_at": row["l1_completed_at"],
+            "l2_completed_at": row["l2_completed_at"],
+            "full_coverage_at": row["full_coverage_at"],
             "available": row["available"],
             "stale": row["stale"],
         })
@@ -265,11 +276,13 @@ def stats(conn: sqlite3.Connection) -> dict:
             "content_pending": content["pending"],
             "content_empty": content["empty"],
             "content_failed": content["failed"],
+            "content_locked": content["locked"],
             "content_unsupported": content["unsupported"],
             "low_quality": content["low_quality"],
             "ocr_indexed": content["ocr_indexed"],
             "ocr_empty": content["ocr_empty"],
             "ocr_failed": content["ocr_failed"],
+            "ocr_locked": content["ocr_locked"],
             "ocr_pending": content["ocr_pending"],
             "mixed_pdf": content["mixed_pdf"],
             "ocr_policy": content["ocr_policy"],
@@ -279,4 +292,6 @@ def stats(conn: sqlite3.Connection) -> dict:
             "ocr_message": content["ocr_message"],
         },
         "maintenance": maintenance.stats(conn),
+        "ingest": ingest.public_settings(conn),
+        "full_coverage": indexer.full_coverage(conn),
     }

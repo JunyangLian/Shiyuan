@@ -327,21 +327,43 @@ def convert_legacy(path: Path, target_ext: str, outdir: Path) -> Path:
         str(path),
     ]
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    timeout_seconds = 90
+    stdout = ""
+    stderr = ""
     try:
         with _SOFFICE_LOCK:
-            completed = subprocess.run(
-                command, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=180, creationflags=creationflags,
+            process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=creationflags,
             )
-    except subprocess.TimeoutExpired as exc:
-        raise ExtractError("LibreOffice 转换超时（超过 180 秒）") from exc
+            try:
+                stdout, stderr = process.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                        capture_output=True, creationflags=creationflags,
+                    )
+                else:
+                    process.kill()
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                raise ExtractError(
+                    f"LibreOffice 转换超时（超过 {timeout_seconds} 秒），已终止转换进程"
+                )
+    except OSError as exc:
+        raise ExtractError(f"无法启动 LibreOffice：{exc}") from exc
     output = Path(outdir) / f"{path.stem}.{target_ext}"
     if not output.exists():
         matches = sorted(Path(outdir).glob(f"*.{target_ext}"))
         if matches:
             output = matches[0]
-    if completed.returncode != 0 or not output.exists():
-        detail = (completed.stderr or completed.stdout or "").strip()
+    if process.returncode != 0 or not output.exists():
+        detail = (stderr or stdout or "").strip()
         raise ExtractError(f"LibreOffice 转换失败：{detail[:300] or '未生成输出文件'}")
     return output
 
@@ -925,10 +947,47 @@ def _cell_text(value: object) -> str:
     return str(value).strip().replace("\n", " ")
 
 
+def _protected_sheet_names(path: Path) -> set[str]:
+    """从 xlsx 的 sheet XML 读取受保护工作表；read_only 模式下 openpyxl 不暴露 protection。"""
+    from xml.etree import ElementTree as ET
+
+    rel_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    main_ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+    try:
+        with zipfile.ZipFile(path) as archive:
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+            targets = {
+                rel.attrib.get("Id"): rel.attrib.get("Target")
+                for rel in rels
+            }
+            protected: set[str] = set()
+            for sheet in workbook.findall(f"{main_ns}sheets/{main_ns}sheet"):
+                rid = sheet.attrib.get(rel_ns)
+                target = targets.get(rid)
+                if not target:
+                    continue
+                target = target.lstrip("/")
+                if not target.startswith("xl/"):
+                    target = f"xl/{target}"
+                try:
+                    payload = archive.read(target)
+                except KeyError:
+                    continue
+                if b"<sheetProtection" in payload:
+                    name = sheet.attrib.get("name")
+                    if name:
+                        protected.add(name)
+            return protected
+    except (OSError, KeyError, ET.ParseError, zipfile.BadZipFile):
+        return set()
+
+
 def _read_sheet(path: Path) -> list[Section]:
     """同时读取计算值与公式原文；公式单元格输出为“值〔公式：...〕”。"""
     import openpyxl
 
+    protected = _protected_sheet_names(path)
     workbook = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
     try:
         try:
@@ -949,6 +1008,8 @@ def _read_sheet(path: Path) -> list[Section]:
                     else iter(())
                 )
                 lines = []
+                if sheet.title in protected:
+                    lines.append("[工作表受保护，当前仅建立只读索引]")
                 for row in sheet.iter_rows(values_only=True):
                     formula_row = next(formula_rows, ())
                     cells = []

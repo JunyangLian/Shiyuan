@@ -223,7 +223,7 @@ class WatcherManager:
                     scanner.sync_paths(conn, source_id, paths)
             finally:
                 conn.close()
-            indexer.index_pending_in_new_connection(source_id, self.store_path)
+            indexer.index_incremental_in_new_connection(source_id, self.store_path)
         except Exception as exc:
             self._log("sync_failed", source_id, str(exc)[:300], "error")
         finally:

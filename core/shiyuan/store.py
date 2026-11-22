@@ -70,6 +70,45 @@ def get_source(conn: sqlite3.Connection, source_id: str) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM sources WHERE source_id = ?", (source_id,)).fetchone()
 
 
+_STAGE_COLUMNS = {
+    "l0": "l0_completed_at",
+    "l1": "l1_completed_at",
+    "l2": "l2_completed_at",
+}
+
+
+def mark_ingest_stage(conn: sqlite3.Connection, source_id: str, stage: str) -> None:
+    """记录某个数据源首次完成 L0/L1/L2 的时间；重复完成保留第一次。"""
+    column = _STAGE_COLUMNS[stage]
+    conn.execute(
+        f"UPDATE sources SET {column} = COALESCE({column}, ?) WHERE source_id = ?",
+        (now_iso(), source_id),
+    )
+    conn.commit()
+
+
+def refresh_full_coverage(conn: sqlite3.Connection, source_id: str) -> sqlite3.Row | None:
+    row = get_source(conn, source_id)
+    if row is None:
+        return None
+    if row["l0_completed_at"] and row["l1_completed_at"] and row["l2_completed_at"]:
+        conn.execute(
+            "UPDATE sources SET full_coverage_at = COALESCE(full_coverage_at, ?)"
+            " WHERE source_id = ?",
+            (now_iso(), source_id),
+        )
+        conn.commit()
+        return get_source(conn, source_id)
+    return row
+
+
+def list_incomplete_sources(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sources WHERE state = 'active' AND full_coverage_at IS NULL"
+        " ORDER BY created_at"
+    ).fetchall()
+
+
 def add_source(conn: sqlite3.Connection, root: str | Path, label: str | None = None,
                excludes: list[str] | None = None) -> sqlite3.Row:
     resolved = validate_root(root)

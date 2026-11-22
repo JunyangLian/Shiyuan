@@ -55,6 +55,21 @@ class OcrUnavailable(RuntimeError):
     """系统没有可用的 OCR 引擎或语言包。"""
 
 
+class OcrEmptyFile(RuntimeError):
+    """文件为空或没有可解码的图像数据；应记为 empty，而不是 failed。"""
+
+
+class OcrImageTooLarge(RuntimeError):
+    """图片过大，预处理阶段无法安全读取。"""
+
+
+WINDOWS_MAX_IMAGE_DIM = 10000
+WINDOWS_TILE_TRIGGER = 20000
+WINDOWS_TILE_SIZE = 8000
+WINDOWS_TILE_OVERLAP = 200
+MAX_PREPROCESS_PIXELS = 800_000_000
+
+
 def _language_tags() -> list[str]:
     from winsdk.windows.media.ocr import OcrEngine
 
@@ -260,10 +275,86 @@ async def _recognize_pdf(engine, path: Path, max_pages: int,
     return sections
 
 
+def _temp_png(image) -> Path:
+    import tempfile
+
+    handle = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    path = Path(handle.name)
+    handle.close()
+    image.save(path, format="PNG")
+    return path
+
+
+def _windows_tiles(path: Path) -> list[tuple[Path, int, int, Path | None]]:
+    """把超过 Windows OCR 上限的图片缩放或切块，返回 (图片, x偏移, y偏移, 临时文件)。
+
+    Windows OCR 的 max_image_dimension 为 10000；13k 以上的科研图很常见。
+    普通超大图先整体缩放；极宽/极高的图按 8000px 重叠切块，保留小字。
+    """
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise OcrUnavailable("缺少 Pillow，无法处理超大图片") from exc
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                raise OcrEmptyFile("图片尺寸为 0")
+            if max(width, height) <= WINDOWS_MAX_IMAGE_DIM:
+                return [(path, 0, 0, None)]
+            if max(width, height) <= WINDOWS_TILE_TRIGGER or width * height > MAX_PREPROCESS_PIXELS:
+                scale = WINDOWS_MAX_IMAGE_DIM / max(width, height)
+                size = (max(1, round(width * scale)), max(1, round(height * scale)))
+                resized = image.convert("RGB").resize(size, Image.LANCZOS)
+                temp = _temp_png(resized)
+                return [(temp, 0, 0, temp)]
+            step = WINDOWS_TILE_SIZE - WINDOWS_TILE_OVERLAP
+            tiles: list[tuple[Path, int, int, Path | None]] = []
+            try:
+                for top in range(0, height, step):
+                    for left in range(0, width, step):
+                        box = (
+                            left, top,
+                            min(left + WINDOWS_TILE_SIZE, width),
+                            min(top + WINDOWS_TILE_SIZE, height),
+                        )
+                        tile = image.crop(box).convert("RGB")
+                        temp = _temp_png(tile)
+                        tiles.append((temp, left, top, temp))
+            except Exception:
+                for _, _, _, temp in tiles:
+                    if temp is not None:
+                        temp.unlink(missing_ok=True)
+                raise
+            return tiles
+    except MemoryError as exc:
+        raise OcrImageTooLarge("图片过大，内存不足，无法预处理") from exc
+
+
 def extract_image(path: str | Path) -> list[Section]:
+    source = Path(path)
+    if source.stat().st_size == 0:
+        raise OcrEmptyFile("文件为空（0 字节）")
+    tiles = _windows_tiles(source)
     engine = _create_engine()
-    section = asyncio.run(_recognize_image(engine, Path(path)))
-    return [section] if section is not None else []
+    texts: list[str] = []
+    boxes: list[list[int]] = []
+    try:
+        for tile_path, offset_x, offset_y, _ in tiles:
+            section = asyncio.run(_recognize_image(engine, tile_path))
+            if section is None:
+                continue
+            texts.append(section.text)
+            for box in (section.boxes or []):
+                boxes.append([box[0] + offset_x, box[1] + offset_y, box[2], box[3]])
+    finally:
+        for _, _, _, temp in tiles:
+            if temp is not None:
+                temp.unlink(missing_ok=True)
+    if not texts:
+        return []
+    return [Section(text="\n".join(texts), page=None, boxes=boxes or None)]
 
 
 def extract_pdf(path: str | Path, max_pages: int = MAX_PDF_PAGES,
@@ -358,7 +449,10 @@ def _rapid_section(result, page: int | None) -> Section | None:
 
 
 def extract_image_rapid(path: str | Path) -> list[Section]:
-    section = _rapid_section(_run_rapid(Path(path)), None)
+    source = Path(path)
+    if source.stat().st_size == 0:
+        raise OcrEmptyFile("文件为空（0 字节）")
+    section = _rapid_section(_run_rapid(source), None)
     return [section] if section is not None else []
 
 

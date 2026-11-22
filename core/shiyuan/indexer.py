@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
-from . import budget, db, extractors, ocr, store
+from . import budget, db, extractors, ingest, inventory, ocr, store
 
 # 解析器与切块策略的版本签名；改动提取逻辑或分块参数时必须同步升级。
 PARSER_SIGNATURE = (
@@ -35,6 +38,22 @@ MAX_ATTEMPTS = 3
 
 CHUNK_CHARS = 800
 CHUNK_OVERLAP = 100
+
+
+def _is_file_lock_error(exc: BaseException) -> bool:
+    """识别 Windows 文件被其他进程占用/拒绝访问；这类文件本轮直接跳过。"""
+    if getattr(exc, "winerror", None) in (5, 32, 33):
+        return True
+    if getattr(exc, "errno", None) == 13:
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        "being used by another process",
+        "sharing violation",
+        "lock violation",
+        "另一个程序正在使用",
+        "文件正被占用",
+    ))
 
 
 @dataclass
@@ -172,6 +191,9 @@ def index_version(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
         return "skipped"
 
     _job_update(conn, row, "l1", "running", count_attempt=True)
+    # 先提交“运行中”，解析期间不持有 SQLite 写锁；否则 LibreOffice 等
+    # 长任务会阻塞其他数据源的扫描与设置保存。
+    conn.commit()
     sections: list[extractors.Section] = []
     chunks: list[Chunk] = []
     page_count = 0
@@ -193,7 +215,10 @@ def index_version(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     except extractors.UnsupportedType:
         return "skipped"
     except Exception as exc:
-        state, quality, message = "failed", "empty", str(exc)[:400]
+        if _is_file_lock_error(exc):
+            state, quality, message = "locked", "empty", "文件被其他程序占用，本轮已跳过"
+        else:
+            state, quality, message = "failed", "empty", str(exc)[:400]
 
     _purge_old_versions(conn, row["asset_id"], row["version_id"])
     _write_artifact(conn, row, state=state, quality=quality, sections=sections,
@@ -205,7 +230,8 @@ def index_version(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
 
 
 def pending_rows(conn: sqlite3.Connection, source_id: str | None = None,
-                 limit: int = 500) -> list[sqlite3.Row]:
+                 limit: int = 500,
+                 allowed_exts: set[str] | None = None) -> list[sqlite3.Row]:
     exts = sorted(extractors.SUPPORTED_EXTS)
     placeholders = ",".join("?" for _ in exts)
     sql = [
@@ -222,23 +248,66 @@ def pending_rows(conn: sqlite3.Connection, source_id: str | None = None,
     if source_id:
         sql.append("AND l.source_id = ?")
         params.append(source_id)
+    if allowed_exts is not None:
+        if not allowed_exts:
+            sql.append("AND 1 = 0")
+        else:
+            marks = ",".join("?" for _ in allowed_exts)
+            sql.append(f"AND l.ext IN ({marks})")
+            params.extend(sorted(allowed_exts))
     sql.append("ORDER BY v.observed_at DESC")
     sql.append(f"LIMIT {limit}")
     return conn.execute(" ".join(sql), params).fetchall()
 
 
+def pending_count(conn: sqlite3.Connection, source_id: str | None = None,
+                  allowed_exts: set[str] | None = None) -> int:
+    exts = sorted(extractors.SUPPORTED_EXTS)
+    placeholders = ",".join("?" for _ in exts)
+    sql = [
+        "SELECT COUNT(*) FROM content_versions v",
+        "JOIN asset_locations l ON l.asset_id = v.asset_id",
+        "JOIN sources s ON s.source_id = l.source_id",
+        "WHERE v.is_current = 1 AND l.availability = 'AVAILABLE' AND s.state = 'active'",
+        f"AND l.ext IN ({placeholders})",
+        "AND NOT EXISTS (SELECT 1 FROM parse_artifacts a"
+        " WHERE a.version_id = v.version_id AND a.parser_signature = ?)",
+    ]
+    params: list[str] = [*exts, PARSER_SIGNATURE]
+    if source_id:
+        sql.append("AND l.source_id = ?")
+        params.append(source_id)
+    if allowed_exts is not None:
+        if not allowed_exts:
+            sql.append("AND 1 = 0")
+        else:
+            marks = ",".join("?" for _ in allowed_exts)
+            sql.append(f"AND l.ext IN ({marks})")
+            params.extend(sorted(allowed_exts))
+    return conn.execute(" ".join(sql), params).fetchone()[0]
+
+
 def index_pending(conn: sqlite3.Connection, source_id: str | None = None,
-                  batch: int = 200) -> dict:
-    """按批处理待解析版本，受每日预算限制；超出的留给下一次运行。"""
-    counters = {"indexed": 0, "empty": 0, "failed": 0, "budget_exhausted": False}
+                  batch: int = 200, *, ignore_budget: bool = False,
+                  pause_check=None, row_delay: float = 0.0,
+                  allowed_exts: set[str] | None = None) -> dict:
+    """按批处理待解析版本。
+
+    首次建库使用 ignore_budget=True，持续处理到队列为空；日常维护仍按每日
+    预算限速。pause_check / row_delay 用于暂停与降低资源占用。
+    """
+    counters = {"indexed": 0, "empty": 0, "failed": 0, "locked": 0, "skipped": 0,
+                "budget_exhausted": False, "paused": False, "remaining": 0}
     failures: list[str] = []
     _requeue_failed(conn, "l1", PARSER_SIGNATURE, source_id)
     conn.commit()
 
-    allow = budget.remaining(conn, "l1")
+    allow = 10 ** 9 if ignore_budget else budget.remaining(conn, "l1")
     processed = 0
-    while processed < allow:
-        rows = pending_rows(conn, source_id, min(batch, allow - processed))
+    paused = False
+    while processed < allow and not paused:
+        rows = pending_rows(conn, source_id, min(batch, allow - processed),
+                            allowed_exts=allowed_exts)
         if not rows:
             break
         for row in rows:
@@ -247,10 +316,21 @@ def index_pending(conn: sqlite3.Connection, source_id: str | None = None,
             processed += 1
             if state == "failed":
                 failures.append(f"{row['path']}: 解析失败")
+            # 逐文件提交：应用中途退出时最多重做当前文件，断点更细。
+            conn.commit()
+            if pause_check is not None and pause_check():
+                paused = True
+                break
+            if row_delay > 0:
+                time.sleep(row_delay)
         conn.commit()
     budget.add(conn, "l1", processed)
-    if allow == 0 and pending_rows(conn, source_id, 1):
+    if not ignore_budget and allow == 0 and pending_rows(
+        conn, source_id, 1, allowed_exts=allowed_exts
+    ):
         counters["budget_exhausted"] = True
+    counters["paused"] = paused
+    counters["remaining"] = pending_count(conn, source_id, allowed_exts=allowed_exts)
 
     if any(counters[key] for key in ("indexed", "empty", "failed")) or counters["budget_exhausted"]:
         store.log_event(
@@ -264,11 +344,38 @@ def index_pending(conn: sqlite3.Connection, source_id: str | None = None,
     return counters
 
 
-def index_pending_in_new_connection(source_id: str | None = None,
-                                    store_path: str | None = None) -> dict:
+def index_incremental_in_new_connection(source_id: str | None = None,
+                                        store_path: str | None = None) -> dict:
+    """监听增量：只处理新版本（新增或修改过的文件），并遵守自动解析与策略。
+
+    `pending_rows` 以 version_id + parser_signature 去重，未变化的文件已有
+    解析产物，不会再次进入队列。自动解析关闭、全局暂停或策略未确认时直接跳过。
+    """
     conn = db.connect(store_path)
     try:
-        return index_pending(conn, source_id)
+        settings = ingest.load(conn)
+        paused = ingest.paused(conn)
+        if paused or not settings.get("auto_parse", True):
+            return {"skipped": True, "reason": "paused" if paused else "auto_parse_off"}
+        if source_id:
+            source = store.get_source(conn, source_id)
+            if (source is not None and source["full_coverage_at"] is None
+                    and not inventory.is_confirmed(conn, source_id)):
+                return {"skipped": True, "reason": "awaiting_policy"}
+        allowed = inventory.allowed_exts(conn, source_id) if source_id else None
+        delay = ingest.delay_for(settings["profile"])
+        batch = ingest.batch_for(settings["profile"])
+        l1 = index_pending(
+            conn, source_id, batch=batch,
+            pause_check=lambda: ingest.paused(conn),
+            row_delay=delay, allowed_exts=allowed,
+        )
+        l2 = index_ocr_pending(
+            conn, source_id,
+            pause_check=lambda: ingest.paused(conn),
+            row_delay=delay, allowed_exts=allowed,
+        )
+        return {"skipped": False, "l1": l1, "l2": l2}
     finally:
         conn.close()
 
@@ -351,7 +458,8 @@ def _ocr_plan_sql(conn: sqlite3.Connection) -> tuple[dict, str | None, str | Non
 
 
 def _ocr_query(conn: sqlite3.Connection, source_id: str | None,
-               select: str, tail: str) -> tuple[list[sqlite3.Row], dict]:
+               select: str, tail: str,
+               allowed_exts: set[str] | None = None) -> tuple[list[sqlite3.Row], dict]:
     plan, engine_expr, sig_expr, eligible, image_params = _ocr_plan_sql(conn)
     if engine_expr is None or sig_expr is None:
         return [], plan
@@ -365,6 +473,13 @@ def _ocr_query(conn: sqlite3.Connection, source_id: str | None,
     if source_id:
         where.append("l.source_id = ?")
         params.append(source_id)
+    if allowed_exts is not None:
+        if not allowed_exts:
+            where.append("1 = 0")
+        else:
+            marks = ",".join("?" for _ in allowed_exts)
+            where.append(f"l.ext IN ({marks})")
+            params.extend(sorted(allowed_exts))
     sql = (
         f"{select} FROM content_versions v"
         " JOIN asset_locations l ON l.asset_id = v.asset_id"
@@ -380,11 +495,13 @@ def _ocr_query(conn: sqlite3.Connection, source_id: str | None,
 
 
 def ocr_candidate_rows(conn: sqlite3.Connection, source_id: str | None = None,
-                       limit: int = OCR_BATCH) -> list[sqlite3.Row]:
+                       limit: int = OCR_BATCH,
+                       allowed_exts: set[str] | None = None) -> list[sqlite3.Row]:
     rows, _ = _ocr_query(
         conn, source_id,
         "SELECT v.version_id, v.asset_id, l.path, l.ext, l.source_id",
         f"ORDER BY v.observed_at DESC LIMIT {limit}",
+        allowed_exts=allowed_exts,
     )
     if not rows:
         return []
@@ -404,8 +521,10 @@ def ocr_candidate_rows(conn: sqlite3.Connection, source_id: str | None = None,
     return [{**dict(row), "engine": engines.get(row["version_id"])} for row in rows]
 
 
-def ocr_pending_count(conn: sqlite3.Connection, source_id: str | None = None) -> int:
-    rows, _ = _ocr_query(conn, source_id, "SELECT COUNT(*) AS n", "")
+def ocr_pending_count(conn: sqlite3.Connection, source_id: str | None = None,
+                      allowed_exts: set[str] | None = None) -> int:
+    rows, _ = _ocr_query(conn, source_id, "SELECT COUNT(*) AS n", "",
+                         allowed_exts=allowed_exts)
     return rows[0]["n"] if rows else 0
 
 
@@ -451,9 +570,12 @@ def index_ocr_version(conn: sqlite3.Connection, row, engine: str | None = None) 
         return existing["state"]
 
     _job_update(conn, row, "l2", "running", count_attempt=True)
+    conn.commit()
     sections: list[ocr.Section] = []
     chunks: list[Chunk] = []
     try:
+        if Path(row["path"]).stat().st_size == 0:
+            raise ocr.OcrEmptyFile("文件为空（0 字节）")
         if row["ext"] == "pdf":
             skip_pages: set[int] = set()
             l1 = conn.execute(
@@ -480,10 +602,15 @@ def index_ocr_version(conn: sqlite3.Connection, row, engine: str | None = None) 
         else:
             state, message = "ok", None
             chunks = chunk_sections(sections)
+    except ocr.OcrEmptyFile as exc:
+        state, quality, message = "empty", "empty", str(exc)
     except ocr.OcrUnavailable:
         raise
     except Exception as exc:
-        state, quality, message = "failed", "empty", str(exc)[:400]
+        if _is_file_lock_error(exc):
+            state, quality, message = "locked", "empty", "文件被其他程序占用，本轮已跳过"
+        else:
+            state, quality, message = "failed", "empty", str(exc)[:400]
 
     _purge_old_versions(conn, row["asset_id"], row["version_id"])
     _write_artifact(conn, row, state=state, quality=quality, sections=sections,
@@ -493,15 +620,20 @@ def index_ocr_version(conn: sqlite3.Connection, row, engine: str | None = None) 
 
 
 def index_ocr_pending(conn: sqlite3.Connection, source_id: str | None = None,
-                      limit: int = OCR_RUN_LIMIT) -> dict:
+                      limit: int = OCR_RUN_LIMIT, *, ignore_budget: bool = False,
+                      pause_check=None, row_delay: float = 0.0,
+                      allowed_exts: set[str] | None = None) -> dict:
     counters = {"available": True, "indexed": 0, "empty": 0, "failed": 0,
-                "processed": 0, "remaining": 0, "budget_exhausted": False}
+                "locked": 0, "processed": 0, "remaining": 0,
+                "budget_exhausted": False, "paused": False}
     plan = ocr.plan_engines(conn)
     windows_info = ocr.engine_info()
     available = plan["windows"]
     if not available and plan["rapidocr"] and plan["policy"] == "rapidocr":
         available = True
-    if not available and plan["rapidocr"] and ocr_pending_count(conn, source_id):
+    if not available and plan["rapidocr"] and ocr_pending_count(
+        conn, source_id, allowed_exts=allowed_exts
+    ):
         available = True
     if not available:
         return {**counters, "available": False,
@@ -512,23 +644,35 @@ def index_ocr_pending(conn: sqlite3.Connection, source_id: str | None = None,
         _requeue_failed(conn, "l2", signature, source_id)
     conn.commit()
 
-    allow = min(limit, budget.remaining(conn, "l2"))
+    allow = 10 ** 9 if ignore_budget else min(limit, budget.remaining(conn, "l2"))
     processed = 0
-    while processed < allow:
-        rows = ocr_candidate_rows(conn, source_id, min(OCR_BATCH, allow - processed))
+    paused = False
+    while processed < allow and not paused:
+        rows = ocr_candidate_rows(conn, source_id, min(OCR_BATCH, allow - processed),
+                                  allowed_exts=allowed_exts)
         if not rows:
             break
         for row in rows:
             state = index_ocr_version(conn, row)
             counters[{"ok": "indexed"}.get(state, state)] += 1
             processed += 1
+            conn.commit()
+            if pause_check is not None and pause_check():
+                paused = True
+                break
+            if row_delay > 0:
+                time.sleep(row_delay)
         conn.commit()
 
     budget.add(conn, "l2", processed)
-    if allow == 0 and ocr_candidate_rows(conn, source_id, 1):
+    if not ignore_budget and allow == 0 and ocr_candidate_rows(
+        conn, source_id, 1, allowed_exts=allowed_exts
+    ):
         counters["budget_exhausted"] = True
     counters["processed"] = processed
-    counters["remaining"] = ocr_pending_count(conn, source_id)
+    counters["paused"] = paused
+    counters["remaining"] = ocr_pending_count(conn, source_id,
+                                              allowed_exts=allowed_exts)
     counters["engine"] = plan["policy"]
     counters["languages"] = (windows_info["languages"] if plan["windows"]
                              else ["zh-Hans", "en"])
@@ -536,8 +680,8 @@ def index_ocr_pending(conn: sqlite3.Connection, source_id: str | None = None,
         store.log_event(
             conn, "ocr_completed", source_id,
             detail=json.dumps({key: counters[key] for key in
-                               ("indexed", "empty", "failed", "remaining",
-                                "budget_exhausted")},
+                               ("indexed", "empty", "failed", "locked", "remaining",
+                                "budget_exhausted", "paused")},
                               ensure_ascii=False),
             outcome="ok",
         )
@@ -638,6 +782,120 @@ def retry_job(conn: sqlite3.Connection, job_id: str) -> dict:
     return {"job_id": job_id, "stage": job["stage"], "state": state}
 
 
+def parse_results(conn: sqlite3.Connection, source_id: str, *,
+                  status: str | None = None, limit: int = 100,
+                  offset: int = 0) -> dict:
+    """按数据源列出每个文件的解析结果：成功、失败、无文本、待处理与不支持。
+
+    成功以 L1 正文或 L2 OCR 产物为准；失败优先取最近一条失败任务。
+    一次分类完再分页，保证汇总数字不受分页影响。
+    """
+    rows = conn.execute(
+        "SELECT l.location_id, l.path, l.rel_path, l.ext, l.size,"
+        " v.version_id, a.state AS l1_state, a.quality, a.char_count,"
+        " a.page_count, a.text_pages, a.image_count, a.message, a.created_at,"
+        " j.stage AS job_stage, j.attempts, j.error, j.updated_at,"
+        " o.ocr_ok, o.ocr_failed, o.ocr_locked, o.ocr_empty, o.ocr_chars"
+        " FROM content_versions v"
+        " JOIN asset_locations l ON l.asset_id = v.asset_id"
+        " LEFT JOIN parse_artifacts a ON a.version_id = v.version_id"
+        "  AND a.parser_signature = ?"
+        " LEFT JOIN index_jobs j ON j.job_id = ("
+        "   SELECT j2.job_id FROM index_jobs j2"
+        "   WHERE j2.version_id = v.version_id AND j2.status = 'failed'"
+        "   ORDER BY j2.updated_at DESC LIMIT 1)"
+        " LEFT JOIN ("
+        "   SELECT version_id,"
+        "    MAX(CASE WHEN state = 'ok' THEN 1 ELSE 0 END) AS ocr_ok,"
+        "    MAX(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS ocr_failed,"
+        "    MAX(CASE WHEN state = 'locked' THEN 1 ELSE 0 END) AS ocr_locked,"
+        "    MAX(CASE WHEN state = 'empty' THEN 1 ELSE 0 END) AS ocr_empty,"
+        "    SUM(CASE WHEN state = 'ok' THEN char_count ELSE 0 END) AS ocr_chars"
+        "   FROM parse_artifacts WHERE parser_signature LIKE 'l2.%'"
+        "   GROUP BY version_id) o ON o.version_id = v.version_id"
+        " WHERE v.is_current = 1 AND l.source_id = ? AND l.availability = 'AVAILABLE'"
+        " ORDER BY l.path",
+        (PARSER_SIGNATURE, source_id),
+    ).fetchall()
+
+    counts = {key: 0 for key in ("ok", "failed", "empty", "pending", "locked", "unsupported")}
+    items: list[dict] = []
+    for row in rows:
+        ext = (row["ext"] or "").lower()
+        supported = extractors.is_supported(ext)
+        ocr_ext = ext in ocr.OCR_EXTS
+        l1_state = row["l1_state"]
+        l1_chars = int(row["char_count"] or 0)
+
+        if (l1_state == "ok" and l1_chars > 0) or row["ocr_ok"]:
+            item_status = "ok"
+            if l1_state == "ok" and l1_chars > 0 and row["ocr_ok"]:
+                stage = "L1+L2"
+            elif l1_state == "ok" and l1_chars > 0:
+                stage = "L1"
+            else:
+                stage = "L2"
+        elif row["error"] or l1_state == "failed" or row["ocr_failed"]:
+            item_status = "failed"
+            stage = "L2" if row["job_stage"] == "l2" or row["ocr_failed"] else "L1"
+        elif l1_state == "locked" or row["ocr_locked"]:
+            item_status = "locked"
+            stage = "L2" if row["ocr_locked"] else "L1"
+        elif l1_state == "empty" or row["ocr_empty"] or (l1_state == "ok" and l1_chars == 0):
+            item_status = "empty"
+            stage = "L1"
+        elif not supported and not ocr_ext:
+            item_status = "unsupported"
+            stage = None
+        else:
+            item_status = "pending"
+            stage = None
+
+        counts[item_status] += 1
+        items.append({
+            "location_id": row["location_id"],
+            "version_id": row["version_id"],
+            "name": Path(row["path"]).name,
+            "path": row["path"],
+            "rel_path": row["rel_path"],
+            "ext": ext,
+            "size": int(row["size"] or 0),
+            "status": item_status,
+            "stage": stage,
+            "chars": l1_chars + int(row["ocr_chars"] or 0),
+            "pages": int(row["page_count"] or 0),
+            "quality": row["quality"],
+            "message": row["message"],
+            "error": row["error"],
+            "attempts": int(row["attempts"] or 0),
+            "updated_at": row["updated_at"] or row["created_at"],
+        })
+
+    chosen = [
+        item for item in items
+        if not status or status == "all" or item["status"] == status
+    ]
+    start = max(0, offset)
+    selected = chosen[start:start + max(1, min(limit, 500))]
+    return {
+        "source_id": source_id,
+        "summary": {
+            "total": len(items),
+            "parsed": counts["ok"],
+            "failed": counts["failed"],
+            "empty": counts["empty"],
+            "pending": counts["pending"],
+            "locked": counts["locked"],
+            "unsupported": counts["unsupported"],
+        },
+        "items": selected,
+        "total": len(chosen),
+        "limit": max(1, min(limit, 500)),
+        "offset": start,
+        "generated_at": store.now_iso(),
+    }
+
+
 def coverage(conn: sqlite3.Connection) -> dict:
     """当前内容版本的解析覆盖：已解析 / 无文本层 / 失败 / 未支持 / 待处理。"""
     rows = conn.execute(
@@ -649,7 +907,8 @@ def coverage(conn: sqlite3.Connection) -> dict:
         " WHERE v.is_current = 1 AND l.availability = 'AVAILABLE' AND s.state = 'active'",
         (PARSER_SIGNATURE,),
     ).fetchall()
-    counts = {"indexed": 0, "empty": 0, "failed": 0, "pending": 0, "unsupported": 0}
+    counts = {"indexed": 0, "empty": 0, "failed": 0, "locked": 0,
+              "pending": 0, "unsupported": 0}
     for row in rows:
         if not extractors.is_supported(row["ext"]):
             # 图片与 PDF 由 L2 接管，不算"暂不支持"。
@@ -661,6 +920,8 @@ def coverage(conn: sqlite3.Connection) -> dict:
             counts["indexed"] += 1
         elif row["state"] == "empty":
             counts["empty"] += 1
+        elif row["state"] == "locked":
+            counts["locked"] += 1
         else:
             counts["failed"] += 1
 
@@ -695,6 +956,7 @@ def coverage(conn: sqlite3.Connection) -> dict:
         "ocr_indexed": ocr_states.get("ok", 0),
         "ocr_empty": ocr_states.get("empty", 0),
         "ocr_failed": ocr_states.get("failed", 0),
+        "ocr_locked": ocr_states.get("locked", 0),
         "ocr_pending": ocr_pending_count(conn),
         "mixed_pdf": conn.execute(
             "SELECT COUNT(*) FROM parse_artifacts a"
@@ -715,3 +977,84 @@ def coverage(conn: sqlite3.Connection) -> dict:
         "ocr_message": info["message"],
     })
     return counts
+
+
+def _seconds_between(start: str | None, end: str | None) -> int | None:
+    if not start or not end:
+        return None
+    try:
+        return max(0, int((datetime.fromisoformat(end) - datetime.fromisoformat(start))
+                          .total_seconds()))
+    except ValueError:
+        return None
+
+
+def full_coverage(conn: sqlite3.Connection) -> dict:
+    """首次建库的 L0/L1/L2 时间线与 Time to Full Coverage。"""
+    rows = conn.execute(
+        "SELECT source_id, label, root_uri, created_at, l0_completed_at,"
+        " l1_completed_at, l2_completed_at, full_coverage_at"
+        " FROM sources WHERE state = 'active' ORDER BY created_at"
+    ).fetchall()
+    content = coverage(conn)
+    started_at = min((row["created_at"] for row in rows), default=None)
+    stage_ts = {
+        "l0": max((row["l0_completed_at"] for row in rows if row["l0_completed_at"]),
+                  default=None),
+        "l1": max((row["l1_completed_at"] for row in rows if row["l1_completed_at"]),
+                  default=None),
+        "l2": max((row["l2_completed_at"] for row in rows if row["l2_completed_at"]),
+                  default=None),
+    }
+    stage_complete = {
+        stage: all(row[f"{stage}_completed_at"] for row in rows)
+        for stage in ("l0", "l1", "l2")
+    }
+    complete = bool(rows) and all(row["full_coverage_at"] for row in rows)
+    completed_at = None
+    if complete:
+        completed_at = max(row["full_coverage_at"] for row in rows)
+    excluded = conn.execute(
+        "SELECT COALESCE(SUM(r.files_skipped), 0) FROM source_scan_runs r"
+        " JOIN sources s ON s.source_id = r.source_id"
+        " WHERE s.state = 'active' AND r.started_at ="
+        " (SELECT MAX(r2.started_at) FROM source_scan_runs r2"
+        "  WHERE r2.source_id = r.source_id)"
+    ).fetchone()[0]
+    sources = []
+    for row in rows:
+        sources.append({
+            "source_id": row["source_id"],
+            "label": row["label"],
+            "root_uri": row["root_uri"],
+            "created_at": row["created_at"],
+            "l0_completed_at": row["l0_completed_at"],
+            "l1_completed_at": row["l1_completed_at"],
+            "l2_completed_at": row["l2_completed_at"],
+            "full_coverage_at": row["full_coverage_at"],
+            "full_coverage_seconds": _seconds_between(
+                row["created_at"], row["full_coverage_at"]),
+        })
+    return {
+        "complete": complete,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "time_to_full_coverage_seconds": _seconds_between(started_at, completed_at),
+        "elapsed_seconds": _seconds_between(started_at, store.now_iso()),
+        "l0_complete": stage_complete["l0"],
+        "l1_complete": stage_complete["l1"],
+        "l2_complete": stage_complete["l2"],
+        "l0_completed_at": stage_ts["l0"],
+        "l1_completed_at": stage_ts["l1"],
+        "l2_completed_at": stage_ts["l2"],
+        "l0_seconds": _seconds_between(started_at, stage_ts["l0"]),
+        "l1_seconds": _seconds_between(started_at, stage_ts["l1"]),
+        "l2_seconds": _seconds_between(started_at, stage_ts["l2"]),
+        "pending_l1": content["pending"],
+        "pending_l2": content["ocr_pending"],
+        "failed": content["failed"],
+        "ocr_failed": content["ocr_failed"],
+        "unsupported": content["unsupported"],
+        "excluded": excluded,
+        "sources": sources,
+    }

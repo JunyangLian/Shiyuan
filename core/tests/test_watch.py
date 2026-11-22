@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from shiyuan import db, indexer, scanner, search, store, watcher
+from shiyuan import db, indexer, inventory, scanner, search, store, watcher
 
 
 @pytest.fixture()
@@ -151,6 +151,8 @@ def test_watcher_detects_new_file_end_to_end(tmp_path, monkeypatch):
     db.init_db(connection)
     source = store.add_source(connection, root)
     scanner.scan_source(connection, source["source_id"])
+    inventory.save_policies(
+        connection, {"md": "standard_parse"}, source_id=source["source_id"])
     connection.close()
 
     manager = watcher.WatcherManager(home / "shiyuan.db", debounce=0.2, max_delay=1.0)

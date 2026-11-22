@@ -157,6 +157,14 @@ def client(tmp_path, monkeypatch):
         yield test_client
 
 
+def test_api_updates_overview(client):
+    overview = client.get("/api/updates/overview").json()
+    assert overview["auto_parse"] is True
+    assert overview["summary"]["sources"] == 0
+    assert overview["summary"]["pending_l1"] == 0
+    assert client.post("/api/updates/check").json()["started"] == []
+
+
 def test_api_jobs_and_retry(client, tmp_path):
     root = tmp_path / "资料"
     root.mkdir()
@@ -164,6 +172,16 @@ def test_api_jobs_and_retry(client, tmp_path):
     source_id = client.post("/api/sources", json={"root": str(root)}).json()["source_id"]
     client.post(f"/api/sources/{source_id}/scan")
 
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not client.get("/api/sources").json()["items"][0]["scanning"]:
+            break
+        time.sleep(0.05)
+
+    confirmed = client.put("/api/inventory/policies", json={
+        "source_id": source_id, "policies": {"docx": "standard_parse"},
+    })
+    assert confirmed.status_code == 200
     deadline = time.time() + 10
     while time.time() < deadline:
         if not client.get("/api/sources").json()["items"][0]["scanning"]:

@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from . import __version__, config, db, search, store
+from . import __version__, config, db, external, search, store
 
 SERVER_NAME = "shiyuan-mcp"
 DEFAULT_PROTOCOL = "2025-06-18"
@@ -182,8 +182,12 @@ class MCPServer:
             "serverInfo": {"name": SERVER_NAME, "version": __version__},
             "instructions": (
                 "Read-only access to the local Shiyuan knowledge base. "
-                "Use search_knowledge first, then get_document_text with the returned "
-                "location_id for full context. Paths point to original files on this machine."
+                "For ordinary content questions, use search_knowledge first, then "
+                "get_document_text with the returned location_id for full context. "
+                "For corpus-level questions (what files exist, how many files, coverage), "
+                "call knowledge_stats and list_sources instead: search_knowledge returns "
+                "only a limited top-k sample, and its item count is not the corpus total. "
+                "Paths point to original files on this machine."
             ),
         }
 
@@ -197,7 +201,9 @@ class MCPServer:
                 "description": (
                     "Search indexed file names, paths, parsed text and OCR content. "
                     "Returns ranked documents with snippets and page/sheet locators. "
-                    "This is the recommended first step."
+                    "This is the recommended first step for content questions. "
+                    "Results are a limited top-k sample, not the complete corpus; "
+                    "use knowledge_stats for file counts and coverage."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -347,6 +353,11 @@ class MCPServer:
                 "snippet": item["snippet"],
                 "source_id": item["source_id"],
                 "source_label": item["source_label"],
+                "family_id": item.get("family_id"),
+                "family_size": item.get("family_size"),
+                "family_title": item.get("family_title"),
+                "version_label": item.get("version_label"),
+                "family_versions": item.get("family_versions"),
             }
             for item in result["items"]
         ]
@@ -625,6 +636,8 @@ def serve(
     conn: sqlite3.Connection,
     reader: BinaryIO | None = None,
     writer: BinaryIO | None = None,
+    *,
+    once: bool = False,
 ) -> None:
     """按行读写 JSON-RPC；stdout 只允许协议消息。"""
     server = MCPServer(conn)
@@ -640,43 +653,76 @@ def serve(
             payload = _error(None, -32700, "Parse error")
         else:
             payload = server.handle(message)
-        if payload is None:
-            continue
-        writer.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
-        writer.flush()
+        if payload is not None:
+            writer.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
+            writer.flush()
+        if once:
+            break
 
 
-def _config_snippet() -> dict:
+def server_command() -> list[str]:
+    """MCP 启动命令：源码模式走 python -m，安装版走 shiyuan-core.exe --mcp。"""
     if getattr(sys, "frozen", False):
-        server: dict[str, Any] = {"command": sys.executable, "args": ["--mcp"]}
-        if os.environ.get("SHIYUAN_HOME"):
-            server["env"] = {"SHIYUAN_HOME": str(config.app_home())}
-        return {"mcpServers": {"shiyuan": server}}
-    core_dir = Path(__file__).resolve().parents[1]
-    return {
-        "mcpServers": {
-            "shiyuan": {
-                "command": sys.executable,
-                "args": ["-m", "shiyuan.mcp_server"],
-                "cwd": str(core_dir),
-                "env": {"SHIYUAN_HOME": str(config.app_home())},
-            }
+        return [sys.executable, "--mcp"]
+    return [sys.executable, "-m", "shiyuan.mcp_server"]
+
+
+def config_snippet(token: str | None = None) -> dict:
+    env = {"SHIYUAN_HOME": str(config.app_home())}
+    if token:
+        env["SHIYUAN_EXT_TOKEN"] = token
+    if getattr(sys, "frozen", False):
+        server: dict[str, Any] = {
+            "command": sys.executable, "args": ["--mcp"], "env": env,
         }
-    }
+    else:
+        server = {
+            "command": sys.executable,
+            "args": ["-m", "shiyuan.mcp_server"],
+            "cwd": str(Path(__file__).resolve().parents[1]),
+            "env": env,
+        }
+    return {"mcpServers": {"shiyuan": server}}
+
+
+def _verify_token(path: Path, token: str) -> str | None:
+    """校验外部连接令牌；返回 client_id，非法令牌直接终止进程。"""
+    conn = db.connect(path)
+    try:
+        db.init_db(conn)
+        row = external.match_token(conn, token)
+        if row is None:
+            line = "Shiyuan MCP: invalid external token\n"
+            if sys.stderr is not None:
+                sys.stderr.write(line)
+            else:
+                os.write(2, line.encode("utf-8"))
+            raise SystemExit(2)
+        external.record_usage(conn, row["client_id"])
+        return row["client_id"]
+    finally:
+        conn.close()
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Shiyuan MCP server (stdio, read-only)")
     parser.add_argument("--db", help="SQLite path; defaults to the desktop app database")
+    parser.add_argument("--token", help="external client token (or SHIYUAN_EXT_TOKEN)")
     parser.add_argument(
         "--print-config", action="store_true",
         help="print an MCP client JSON snippet and exit",
     )
+    parser.add_argument(
+        "--once", action="store_true",
+        help="handle a single JSON-RPC message and exit (used by connection test)",
+    )
     args = parser.parse_args(argv)
+
+    token = (args.token or os.environ.get("SHIYUAN_EXT_TOKEN", "")).strip()
 
     if args.print_config:
         # 控制台编码因系统而异；Unicode 转义保证中文路径在任何客户端复制后仍然有效。
-        text = json.dumps(_config_snippet(), ensure_ascii=True, indent=2)
+        text = json.dumps(config_snippet(token or None), ensure_ascii=True, indent=2)
         if sys.stdout is not None:
             print(text)
         else:
@@ -684,11 +730,13 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     path = Path(args.db) if args.db else db.db_path()
+    if token:
+        _verify_token(path, token)
     conn = db.connect(path)
     try:
         db.init_db(conn)
         conn.execute("PRAGMA query_only = ON")
-        serve(conn)
+        serve(conn, once=args.once)
     finally:
         conn.close()
 

@@ -1,62 +1,51 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, formatSize, formatTime } from "../api";
-import type { IndexJob, MaintenanceEvent, OcrSettings, OverviewStats } from "../api";
+import { api, formatTime } from "../api";
+import type { OcrSettings, UpdateOverview } from "../api";
+
+const PROFILES: { key: "quiet" | "balanced" | "fast"; label: string }[] = [
+  { key: "quiet", label: "安静" },
+  { key: "balanced", label: "平衡" },
+  { key: "fast", label: "快速" },
+];
 
 const OCR_POLICY_LABEL: Record<string, string> = {
-  auto: "自动（文本 PDF → Windows / 扫描 PDF → PP-OCRv6 small）",
-  windows: "全部 Windows OCR",
-  rapidocr: "全部 PP-OCRv6 small",
+  auto: "自动",
+  windows: "Windows OCR",
+  rapidocr: "PP-OCRv6 small",
 };
 
-const EVENT_LABEL: Record<string, string> = {
-  source_added: "新增数据源",
-  source_merged: "合并数据源",
-  source_removed: "撤销授权",
-  source_state: "状态变更",
-  scan_completed: "扫描完成",
-  scan_failed: "扫描失败",
-  location_moved: "文件移动",
-  index_completed: "内容解析",
-  index_failed: "解析失败",
-  watch_started: "监听启动",
-  watch_stopped: "监听停止",
-  watch_failed: "监听失败",
-  sync_completed: "增量同步",
-  sync_failed: "同步失败",
-  maintenance_reindex: "重建索引",
-  maintenance_retry: "重试失败",
-  maintenance_ocr: "重建 OCR",
-  maintenance_cleanup: "清理缓存",
-  maintenance_embed: "补建向量索引",
-  job_retry: "单文件重试",
-  maintenance_reindex_failed: "重建索引失败",
-  maintenance_retry_failed: "重试失败",
-  maintenance_ocr_failed: "重建 OCR 失败",
-  maintenance_cleanup_failed: "清理失败",
-  maintenance_embed_failed: "补建向量失败",
-};
-
-const ACTION_LABEL: Record<string, string> = {
-  reindex: "重建正文索引",
-  retry: "重试失败任务",
-  ocr: "重建 OCR",
-  cleanup: "清理旧版本缓存",
-  embed: "补建向量索引",
-};
-
-export default function HealthView({ embedded = false }: { embedded?: boolean }) {
-  const [stats, setStats] = useState<OverviewStats | null>(null);
-  const [events, setEvents] = useState<MaintenanceEvent[]>([]);
-  const [jobs, setJobs] = useState<IndexJob[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [actionBusy, setActionBusy] = useState<string | null>(null);
-  const [jobBusy, setJobBusy] = useState<string | null>(null);
-
+export default function HealthView() {
+  const [overview, setOverview] = useState<UpdateOverview | null>(null);
   const [ocrInfo, setOcrInfo] = useState<OcrSettings | null>(null);
   const [ocrPolicy, setOcrPolicy] = useState<OcrSettings["policy"]>("auto");
-  const [ocrSaving, setOcrSaving] = useState(false);
-  const [ocrNote, setOcrNote] = useState<string | null>(null);
+  const [profileDraft, setProfileDraft] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [savingAuto, setSavingAuto] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [savingOcr, setSavingOcr] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [retrying, setRetrying] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const data = await api.updatesOverview();
+      setOverview(data);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
+  }, [load]);
 
   useEffect(() => {
     api
@@ -68,472 +57,344 @@ export default function HealthView({ embedded = false }: { embedded?: boolean })
       .catch(() => setOcrInfo(null));
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [overview, log, failed] = await Promise.all([
-        api.stats(),
-        api.events(40),
-        api.jobs({ status: "failed", limit: 10 }),
-      ]);
-      setStats(overview);
-      setEvents(log.items);
-      setJobs(failed.items);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const auto = overview?.auto_parse ?? true;
+  const paused = overview?.paused ?? false;
+  const watcher = overview?.watch_enabled
+    ? overview.watcher_running
+      ? "监听运行中"
+      : "监听未启动"
+    : "实时监听已关闭";
+  const summary = overview?.summary;
 
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  const maintenanceRunning = stats?.maintenance.running.running ?? false;
-
-  useEffect(() => {
-    if (!maintenanceRunning) return;
-    const timer = window.setInterval(() => void load(), 1500);
-    return () => window.clearInterval(timer);
-  }, [maintenanceRunning, load]);
-
-  const runMaintenance = async (action: "reindex" | "retry" | "ocr" | "cleanup" | "embed") => {
-    const label = ACTION_LABEL[action];
-    if (action !== "retry" &&
-        !window.confirm(`${label}会重建派生数据，不会修改原文件。继续？`)) {
-      return;
-    }
-    setActionBusy(action);
+  const toggleAuto = async () => {
+    if (!overview) return;
+    const next = !overview.auto_parse;
+    setSavingAuto(true);
     setError(null);
+    setNote(null);
     try {
-      await api.maintenance(action);
+      await api.saveIngestSettings({
+        auto_parse: next,
+        ...(next ? { paused: false } : {}),
+      });
+      if (next) await api.checkUpdates();
+      setNote(
+        next
+          ? "已开启持续自动解析，正在检查新增或修改过的文件。"
+          : "已关闭持续自动解析；新文件只登记元数据，可在数据页手动深度解析。",
+      );
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setActionBusy(null);
+      setSavingAuto(false);
     }
   };
 
-  const retryJob = async (jobId: string) => {
-    setJobBusy(jobId);
+  const checkNow = async () => {
+    setChecking(true);
     setError(null);
+    setNote(null);
     try {
-      await api.retryJob(jobId);
+      const result = await api.checkUpdates();
+      setNote(
+        result.started.length
+          ? `已开始检查 ${result.started.length} 个数据源。`
+          : "没有可检查的数据源。",
+      );
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setJobBusy(null);
+      setChecking(false);
+    }
+  };
+
+  const rebuildFamilies = async () => {
+    setRebuilding(true);
+    setError(null);
+    setNote(null);
+    try {
+      const result = await api.rebuildFamilies();
+      setNote(
+        result.state === "running"
+          ? "已开始重建文档家族，完成后检索会自动按推荐版本归并。"
+          : "文档家族正在重建中，请稍后再试。",
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRebuilding(false);
+    }
+  };
+
+  const resume = async () => {
+    setSavingAuto(true);
+    try {
+      await api.saveIngestSettings({ paused: false });
+      await api.checkUpdates();
+      setNote("已恢复自动解析。");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingAuto(false);
+    }
+  };
+
+  const saveProfile = async () => {
+    setSavingProfile(true);
+    setError(null);
+    try {
+      await api.saveIngestSettings({
+        profile: profileDraft ?? overview?.profile ?? "balanced",
+      });
+      setProfileDraft(null);
+      setNote("资源模式已保存；只影响处理速度，不会重复解析。");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingProfile(false);
     }
   };
 
   const saveOcrPolicy = async () => {
-    setOcrSaving(true);
-    setOcrNote(null);
+    setSavingOcr(true);
     setError(null);
     try {
       const saved = await api.saveOcrSettings({ policy: ocrPolicy });
       setOcrInfo(saved);
-      setOcrNote("OCR 策略已保存；新策略对之后的深度解析生效。");
+      setNote("OCR 策略已保存；对之后的深度解析生效。");
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setOcrSaving(false);
+      setSavingOcr(false);
     }
   };
 
-  const jobCounts = stats?.maintenance.jobs ?? {};
-  const failedJobs = Object.entries(jobCounts)
-    .filter(([key]) => key.endsWith(":failed"))
-    .reduce((sum, [, count]) => sum + count, 0);
-  const activeJobs = Object.entries(jobCounts)
-    .filter(([key]) => key.endsWith(":running") || key.endsWith(":pending"))
-    .reduce((sum, [, count]) => sum + count, 0);
-
-  const maxExt = Math.max(1, ...(stats?.by_ext.map((entry) => entry.count) ?? [1]));
+  const retry = async (jobId: string) => {
+    setRetrying(jobId);
+    setError(null);
+    try {
+      await api.retryJob(jobId);
+      setNote("已提交重试。");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRetrying(null);
+    }
+  };
 
   return (
-    <div className={embedded ? "view-section" : "view"}>
-      {embedded ? (
-        <div className="section-toolbar">
-          <span className="muted small-text">
-            最近一次同步、内容覆盖和自动维护记录，都可以在这里检查。
+    <div className="view">
+      <header className="view-head">
+        <div>
+          <p className="eyebrow">持续更新</p>
+          <h1>更新</h1>
+          <p className="sub">
+            监听授权目录，只解析新增或修改后的文件；已解析且未变化的文件不会重复处理。
+          </p>
+        </div>
+        <div className="chip-row">
+          <span className={`chip ${auto && !paused ? "ok" : "warn"}`}>
+            {paused ? "自动解析已暂停" : auto ? "自动解析已开启" : "自动解析已关闭"}
           </span>
-          <button className="ghost small" disabled={loading} onClick={() => void load()}>
-            {loading ? "刷新中…" : "刷新"}
+          <button
+            className="ghost small"
+            disabled={rebuilding}
+            onClick={() => void rebuildFamilies()}
+          >
+            {rebuilding ? "提交中…" : "重建文档家族"}
+          </button>
+          <button className="ghost small" disabled={checking} onClick={() => void checkNow()}>
+            {checking ? "检查中…" : "立即检查"}
           </button>
         </div>
-      ) : (
-        <header className="view-head">
-          <div>
-            <h1>健康与维护</h1>
-            <p className="sub">最近一次同步、覆盖程度和自动维护记录，都应当可以被检查。</p>
-          </div>
-          <button className="ghost" disabled={loading} onClick={() => void load()}>
-            {loading ? "刷新中…" : "刷新"}
-          </button>
-        </header>
-      )}
+      </header>
 
       {error && <div className="alert error">{error}</div>}
+      {note && <div className="notice">{note}</div>}
+      {loading && !overview && <div className="notice">正在读取更新状态…</div>}
 
-      <div className="stat-grid">
-        <div className="stat">
-          <span className="stat-label">可检索文件</span>
-          <span className="stat-value">{stats?.files.available ?? 0}</span>
-          <span className="stat-foot">L0 目录层</span>
+      <section className="panel update-control">
+        <div className="update-control-main">
+          <div>
+            <h2>持续自动解析</h2>
+            <p className="muted small-text">
+              开启后，新增或修改过的文件会自动完成初解析与深度解析；
+              原文件未变化的条目直接跳过。
+            </p>
+          </div>
+          <button
+            role="switch"
+            aria-checked={auto && !paused}
+            aria-label="持续自动解析"
+            className={`switch${auto && !paused ? " on" : ""}`}
+            disabled={savingAuto || !overview}
+            onClick={() => void toggleAuto()}
+          >
+            <span className="switch-knob" />
+          </button>
         </div>
-        <div className="stat">
-          <span className="stat-label">失联</span>
-          <span className="stat-value">{stats?.files.missing ?? 0}</span>
-          <span className="stat-foot">扫描确认原位置不在</span>
+
+        <div className="update-status-line">
+          <span>{watcher}</span>
+          <span>最近同步 {formatTime(overview?.last_sync_at ?? null)}</span>
+          <span>数据源 {summary?.sources ?? 0} 个</span>
+          {paused && (
+            <button className="ghost small" disabled={savingAuto} onClick={() => void resume()}>
+              恢复解析
+            </button>
+          )}
         </div>
-        <div className="stat">
-          <span className="stat-label">离线</span>
-          <span className="stat-value">{stats?.files.offline ?? 0}</span>
-          <span className="stat-foot">数据源当前不可达</span>
-        </div>
-        <div className="stat">
-          <span className="stat-label">内容索引</span>
-          <span className="stat-value">{stats?.coverage.content_indexed ?? 0}</span>
-          <span className="stat-foot">
-            {stats?.coverage.content_level ?? "L1"} · 待解析 {stats?.coverage.content_pending ?? 0}
+
+        <div className="update-options">
+          <label>
+            资源模式
+            <select
+              value={profileDraft ?? overview?.profile ?? "balanced"}
+              disabled={savingProfile}
+              onChange={(event) => setProfileDraft(event.target.value)}
+            >
+              {PROFILES.map((profile) => (
+                <option key={profile.key} value={profile.key}>
+                  {profile.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="ghost small" disabled={savingProfile} onClick={() => void saveProfile()}>
+            {savingProfile ? "保存中…" : "保存"}
+          </button>
+          <label>
+            OCR 引擎
+            <select
+              value={ocrPolicy}
+              disabled={savingOcr}
+              onChange={(event) =>
+                setOcrPolicy(event.target.value as OcrSettings["policy"])
+              }
+            >
+              <option value="auto">{OCR_POLICY_LABEL.auto}</option>
+              <option value="windows">{OCR_POLICY_LABEL.windows}</option>
+              <option value="rapidocr">{OCR_POLICY_LABEL.rapidocr}</option>
+            </select>
+          </label>
+          <button className="ghost small" disabled={savingOcr} onClick={() => void saveOcrPolicy()}>
+            {savingOcr ? "保存中…" : "保存"}
+          </button>
+          <span className="muted small-text">
+            {ocrInfo?.engines
+              .map((item) => `${item.label}：${item.available ? "可用" : "不可用"}`)
+              .join(" · ") ?? "正在读取 OCR 引擎状态…"}
           </span>
+        </div>
+      </section>
+
+      <div className="inventory-summary">
+        <div>
+          <span>待初解析</span>
+          <strong>{summary?.pending_l1 ?? 0}</strong>
+        </div>
+        <div>
+          <span>待深度解析</span>
+          <strong>{summary?.pending_l2 ?? 0}</strong>
+        </div>
+        <div>
+          <span>24 小时已解析</span>
+          <strong>{summary?.parsed_24h ?? 0}</strong>
+        </div>
+        <div>
+          <span>失败记录</span>
+          <strong>{summary?.failed ?? 0}</strong>
         </div>
       </div>
 
-      <section className="panel">
-        <div className="panel-head">
-          <h2>内容覆盖（L1）</h2>
-          <span className="muted small-text">统计当前内容版本的解析结果，不含历史版本</span>
+      {summary && summary.awaiting_policy > 0 && (
+        <div className="notice">
+          有 {summary.awaiting_policy} 个数据源尚未确认盘点策略；确认后才会进入自动解析。
         </div>
-        <table className="table">
-          <tbody>
-            <tr>
-              <td>已解析，可检索正文</td>
-              <td>{stats?.coverage.content_indexed ?? 0}</td>
-            </tr>
-            <tr>
-              <td>待解析</td>
-              <td>{stats?.coverage.content_pending ?? 0}</td>
-            </tr>
-            <tr>
-              <td>无文本层（可能是扫描件）</td>
-              <td>{stats?.coverage.content_empty ?? 0}</td>
-            </tr>
-            <tr>
-              <td>低质量文本（已尝试 OCR 补充）</td>
-              <td>{stats?.coverage.low_quality ?? 0}</td>
-            </tr>
-            <tr>
-              <td>解析失败</td>
-              <td>{stats?.coverage.content_failed ?? 0}</td>
-            </tr>
-            <tr>
-              <td>暂不支持的类型</td>
-              <td>{stats?.coverage.content_unsupported ?? 0}</td>
-            </tr>
-            <tr>
-              <td>OCR 已识别（可检索）</td>
-              <td>{stats?.coverage.ocr_indexed ?? 0}</td>
-            </tr>
-            <tr>
-              <td>待 OCR（图片 / 无文本层 PDF / PPTX 内嵌图）</td>
-              <td>{stats?.coverage.ocr_pending ?? 0}</td>
-            </tr>
-            <tr>
-              <td>混合版式 PDF（部分页缺文本层）</td>
-              <td>{stats?.coverage.mixed_pdf ?? 0}</td>
-            </tr>
-            <tr>
-              <td>OCR 未识别到文字</td>
-              <td>{stats?.coverage.ocr_empty ?? 0}</td>
-            </tr>
-            <tr>
-              <td>OCR 失败</td>
-              <td>{stats?.coverage.ocr_failed ?? 0}</td>
-            </tr>
-          </tbody>
-        </table>
-        <div className="muted small-text" style={{ marginTop: 10 }}>
-          OCR 策略：{OCR_POLICY_LABEL[stats?.coverage.ocr_policy ?? ocrPolicy] ?? "自动"}
-          {stats?.coverage.ocr_languages?.length
-            ? ` · Windows 语言包：${stats.coverage.ocr_languages.join(" / ")}`
-            : ""}
-          {stats?.coverage.ocr_available === false
-            ? ` · Windows OCR 不可用：${stats.coverage.ocr_message ?? "未安装语言包"}`
-            : ""}
+      )}
+
+      <section className="panel inventory-panel">
+        <div className="inventory-panel-head">
+          <h3>最近解析活动</h3>
+          <span className="muted small-text">只显示新增或修改后文件的处理记录</span>
         </div>
+        {overview && overview.recent.length === 0 ? (
+          <p className="muted">还没有解析记录。新增或修改文件后会自动出现在这里。</p>
+        ) : (
+          <ul className="update-list">
+            {overview?.recent.map((item, index) => (
+              <li
+                key={`${item.path}-${item.stage}-${item.created_at}-${index}`}
+                className="update-item"
+              >
+                <div className="update-item-main">
+                  <div className="update-item-title">
+                    <span className="update-item-name">{item.name ?? "—"}</span>
+                    <span className="chip subtle">
+                      {item.stage === "L2" ? "OCR" : "正文"}
+                    </span>
+                    <span className="chip">{item.source_label}</span>
+                  </div>
+                  <div className="update-item-meta">
+                    {item.state === "ok" ? `${item.chars} 字` : item.state}
+                    {" · "}
+                    {formatTime(item.created_at)}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
 
-      <section className="panel">
-        <div className="panel-head">
-          <h2>知识库管理</h2>
+      <section className="panel inventory-panel">
+        <div className="inventory-panel-head">
+          <h3>最近失败</h3>
           <span className="muted small-text">
-            {maintenanceRunning
-              ? `正在执行：${ACTION_LABEL[stats?.maintenance.running.kind ?? ""] ?? "维护"}…`
-              : "维护只改派生缓存，不动原文件"}
+            失败文件不会反复重试；完整记录可在数据页的「解析结果」查看
           </span>
         </div>
-        <table className="table">
-          <tbody>
-            <tr>
-              <td>索引任务失败</td>
-              <td>{failedJobs}</td>
-            </tr>
-            <tr>
-              <td>排队 / 运行中的任务</td>
-              <td>{activeJobs}</td>
-            </tr>
-            <tr>
-              <td>缓存块数</td>
-              <td>{stats?.maintenance.chunks ?? 0}</td>
-            </tr>
-            <tr>
-              <td>数据库大小</td>
-              <td>{formatSize(stats?.maintenance.db_bytes ?? 0)}</td>
-            </tr>
-            <tr>
-              <td>今日预算</td>
-              <td>
-                正文 {stats?.maintenance.budget.l1_used ?? 0}/
-                {stats?.maintenance.budget.l1_limit ?? 0} · OCR{" "}
-                {stats?.maintenance.budget.l2_used ?? 0}/
-                {stats?.maintenance.budget.l2_limit ?? 0}
-              </td>
-            </tr>
-            <tr>
-              <td>向量条数</td>
-              <td>{stats?.maintenance.vectors ?? 0}</td>
-            </tr>
-            <tr>
-              <td>语义检索</td>
-              <td>
-                {stats?.maintenance.embedding.provider === "none"
-                  ? "关闭"
-                  : stats?.maintenance.embedding.provider === "ollama"
-                    ? "Ollama 本机"
-                    : "OpenAI 兼容"}
-                {stats?.maintenance.embedding.model
-                  ? ` · ${stats.maintenance.embedding.model}`
-                  : ""}
-              </td>
-            </tr>
-            <tr>
-              <td>OCR 策略</td>
-              <td>
-                <select
-                  value={ocrPolicy}
-                  onChange={(event) =>
-                    setOcrPolicy(event.target.value as OcrSettings["policy"])
-                  }
-                >
-                  <option value="auto">{OCR_POLICY_LABEL.auto}</option>
-                  <option value="windows">{OCR_POLICY_LABEL.windows}</option>
-                  <option value="rapidocr">{OCR_POLICY_LABEL.rapidocr}</option>
-                </select>
+        {overview && overview.failures.length === 0 ? (
+          <p className="muted">没有失败记录。</p>
+        ) : (
+          <ul className="update-list">
+            {overview?.failures.map((item) => (
+              <li key={item.job_id} className="update-item">
+                <div className="update-item-main">
+                  <div className="update-item-title">
+                    <span className="update-item-name">{item.name ?? "—"}</span>
+                    <span className="chip warn">
+                      {item.stage === "l2" ? "OCR" : "正文"}
+                    </span>
+                    <span className="chip">{item.source_label}</span>
+                  </div>
+                  <div className="update-item-error">{item.error ?? "解析失败"}</div>
+                  <div className="update-item-meta">
+                    尝试 {item.attempts} 次 · {formatTime(item.updated_at)}
+                  </div>
+                </div>
                 <button
                   className="ghost small"
-                  style={{ marginLeft: 8 }}
-                  disabled={ocrSaving}
-                  onClick={() => void saveOcrPolicy()}
+                  disabled={retrying === item.job_id}
+                  onClick={() => void retry(item.job_id)}
                 >
-                  {ocrSaving ? "保存中…" : "保存"}
+                  {retrying === item.job_id ? "重试中…" : "重试"}
                 </button>
-                <div className="muted small-text" style={{ marginTop: 4 }}>
-                  {ocrInfo?.engines
-                    .map((item) => `${item.label}：${item.available ? "可用" : "不可用"}`)
-                    .join(" · ") ?? "正在读取引擎状态…"}
-                </div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        {ocrNote && <div className="notice" style={{ marginTop: 10 }}>{ocrNote}</div>}
-        <div className="panel-actions">
-          <button
-            className="ghost small"
-            disabled={maintenanceRunning || actionBusy !== null}
-            onClick={() => void runMaintenance("retry")}
-          >
-            {actionBusy === "retry" ? "提交中…" : "重试失败"}
-          </button>
-          <button
-            className="ghost small"
-            disabled={maintenanceRunning || actionBusy !== null}
-            onClick={() => void runMaintenance("reindex")}
-          >
-            {actionBusy === "reindex" ? "提交中…" : "重建正文索引"}
-          </button>
-          <button
-            className="ghost small"
-            disabled={maintenanceRunning || actionBusy !== null}
-            onClick={() => void runMaintenance("ocr")}
-          >
-            {actionBusy === "ocr" ? "提交中…" : "重建 OCR"}
-          </button>
-          <button
-            className="ghost small"
-            disabled={maintenanceRunning || actionBusy !== null}
-            onClick={() => void runMaintenance("cleanup")}
-          >
-            {actionBusy === "cleanup" ? "提交中…" : "清理缓存"}
-          </button>
-          <button
-            className="ghost small"
-            disabled={
-              maintenanceRunning ||
-              actionBusy !== null ||
-              stats?.maintenance.embedding.provider === "none" ||
-              !stats?.maintenance.embedding.model
-            }
-            title="为尚未生成向量的文本块补建向量索引"
-            onClick={() => void runMaintenance("embed")}
-          >
-            {actionBusy === "embed" ? "提交中…" : "补建向量索引"}
-          </button>
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="panel-head">
-          <h2>失败任务</h2>
-          <span className="muted small-text">自动重试 3 次后停在这里，可单条重试</span>
-        </div>
-        {jobs.length ? (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>文件</th>
-                <th>阶段</th>
-                <th>尝试</th>
-                <th>错误</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              {jobs.map((job) => (
-                <tr key={job.job_id}>
-                  <td className="ellipsis" style={{ maxWidth: 220 }} title={job.path ?? ""}>
-                    {job.name ?? "—"}
-                  </td>
-                  <td>
-                    <span className={`chip ${job.stage === "l2" ? "warn" : "subtle"}`}>
-                      {job.stage === "l2" ? "OCR" : "正文"}
-                    </span>
-                  </td>
-                  <td>{job.attempts}</td>
-                  <td className="ellipsis" style={{ maxWidth: 260 }} title={job.error ?? ""}>
-                    {job.error ?? "—"}
-                  </td>
-                  <td>
-                    <button
-                      className="ghost small"
-                      disabled={jobBusy === job.job_id}
-                      onClick={() => void retryJob(job.job_id)}
-                    >
-                      {jobBusy === job.job_id ? "重试中…" : "重试"}
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        ) : (
-          <p className="muted">没有失败任务。</p>
-        )}
-      </section>
-
-      <section className="panel">
-        <div className="panel-head">
-          <h2>数据源同步</h2>
-        </div>
-        {stats?.sources.length ? (
-          <table className="table">
-            <thead>
-              <tr>
-                <th>数据源</th>
-                <th>根目录</th>
-                <th>状态</th>
-                <th>可检索</th>
-                <th>待刷新</th>
-                <th>最后同步</th>
-              </tr>
-            </thead>
-            <tbody>
-              {stats.sources.map((source) => (
-                <tr key={source.source_id}>
-                  <td>{source.label}</td>
-                  <td className="mono ellipsis" title={source.root_uri}>
-                    {source.root_uri}
-                  </td>
-                  <td>
-                    <span className={`chip ${source.health === "offline" ? "warn" : "ok"}`}>
-                      {source.state === "paused" ? "已暂停" : source.health === "offline" ? "离线" : "正常"}
-                    </span>
-                  </td>
-                  <td>{source.available}</td>
-                  <td>
-                    {source.stale > 0 ? <span className="chip warn">{source.stale}</span> : "0"}
-                  </td>
-                  <td>{formatTime(source.last_scan_at)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        ) : (
-          <p className="muted">尚未添加数据源。</p>
-        )}
-      </section>
-
-      <section className="panel">
-        <div className="panel-head">
-          <h2>文件类型分布</h2>
-        </div>
-        {stats?.by_ext.length ? (
-          <ul className="bars">
-            {stats.by_ext.map((entry) => (
-              <li key={entry.ext || "none"}>
-                <span className="bar-label">{entry.ext || "无扩展名"}</span>
-                <span className="bar-track">
-                  <span className="bar-fill" style={{ width: `${(entry.count / maxExt) * 100}%` }} />
-                </span>
-                <span className="bar-count">{entry.count}</span>
               </li>
             ))}
           </ul>
-        ) : (
-          <p className="muted">暂无数据。</p>
         )}
       </section>
 
-      <section className="panel">
-        <div className="panel-head">
-          <h2>维护日志</h2>
-          <span className="muted small-text">只记录索引侧动作，不涉及原件修改</span>
-        </div>
-        {events.length ? (
-          <ul className="event-list">
-            {events.map((event) => (
-              <li key={event.event_id}>
-                <span className="event-time">{formatTime(event.timestamp)}</span>
-                <span className={`chip ${event.type === "scan_failed" ? "warn" : "subtle"}`}>
-                  {EVENT_LABEL[event.type] ?? event.type}
-                </span>
-                <span className="event-detail ellipsis" title={event.detail ?? ""}>
-                  {event.detail ?? "—"}
-                </span>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="muted">还没有维护记录。</p>
-        )}
-      </section>
+      <div className="notice">
+        原文件只读，解析结果只写入应用缓存。关闭自动解析后，仍可在「数据」页对单个数据源手动深度解析。
+      </div>
     </div>
   );
 }

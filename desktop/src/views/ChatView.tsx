@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api, formatTime } from "../api";
 import type {
   AnswerResult,
   AnswerSettings,
   ChatMessage,
   ChatSession,
+  Citation,
+  DocumentFamilyMember,
   EmbeddingSettings,
   QuerySettings,
 } from "../api";
@@ -14,6 +18,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   extractive: "本地摘录",
   openai: "OpenAI 兼容",
   ollama: "Ollama 本机",
+  library: "本地统计",
 };
 
 interface Draft {
@@ -35,6 +40,7 @@ const EMPTY_DRAFT: Draft = {
 };
 
 const ACTIVE_CHAT_KEY = "shiyuan.chat.active";
+const SESSIONS_COLLAPSED_KEY = "shiyuan.chat.sessions.collapsed";
 
 function rememberActiveSession(sessionId: string | null) {
   if (sessionId) {
@@ -44,69 +50,260 @@ function rememberActiveSession(sessionId: string | null) {
   }
 }
 
-function AnswerCard({ result }: { result: AnswerResult }) {
+function CitationRow({
+  citation,
+  inFamily = false,
+}: {
+  citation: Citation;
+  inFamily?: boolean;
+}) {
   return (
-    <section className="panel chat-answer">
-      <div className="panel-head">
-        <h2>回答</h2>
-        <div className="chip-row">
-          <span className={`chip ${result.refused ? "warn" : "ok"}`}>
-            {PROVIDER_LABEL[result.provider] ?? result.provider}
-          </span>
-          {result.model && <span className="chip subtle">{result.model}</span>}
-          {result.refused && <span className="chip warn">已拒答</span>}
+    <li>
+      <span className="chip citation-index">[{citation.n}]</span>
+      <div className="citation-body">
+        <div className="citation-name">
+          {citation.name}
+          {citation.page != null && <span className="chip subtle">第 {citation.page} 页</span>}
+          {citation.sheet && <span className="chip subtle">工作表 {citation.sheet}</span>}
+          {citation.ocr && <span className="chip subtle">OCR</span>}
+          {citation.semantic && <span className="chip warn">语义</span>}
+          {!inFamily && citation.family_size != null && citation.family_size > 1 && (
+            <span className="chip subtle">同一文档 {citation.family_size} 个版本</span>
+          )}
+          {citation.mtime && (
+            <span className="chip subtle">更新于 {formatTime(citation.mtime)}</span>
+          )}
         </div>
+        <div className="citation-snippet">{citation.snippet}</div>
+        {citation.sources && citation.sources.length > 1 && (
+          <div className="citation-sources">
+            同源版本：
+            {citation.sources
+              .slice(0, 6)
+              .map((source) => source.name ?? source.path ?? "—")
+              .join("、")}
+            {citation.sources.length > 6
+              ? ` 等 ${citation.sources.length} 个版本`
+              : ""}
+          </div>
+        )}
       </div>
-      <div className={`answer-text${result.refused ? " refused" : ""}`}>{result.answer}</div>
-      {result.warning && <div className="alert warn" style={{ marginTop: 10 }}>{result.warning}</div>}
+      <button className="ghost small" onClick={() => void openFile(citation.path)}>
+        打开
+      </button>
+    </li>
+  );
+}
+
+interface FamilyCitationGroup {
+  familyId: string;
+  title: string;
+  size: number;
+  citations: Citation[];
+}
+
+function AnswerCard({ result }: { result: AnswerResult }) {
+  const familyGroups: FamilyCitationGroup[] = [];
+  const groupIndex = new Map<string, number>();
+  const standalone: Citation[] = [];
+
+  for (const citation of result.citations) {
+    if (citation.family_id && (citation.family_size ?? 1) > 1) {
+      const index = groupIndex.get(citation.family_id);
+      if (index === undefined) {
+        groupIndex.set(citation.family_id, familyGroups.length);
+        familyGroups.push({
+          familyId: citation.family_id,
+          title: citation.family_title || citation.name,
+          size: citation.family_size ?? 1,
+          citations: [citation],
+        });
+      } else {
+        familyGroups[index].citations.push(citation);
+      }
+    } else {
+      standalone.push(citation);
+    }
+  }
+
+  const units: ({ order: number; group: FamilyCitationGroup }
+    | { order: number; citation: Citation })[] = [
+    ...familyGroups.map((group) => ({ order: group.citations[0].n, group })),
+    ...standalone.map((citation) => ({ order: citation.n, citation })),
+  ];
+  units.sort((first, second) => first.order - second.order);
+
+  const [openFamily, setOpenFamily] = useState<FamilyCitationGroup | null>(null);
+  const [familyMembers, setFamilyMembers] = useState<DocumentFamilyMember[]>([]);
+  const [familyLoading, setFamilyLoading] = useState(false);
+  const [familyError, setFamilyError] = useState<string | null>(null);
+
+  const showFamilyVersions = async (group: FamilyCitationGroup) => {
+    setOpenFamily(group);
+    setFamilyMembers([]);
+    setFamilyError(null);
+    setFamilyLoading(true);
+    try {
+      const primary = group.citations[0];
+      const anchor = primary?.asset_id || primary?.sources?.[0]?.asset_id;
+      // 家族 ID 会在重建后变化，优先按文件解析当前家族。
+      const data = anchor
+        ? await api.familyMembersByAsset(anchor)
+        : await api.documentFamilyMembers(group.familyId);
+      setFamilyMembers(data.members);
+      setOpenFamily((current) => (current
+        ? {
+          ...current,
+          familyId: data.family_id,
+          title: data.title || current.title,
+          size: data.members.length || current.size,
+        }
+        : current));
+    } catch (err) {
+      setFamilyError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setFamilyLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!openFamily) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenFamily(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openFamily]);
+
+  return (
+    <section className="chat-answer">
+      <div className="chat-answer-head">
+        <span className="assistant-mark">拾</span>
+        <span className="assistant-name">拾源</span>
+        <span className={`chip ${result.refused ? "warn" : "ok"}`}>
+          {result.reason === "source_recall"
+            ? "数据源记忆"
+            : PROVIDER_LABEL[result.provider] ?? result.provider}
+        </span>
+        {result.model && <span className="chip subtle">{result.model}</span>}
+        {result.refused && <span className="chip warn">已拒答</span>}
+      </div>
+      <div className={`answer-text${result.refused ? " refused" : ""}`}>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{result.answer}</ReactMarkdown>
+      </div>
+      {result.warning && <div className="alert warn answer-warning">{result.warning}</div>}
 
       {result.citations.length > 0 && (
-        <>
-          <div className="muted small-text" style={{ marginTop: 14 }}>
-            来源（点击「打开」定位原件）
+        <div className="answer-sources">
+          <div className="answer-sources-head">
+            来源 · {result.citations.length}
+            {familyGroups.length > 0 && (
+              <span className="muted small-text">
+                {" "}· 归并为 {familyGroups.length} 个文档家族
+              </span>
+            )}
           </div>
           <ul className="citation-list">
-            {result.citations.map((citation) => (
-              <li key={citation.chunk_id}>
-                <span className="chip">[{citation.n}]</span>
-                <div className="citation-body">
-                  <div className="citation-name">
-                    {citation.name}
-                    {citation.page != null && <span className="chip subtle">第 {citation.page} 页</span>}
-                    {citation.sheet && <span className="chip subtle">工作表 {citation.sheet}</span>}
-                    {citation.ocr && <span className="chip subtle">OCR</span>}
-                    {citation.semantic && <span className="chip warn">语义</span>}
-                    {citation.mtime && (
-                      <span className="chip subtle">更新于 {formatTime(citation.mtime)}</span>
-                    )}
+            {units.map((unit) => (
+              "group" in unit ? (
+                <li key={unit.group.familyId} className="citation-family">
+                  <div className="citation-family-head">
+                    <span className="citation-family-title">{unit.group.title}</span>
+                    <button
+                      type="button"
+                      className="chip accent family-chip-button"
+                      title="查看全部关联版本"
+                      aria-label={`查看 ${unit.group.title} 的 ${unit.group.size} 个关联版本`}
+                      onClick={() => void showFamilyVersions(unit.group)}
+                    >
+                      {unit.group.size} 个关联版本
+                    </button>
+                    <span className="muted small-text">
+                      本回答命中 {unit.group.citations.length} 段，重复段落已合并
+                    </span>
                   </div>
-                  <div className="citation-snippet">{citation.snippet}</div>
-                </div>
-                <button className="ghost small" onClick={() => void openFile(citation.path)}>
-                  打开
-                </button>
-              </li>
+                  <ul className="citation-family-list">
+                    {unit.group.citations.map((citation) => (
+                      <CitationRow key={citation.chunk_id} citation={citation} inFamily />
+                    ))}
+                  </ul>
+                </li>
+              ) : (
+                <CitationRow key={unit.citation.chunk_id} citation={unit.citation} />
+              )
             ))}
           </ul>
-        </>
+        </div>
       )}
 
-      <div className="muted small-text" style={{ marginTop: 12 }}>
-        覆盖：已解析 {result.coverage.content_indexed} 个文件 · OCR{" "}
-        {result.coverage.ocr_indexed} · 待解析 {result.coverage.content_pending} · 无文本层{" "}
-        {result.coverage.content_empty}
+      <div className="answer-coverage">
+        覆盖：已解析 {result.coverage.content_indexed} 个文件 · OCR {result.coverage.ocr_indexed} ·
+        待解析 {result.coverage.content_pending} · 无文本层 {result.coverage.content_empty}
       </div>
+
+      {openFamily && (
+        <div
+          className="family-modal-backdrop"
+          role="presentation"
+          onClick={() => setOpenFamily(null)}
+        >
+          <div
+            className="family-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${openFamily.title} 的关联版本`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="family-modal-head">
+              <div>
+                <h3>{openFamily.title}</h3>
+                <p className="muted small-text">
+                  {openFamily.size} 个关联版本 · 原文件保持不变，拾源不判断哪个版本更好
+                </p>
+              </div>
+              <button className="ghost small" onClick={() => setOpenFamily(null)}>
+                关闭
+              </button>
+            </div>
+
+            {familyError && <div className="alert error">{familyError}</div>}
+            {familyLoading ? (
+              <p className="muted small-text family-modal-loading">正在读取版本列表…</p>
+            ) : (
+              <ul className="family-version-list">
+                {familyMembers.map((member) => (
+                  <li key={member.asset_id} className="family-version-item">
+                    <div className="family-version-main">
+                      <span className="family-version-name" title={member.path ?? ""}>
+                        {member.name || member.path || member.asset_id}
+                      </span>
+                      <span className="chip subtle">
+                        {member.version_label || "未标注版本"}
+                      </span>
+                    </div>
+                    <div className="family-version-path" title={member.path ?? ""}>
+                      {member.rel_path || member.path || "路径不可用"}
+                    </div>
+                    {member.path && (
+                      <button
+                        className="ghost small"
+                        onClick={() => void openFile(member.path as string)}
+                      >
+                        打开
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
     </section>
   );
 }
 
-export default function ChatView({
-  embedded = false,
-  active = true,
-}: {
-  embedded?: boolean;
-  active?: boolean;
-}) {
+export default function ChatView({ active = true }: { active?: boolean }) {
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -115,9 +312,16 @@ export default function ChatView({
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [messageLoading, setMessageLoading] = useState(false);
+  const [sessionsCollapsed, setSessionsCollapsed] = useState(
+    () => window.localStorage.getItem(SESSIONS_COLLAPSED_KEY) === "1",
+  );
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const initialLoadRef = useRef(true);
   const openSeqRef = useRef(0);
+
+  useEffect(() => {
+    window.localStorage.setItem(SESSIONS_COLLAPSED_KEY, sessionsCollapsed ? "1" : "0");
+  }, [sessionsCollapsed]);
 
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<AnswerSettings | null>(null);
@@ -238,6 +442,19 @@ export default function ChatView({
     });
     return () => window.cancelAnimationFrame(frame);
   }, [messages, loading, active]);
+
+  useEffect(() => {
+    if (!showSettings) return;
+    const end = messagesEndRef.current;
+    if (!end) return;
+    const frame = window.requestAnimationFrame(() => {
+      const container = end.closest(".main");
+      if (container instanceof HTMLElement) {
+        container.scrollTop = container.scrollHeight;
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [showSettings]);
 
   const newSession = async () => {
     setError(null);
@@ -408,43 +625,74 @@ export default function ChatView({
     }
   };
 
+  const activeSession = sessions.find((item) => item.session_id === activeId) ?? null;
+
   return (
-    <div className={embedded ? "view-section chat-view" : "view chat-view"}>
-      {!embedded && (
-        <header className="view-head">
-          <div>
-            <h1>知识对话</h1>
-            <p className="sub">只依据你授权目录里已解析的正文回答，并逐条标注来源；证据不足会直接拒答。</p>
-          </div>
-          <div className="chip-row">
-            <button className="ghost" onClick={() => void newSession()}>
-              新建对话
+    <div className="chat-view">
+      <div className={`chat-shell${sessionsCollapsed ? " sessions-collapsed" : ""}`}>
+        <aside className="chat-sessions">
+          <div className="chat-sessions-head">
+            {!sessionsCollapsed && <strong>对话</strong>}
+            {!sessionsCollapsed && (
+              <button className="ghost small" onClick={() => void newSession()}>
+                新建
+              </button>
+            )}
+            <button
+              className="icon-btn sessions-toggle"
+              onClick={() => setSessionsCollapsed((value) => !value)}
+              aria-label={sessionsCollapsed ? "展开对话列表" : "收起对话列表"}
+              title={sessionsCollapsed ? "展开对话列表" : "收起对话列表"}
+            >
+              {sessionsCollapsed ? "›" : "‹"}
             </button>
-            <button className="ghost" onClick={() => setShowSettings((value) => !value)}>
-              {showSettings ? "收起设置" : "回答设置"}
-            </button>
           </div>
-        </header>
-      )}
+          {sessionsCollapsed ? (
+            <div className="sessions-rail">对话</div>
+          ) : sessions.length === 0 ? (
+            <div className="muted small-text">还没有对话</div>
+          ) : (
+            <ul className="chat-session-list">
+              {sessions.map((session) => (
+                <li
+                  key={session.session_id}
+                  className={session.session_id === activeId ? "active" : ""}
+                >
+                  <button
+                    className="chat-session-main"
+                    onClick={() => void openSession(session.session_id)}
+                  >
+                    <span className="chat-session-title">{session.title}</span>
+                    <span className="chat-session-meta">
+                      {Math.floor(session.message_count / 2)} 轮 · {formatTime(session.updated_at)}
+                    </span>
+                  </button>
+                  <div className="chat-session-actions">
+                    <button onClick={() => void renameSession(session)}>改名</button>
+                    <button onClick={() => void removeSession(session)}>删除</button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </aside>
 
-      {embedded && (
-        <div className="section-toolbar">
-          <span className="muted small-text">
-            对话会自动保存在本机，切换标签或页面不会丢失。
-          </span>
-          <div className="chip-row">
-            <button className="ghost small" onClick={() => void newSession()}>
-              新建对话
-            </button>
-            <button className="ghost small" onClick={() => setShowSettings((value) => !value)}>
-              {showSettings ? "收起设置" : "回答设置"}
-            </button>
+        <div className="chat-main">
+          <div className="chat-head">
+            <div>
+              <h2>{activeSession?.title ?? "知识对话"}</h2>
+              <p className="chat-head-sub">
+                {messageLoading
+                  ? "正在加载对话…"
+                  : activeSession
+                    ? `${Math.floor(activeSession.message_count / 2)} 轮 · 更新于 ${formatTime(activeSession.updated_at)}`
+                    : "只依据已解析的正文回答，并标注来源"}
+              </p>
+            </div>
           </div>
-        </div>
-      )}
 
-      {showSettings && (
-        <section className="panel">
+          {showSettings && (
+        <section className="panel settings-panel">
           <div className="panel-head">
             <h2>回答设置</h2>
             <span className="muted small-text">
@@ -636,43 +884,6 @@ export default function ChatView({
         </section>
       )}
 
-      <div className="chat-shell">
-        <aside className="chat-sessions">
-          <div className="chat-sessions-head">
-            <strong>对话列表</strong>
-            <button className="ghost small" onClick={() => void newSession()}>
-              新建
-            </button>
-          </div>
-          {sessions.length === 0 ? (
-            <div className="muted small-text">还没有对话</div>
-          ) : (
-            <ul className="chat-session-list">
-              {sessions.map((session) => (
-                <li
-                  key={session.session_id}
-                  className={session.session_id === activeId ? "active" : ""}
-                >
-                  <button
-                    className="chat-session-main"
-                    onClick={() => void openSession(session.session_id)}
-                  >
-                    <span className="chat-session-title">{session.title}</span>
-                    <span className="chat-session-meta">
-                      {Math.floor(session.message_count / 2)} 轮 · {formatTime(session.updated_at)}
-                    </span>
-                  </button>
-                  <div className="chat-session-actions">
-                    <button onClick={() => void renameSession(session)}>改名</button>
-                    <button onClick={() => void removeSession(session)}>删除</button>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
-        </aside>
-
-        <div className="chat-main">
           <div className="chat-messages">
             {messages.map((message) =>
               message.role === "user" ? (
@@ -684,30 +895,17 @@ export default function ChatView({
                 <AnswerCard key={message.message_id} result={message.payload} />
               ) : null,
             )}
-            {messageLoading && <div className="notice">正在加载对话…</div>}
-            {!messageLoading && messages.length === 0 && (
-              <div className="empty">
-                <div className="empty-title">
-                  {activeId ? "这个对话还没有消息" : "开始一段新对话"}
-                </div>
-                <p>
-                  拾源会先在本机检索已解析的正文，把命中的片段交给回答方式组织答案。
-                  没有足够证据时不会编造；不同文件说法不一致时，会把各自的来源一起列出。
-                </p>
-              </div>
-            )}
-            {loading && <div className="notice">检索中…</div>}
             <div ref={messagesEndRef} className="chat-end" />
           </div>
 
           <div className="chat-composer">
             {error && <div className="alert error">{error}</div>}
 
-            <div className="ask-box">
+            <div className="composer-box">
               <textarea
-                rows={3}
+                rows={2}
                 value={question}
-                placeholder="例如：项目A 的最终样本量是多少？去年 BLAST 结果的阈值设置是什么？"
+                placeholder="找点啥？"
                 onChange={(event) => setQuestion(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
@@ -716,14 +914,24 @@ export default function ChatView({
                   }
                 }}
               />
-            </div>
-            <div className="ask-actions">
-              <span className="muted small-text">
-                Ctrl + Enter 发送；对话会自动保存在本机，切换页面不会丢失。
-              </span>
-              <button className="primary" disabled={loading || !question.trim()} onClick={() => void ask()}>
-                {loading ? "检索中…" : "提问"}
-              </button>
+              <div className="composer-bar">
+                <span className="composer-hint">Ctrl + Enter 发送 · 对话自动保存在本机</span>
+                <div className="composer-actions">
+                  <button
+                    className="composer-action"
+                    onClick={() => setShowSettings((value) => !value)}
+                  >
+                    {showSettings ? "收起设置" : "回答设置"}
+                  </button>
+                  <button
+                    className="primary small"
+                    disabled={loading || !question.trim()}
+                    onClick={() => void ask()}
+                  >
+                    {loading ? "检索中…" : "提问"}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
         </div>

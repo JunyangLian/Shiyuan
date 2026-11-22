@@ -13,10 +13,11 @@ import re
 import sqlite3
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
-from . import embeddings, indexer, query, retrieval, secrets_store, store
+from . import embeddings, families, indexer, query, retrieval, secrets_store, store
 
 SETTINGS_KEY = "answer"
 PROVIDERS = {"extractive", "openai", "ollama"}
@@ -119,6 +120,11 @@ class Evidence:
     version_id: str = ""
     mtime: str | None = None
     bbox: list[list[int]] | None = None
+    family_id: str | None = None
+    family_size: int = 1
+    family_title: str = ""
+    version_label: str = ""
+    sources: list[dict] = field(default_factory=list)
 
     def label(self) -> str:
         name = f"文件：{self.name}"
@@ -128,6 +134,8 @@ class Evidence:
             name += f"（工作表 {self.sheet}）"
         if self.ocr:
             name += "（OCR 识别）"
+        if self.family_size > 1:
+            name += f"（同一文档 {self.family_size} 个版本）"
         if self.mtime:
             name += f"（更新于 {self.mtime.replace('T', ' ')[:16]}）"
         return name
@@ -139,6 +147,7 @@ class Evidence:
         return {
             "n": number,
             "chunk_id": self.chunk_id,
+            "asset_id": self.asset_id,
             "location_id": self.location_id,
             "name": self.name,
             "path": self.path,
@@ -150,6 +159,11 @@ class Evidence:
             "version_id": self.version_id,
             "mtime": self.mtime,
             "bbox": self.bbox,
+            "family_id": self.family_id,
+            "family_size": self.family_size,
+            "family_title": self.family_title,
+            "version_label": self.version_label,
+            "sources": self.sources,
         }
 
 
@@ -180,6 +194,11 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
             version_id=hit.version_id,
             mtime=_iso_mtime(hit.mtime_ns),
             bbox=hit.bbox,
+            family_id=hit.family_id,
+            family_size=hit.family_size,
+            family_title=hit.family_title,
+            version_label=hit.version_label,
+            sources=hit.sources,
         ))
         if len(evidence) >= limit:
             break
@@ -193,6 +212,7 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
                 top_k=max(10, settings["top_k"] * 3))
         except embeddings.EmbeddingError:
             semantic_hits = []
+        semantic_hits = families.dedupe_semantic_hits(conn, semantic_hits)
         for hit in semantic_hits:
             if len(evidence) >= limit:
                 break
@@ -215,6 +235,11 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
                 version_id=hit["version_id"],
                 mtime=_iso_mtime(hit["mtime_ns"]),
                 bbox=hit.get("bbox"),
+                family_id=hit.get("family_id"),
+                family_size=hit.get("family_size", 1),
+                family_title=hit.get("family_title", ""),
+                version_label=hit.get("version_label", ""),
+                sources=hit.get("sources", []),
             ))
     return evidence
 
@@ -245,7 +270,12 @@ def _messages(question: str, evidence: list[Evidence]) -> list[dict]:
         "禁止补充证据之外的事实或推测。每个事实句末用 [数字] 标注对应证据。"
         "证据标题带有文件的更新时间；若问题涉及时间条件（如最近、去年、某个日期前后），"
         "要用这些时间判断取舍，并在回答里说明采用的版本时间。"
+        "证据可能来自同一份文档的多个版本。不要判断或宣称哪个版本最新、最权威、"
+        "最值得采用；不要替用户选定版本。若不同版本内容有差异，请并列说明各自来自"
+        "哪个文件或版本标记，不要把它们混成一份内容。"
         "若证据之间数值或结论不一致，请并列呈现，并说明各自来自哪个文件/时间条件。"
+        "证据只是本次检索命中的少量片段，不代表知识库的全部文件或全部内容；"
+        "不要根据证据条数推断文件总数、知识库规模或用户拥有的资料范围。"
         "若证据不足，直接回答：根据现有资料无法确定。"
     )
     user = f"<问题>\n{question}\n\n<证据>\n{_evidence_block(evidence)}"
@@ -330,6 +360,135 @@ def _coverage(conn: sqlite3.Connection) -> dict:
             "ocr_indexed": counts["ocr_indexed"], "ocr_pending": counts["ocr_pending"]}
 
 
+_OVERVIEW_PATTERNS = (
+    re.compile(
+        r"(知识库|资料库|库里|拾源|你)(里|中)?(现在|目前|都|一共|总共)?"
+        r"(有|包含|收录|存了)(什么|哪些)(文件|资料|文档)?[？?。！!\s]*$"
+    ),
+    re.compile(r"(有多少|总共多少|一共多少)(个|份)?(文件|资料|文档)"),
+    re.compile(r"(文件|资料|文档)(总数|数量|概况)"),
+    re.compile(r"(知识库|资料库|库里)(概况|概览|统计)"),
+)
+
+
+def _is_library_overview(text: str) -> bool:
+    """识别“知识库里有什么/有多少文件”这类元问题，避免用 6 条证据冒充全库。"""
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact or len(compact) > 40:
+        return False
+    return any(pattern.search(compact) for pattern in _OVERVIEW_PATTERNS)
+
+
+_SOURCE_CUE = re.compile(
+    r"(记得|授权|数据源|那个|这个|之前|上次|在哪|位于|是什么|有什么)"
+)
+
+
+def _bigrams(value: str) -> set[str]:
+    compact = re.sub(r"\s+", "", value or "").lower()
+    return {compact[index:index + 2] for index in range(len(compact) - 1)}
+
+
+def _match_source(conn: sqlite3.Connection, text: str,
+                  source_id: str | None = None) -> sqlite3.Row | None:
+    """识别“你还记得那个 XX 吗”这类对已授权数据源的追问。"""
+    compact = re.sub(r"\s+", "", text or "").lower()
+    if not compact or len(compact) > 60 or not _SOURCE_CUE.search(compact):
+        return None
+    query_grams = _bigrams(compact)
+    if len(query_grams) < 2:
+        return None
+
+    best: sqlite3.Row | None = None
+    best_score = 0
+    for row in store.list_sources(conn):
+        if source_id and row["source_id"] != source_id:
+            continue
+        for name in (row["label"] or "", Path(row["root_uri"]).name):
+            candidate = re.sub(r"\s+", "", name).lower()
+            if not candidate:
+                continue
+            shared = query_grams & _bigrams(candidate)
+            if len(shared) < 2:
+                continue
+            score = len(shared) + (4 if candidate in compact else 0)
+            if score > best_score:
+                best_score = score
+                best = row
+    return best
+
+
+def _source_recall_answer(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    stats = store.source_stats(conn, row["source_id"])
+    available = int(stats["available"] or 0)
+    parsed = conn.execute(
+        "SELECT COUNT(DISTINCT c.asset_id) FROM chunks c"
+        " JOIN asset_locations l ON l.asset_id = c.asset_id"
+        " WHERE l.source_id = ? AND l.availability = 'AVAILABLE'",
+        (row["source_id"],),
+    ).fetchone()[0]
+    label = row["label"] or Path(row["root_uri"]).name
+    lines = [
+        f"记得。你授权的数据源「{label}」在 `{row['root_uri']}`。",
+        f"当前有 {available} 个可检索文件，其中 {parsed} 个已解析正文"
+        + (f"，{available - parsed} 个待解析。" if available > parsed else "。"),
+    ]
+    if row["state"] != "active":
+        lines.append("这个数据源目前处于暂停状态。")
+    lines.append("你可以继续问这个数据源里的具体内容。")
+    return "\n".join(lines)
+
+
+def _library_overview(conn: sqlite3.Connection, *, source_id: str | None,
+                      ext: str | None) -> str:
+    clauses = ["l.availability = 'AVAILABLE'", "s.state = 'active'"]
+    params: list = []
+    if source_id:
+        clauses.append("l.source_id = ?")
+        params.append(source_id)
+    if ext:
+        clauses.append("l.ext = ?")
+        params.append(ext.lower().lstrip("."))
+    where = " AND ".join(clauses)
+    total = conn.execute(
+        "SELECT COUNT(*) FROM asset_locations l"
+        " JOIN sources s ON s.source_id = l.source_id"
+        f" WHERE {where}", params,
+    ).fetchone()[0]
+    by_ext = conn.execute(
+        "SELECT l.ext AS ext, COUNT(*) AS n FROM asset_locations l"
+        " JOIN sources s ON s.source_id = l.source_id"
+        f" WHERE {where} GROUP BY l.ext ORDER BY n DESC LIMIT 8", params,
+    ).fetchall()
+    source_rows = conn.execute(
+        "SELECT s.label,"
+        " (SELECT COUNT(*) FROM asset_locations l WHERE l.source_id = s.source_id"
+        "  AND l.availability = 'AVAILABLE') AS n"
+        " FROM sources s WHERE s.state = 'active' ORDER BY s.created_at"
+    ).fetchall()
+    coverage = indexer.coverage(conn)
+    filtered = bool(source_id or ext)
+    lines = [f"当前知识库共有 {total} 个可检索文件{'（按当前筛选）' if filtered else ''}。"]
+    if not filtered and source_rows:
+        lines.append("数据源：" + "；".join(
+            f"{row['label']}（{row['n']} 个）" for row in source_rows
+        ))
+    if by_ext:
+        lines.append("文件类型：" + "、".join(
+            f"{row['ext'] or '无扩展名'} {row['n']}" for row in by_ext
+        ))
+    lines.append(
+        f"正文索引：已解析 {coverage['indexed']}，待解析 {coverage['pending']}，"
+        f"无文本层 {coverage['empty']}，失败 {coverage['failed']}，"
+        f"暂不支持 {coverage['unsupported']}。"
+    )
+    lines.append(f"OCR：已识别 {coverage['ocr_indexed']}，待 OCR {coverage['ocr_pending']}。")
+    if filtered:
+        lines.append("正文与 OCR 数字为全库统计。")
+    lines.append("这是本地索引统计，不是本次检索到的证据条数。")
+    return "\n".join(lines)
+
+
 def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None,
         ext: str | None = None, top_k: int | None = None) -> dict:
     text = (question or "").strip()
@@ -337,9 +496,39 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
         raise ValueError("问题不能为空")
     settings = load_settings(conn)
     limit = top_k or settings["top_k"]
-    evidence = retrieve(conn, text, source_id=source_id, ext=ext, limit=limit)
     coverage = _coverage(conn)
     provider = settings["provider"]
+
+    if _is_library_overview(text):
+        return {
+            "question": text,
+            "answer": _library_overview(conn, source_id=source_id, ext=ext),
+            "refused": False,
+            "reason": "library_overview",
+            "provider": "library",
+            "model": None,
+            "citations": [],
+            "evidence_count": 0,
+            "warning": None,
+            "coverage": coverage,
+        }
+
+    matched_source = _match_source(conn, text, source_id=source_id)
+    if matched_source is not None:
+        return {
+            "question": text,
+            "answer": _source_recall_answer(conn, matched_source),
+            "refused": False,
+            "reason": "source_recall",
+            "provider": "library",
+            "model": None,
+            "citations": [],
+            "evidence_count": 0,
+            "warning": None,
+            "coverage": coverage,
+        }
+
+    evidence = retrieve(conn, text, source_id=source_id, ext=ext, limit=limit)
 
     if not evidence:
         indexed = coverage["content_indexed"]
@@ -373,6 +562,7 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
 
     if not answer:
         raise AnswerError("模型没有返回任何内容")
+    citations = [item.citation(index) for index, item in enumerate(evidence, start=1)]
     return {
         "question": text,
         "answer": answer,
@@ -380,7 +570,7 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
         "reason": None,
         "provider": provider,
         "model": settings.get("model") or None,
-        "citations": [item.citation(index) for index, item in enumerate(evidence, start=1)],
+        "citations": citations,
         "evidence_count": len(evidence),
         "warning": warning,
         "coverage": coverage,

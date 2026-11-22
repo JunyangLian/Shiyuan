@@ -217,17 +217,19 @@ def test_stdio_framing_skips_notifications(conn, seeded):
 
 
 def test_config_snippet_points_at_core_and_home():
-    snippet = mcp_server._config_snippet()
+    snippet = mcp_server.config_snippet("syext_test")
     server = snippet["mcpServers"]["shiyuan"]
     assert server["args"] == ["-m", "shiyuan.mcp_server"]
     assert server["cwd"].endswith("core")
-    assert "SHIYUAN_HOME" in server["env"]
+    assert server["env"]["SHIYUAN_HOME"]
+    assert server["env"]["SHIYUAN_EXT_TOKEN"] == "syext_test"
 
 
 def test_frozen_config_uses_merged_core_exe(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", str(tmp_path / "shiyuan-core.exe"))
-    snippet = mcp_server._config_snippet()
+    snippet = mcp_server.config_snippet()
     server = snippet["mcpServers"]["shiyuan"]
     assert server["command"].endswith("shiyuan-core.exe")
     assert server["args"] == ["--mcp"]
+    assert "SHIYUAN_EXT_TOKEN" not in server["env"]
