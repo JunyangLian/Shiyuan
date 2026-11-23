@@ -57,6 +57,18 @@ def test_synonym_recall_for_content(conn, tmp_path):
     assert hits["items"][0]["name"] == "记录.md"
 
 
+def test_filename_subject_outranks_dense_content(conn, tmp_path):
+    dense = "本文讨论专利 创新点、创新点分析、专利技术与创新点归纳。" * 20
+    _source(conn, tmp_path, {
+        "专利说明.md": "本发明公开了一种性别决定区定位方法，创新点在于混池测序与全局比对。",
+        "论文笔记.md": dense,
+    })
+
+    hits = search.search(conn, "专利的创新点")
+
+    assert hits["items"][0]["name"] == "专利说明.md"
+
+
 def test_question_tail_does_not_block_content_search(conn, tmp_path):
     _source(conn, tmp_path, {"记录.md": "本次样本量 42 例\n"})
 

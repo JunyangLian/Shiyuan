@@ -159,6 +159,9 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
         path_match = path_index.get(location_id)
         score = path_match.score if path_match else 0
         score += retrieval.name_prior(row["path"], analysis)
+        if path_match is not None and path_match.name_matched and path_match.specific:
+            # 文件名命中主题词时补固定分，避免长文档靠正文 gram 数量压过真正的主角文件。
+            score += 240
         content = content_hits.get(location_id)
         semantic = vector_hits.get(location_id)
         name_matched = path_match is not None
