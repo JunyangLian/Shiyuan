@@ -18,8 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import (embeddings, families, indexer, planner, query, retrieval,
-               secrets_store, store)
+from . import (embeddings, families, indexer, planner, query, rerank,
+               retrieval, secrets_store, store)
 
 SETTINGS_KEY = "answer"
 PROVIDERS = {"extractive", "openai", "ollama"}
@@ -265,6 +265,18 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
     candidates = retrieval.find_chunks(conn, question, analysis=analysis,
                                        source_id=source_id, ext=ext, focus=focus,
                                        path_only=path_only)
+    candidate_total = len(candidates)
+    # 候选明显多于预算时，先让已授权的生成模型按「能否直接回答」筛选并排序；
+    # 未配置、失败或超时都保持本地顺序，不影响问答。
+    answer_settings = load_settings(conn)
+    rerank_stats: dict = {}
+    # 精确查找要保住少量高置信证据，历史追溯要保住多个版本；
+    # 只有解释与综合探索容易被同主题噪声淹没，值得多花一次模型调用。
+    if (plan is not None and plan.mode.key in {"explain", "comprehensive"}
+            and rerank.enabled(answer_settings) and not path_only
+            and len(candidates) > limit):
+        candidates, rerank_stats = rerank.rerank(
+            answer_settings, question, candidates)
 
     # 先按家族取样，凑够计划要求的最小覆盖面；再回头补同家族的第二条。
     min_families = plan.mode.min_families if plan else 1
@@ -290,12 +302,12 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
             evidence.append(build(hit))
             used_chunks.add(hit.chunk_id)
 
-    settings = embeddings.load_settings(conn)
-    if embeddings.enabled(settings) and len(evidence) < limit:
+    embed_settings = embeddings.load_settings(conn)
+    if embeddings.enabled(embed_settings) and len(evidence) < limit:
         try:
             semantic_hits = embeddings.semantic_chunks(
                 conn, analysis["core"] or question, source_id=source_id, ext=ext,
-                top_k=max(10, settings["top_k"] * 3))
+                top_k=max(10, embed_settings["top_k"] * 3))
         except embeddings.EmbeddingError:
             semantic_hits = []
         semantic_hits = families.dedupe_semantic_hits(conn, semantic_hits)
@@ -338,11 +350,15 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
             for facet in (plan.facets if plan else [])
         ]
         stats.update({
-            "candidates": len(candidates),
+            "candidates": candidate_total,
             "used": len(evidence),
             "families": len({item.family_id or item.asset_id for item in evidence}),
             "facets": facets,
             "missing": [item["name"] for item in facets if not item["covered"]],
+            "reranked": bool(rerank_stats.get("reranked")),
+            "rerank_kept": rerank_stats.get("kept", candidate_total),
+            "rerank_empty": bool(rerank_stats.get("empty")),
+            "rerank_error": rerank_stats.get("error"),
         })
     return evidence
 

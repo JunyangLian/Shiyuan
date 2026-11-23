@@ -54,6 +54,9 @@
 - 检索规划：按问题区分「精确查找 / 知识解释 / 综合探索 / 历史追溯」，决定证据预算（4 / 6 / 10 / 6 条）、
   同家族配额与最小覆盖面；回答下方会显示候选数、采用数、覆盖家族数与「证据缺口」
 - 动态证据选择：先跨家族取样保证覆盖面，再补同家族细节；与已选片段高度重合的内容直接跳过
+- 模型重排（可选）：配置生成模型后，「知识解释 / 综合探索」会先把前 50 条候选交给模型判断
+  「能否直接回答」，只保留相关候选；模型未配置、超时或筛不出结果时自动回退本地排序，
+  精确查找与历史追溯不重排
 - 回答默认本地摘录（不联网），可切换 OpenAI 兼容接口或 Ollama；每条结论带 `[n]` 引用，
   没有证据直接拒答并说明内容覆盖
 
@@ -108,15 +111,16 @@ npm run tauri dev
 | `SHIYUAN_DAILY_PARSE_BUDGET` | `500` | 每日正文解析文件数上限，`0` 为不限 |
 | `SHIYUAN_DAILY_OCR_BUDGET` | `200` | 每日 OCR 文件数上限，`0` 为不限 |
 | `SHIYUAN_MODEL_TIMEOUT` | `90` | 模型单次回答超时秒数（推理模型可调 120） |
+| `SHIYUAN_RERANK_TIMEOUT` | `40` | 候选重排单次超时秒数；超时自动回退本地排序 |
 
 ## 架构
 
 ```
 core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            scanner · watcher · ingest · extractors · ocr · indexer
-                      query · retrieval · families · answer · chat
+                      query · retrieval · families · rerank · answer · chat
                       external · mcp_server · inventory · maintenance · api
-  tests/              180 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 安全 / 基线）
+  tests/              184 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 安全 / 基线）
   benchmarks/         目录级扫描基准
 desktop/              Tauri v2 + React + TypeScript
   src/                数据 · 对话 · 外部调用 · 更新 四个模块
@@ -227,7 +231,7 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 180 passed（另需 pip install pytest httpx）
+cd core; python -m pytest -q          # 184 passed（另需 pip install pytest httpx）
 cd desktop; npm test                  # 14 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
@@ -239,7 +243,8 @@ cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
 ## 已知限制
 
 - **OCR 只保留行坐标**，不还原表格结构与版面，没有手写专项
-- **不内置本地大模型**：Ollama 需自行安装；语义检索依赖外部 Embedding 服务，未使用 ANN
+- **不内置本地大模型**：Ollama 需自行安装；语义检索依赖外部 Embedding 服务，未使用 ANN，
+  填了不支持 `/embeddings` 的模型时该通道会被静默跳过
 - **会话记忆只到上一轮**：不保留完整对话状态，跨会话无记忆
 - **跨盘移动**识别为「新增 + 失联」，不做自动合并
 - **网络盘 / SMB** 的监听可靠性未实测，主要依赖周期对账
@@ -247,8 +252,9 @@ cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
 - **短词检索**（<3 字符）走 LIKE 扫描，语料很大时比 FTS 慢
 - **引用只校验编号**：无法证明模型每句话都忠于证据，仍需点开来源核对
 - **不做表格汇总**：合计 / 平均 / 总额这类问题只定位表格并说明，不会真的计算
-- **没有重排序模型**：候选仍靠关键词与路径打分，语义相近但主题不同的文件可能混入；
-  问「实验室做过哪些鱼类研究」这类宽泛问题时，如果语料里没有对应主题，会如实拒答而不是归纳
+- **重排依赖外部模型**：只有配置生成模型并允许云端时，「知识解释 / 综合探索」才重排，
+  单次约 5–15 秒；精确查找、历史追溯与本地摘录模式仍靠关键词与路径打分。
+  推理模型会消耗较多思考 token，宽泛问题在语料缺少对应主题时仍会如实说明覆盖不足
 
 ## 文档
 

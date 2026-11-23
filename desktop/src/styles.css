@@ -1,39 +1,47 @@
-/* Perplexity-inspired system: parchment canvas, quiet ink text, one deep-teal accent. */
+/* Stripe-style system: cool-white canvas, midnight-ink type, one indigo accent. */
 :root {
-  --parchment: #faf8f5;
-  --soft-paper: #fdfbfa;
-  --warm-mist: #d1d1cd;
-  --ash: #92918b;
-  --graphite: #72706b;
-  --ink: #27251e;
-  --pure-black: #000000;
-  --teal: #016a71;
+  /* Stripe-style ledger: cool white canvas, navy ink, one indigo accent. */
+  --parchment: #ffffff;
+  --soft-paper: #ffffff;
+  --warm-mist: #e5edf5;
+  --ash: #64748d;
+  --graphite: #50617a;
+  --ink: #061b31;
+  --pure-black: #061b31;
+  --teal: #533afd;
+  --teal-hover: #7389ff;
+  --teal-wash: #e8e9ff;
+  --teal-line: #b9b9f9;
+  --teal-line-soft: #d6d9fc;
 
-  --sidebar-bg: #f5f2ed;
-  --hairline: #e7e3dd;
-  --red: #a8382f;
-  --red-soft: #f8ece9;
-  --warn-bg: #f3e7dc;
+  --sidebar-bg: #f8fafd;
+  --hairline: #e5edf5;
+  --red: #b42318;
+  --red-soft: #fef3f2;
+  --warn-bg: #fdf6ec;
   --warn-text: #7a4a24;
 
-  --radius-card: 16px;
-  --radius-input: 12px;
-  --radius-button: 6px;
+  --radius-card: 4px;
+  --radius-input: 4px;
+  --radius-button: 4px;
   --radius-pill: 9999px;
-  --shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --shadow-subtle: none;
+
+  --font-ui: "Inter Tight", "Inter", "Segoe UI", "Microsoft YaHei", system-ui,
+    -apple-system, sans-serif;
 
   /* Aliases kept so the view code can stay on a small set of names. */
   --bg: var(--parchment);
   --surface: var(--soft-paper);
-  --surface-alt: var(--parchment);
+  --surface-alt: var(--sidebar-bg);
   --line: var(--hairline);
   --line-strong: var(--warm-mist);
   --text: var(--ink);
   --text-soft: var(--graphite);
   --text-muted: var(--ash);
   --accent: var(--teal);
-  --accent-soft: rgba(1, 106, 113, 0.08);
-  --accent-line: var(--warm-mist);
+  --accent-soft: rgba(83, 58, 253, 0.06);
+  --accent-line: var(--teal-line-soft);
   --radius: var(--radius-card);
 
   color-scheme: light;
@@ -53,12 +61,12 @@ body,
 body {
   background: var(--parchment);
   color: var(--ink);
-  font-family: "Inter", "Segoe UI", "Microsoft YaHei", system-ui, -apple-system,
-    sans-serif;
+  font-family: var(--font-ui);
   font-size: 14px;
   line-height: 1.43;
   font-weight: 400;
-  letter-spacing: normal;
+  letter-spacing: -0.01em;
+  font-feature-settings: "ss01" on, "tnum" on;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -81,7 +89,7 @@ strong {
 }
 
 ::selection {
-  background: rgba(1, 106, 113, 0.16);
+  background: rgba(83, 58, 253, 0.16);
   color: var(--ink);
 }
 
@@ -143,7 +151,7 @@ a:focus-visible {
 }
 
 .sidebar-toggle:hover {
-  background: var(--soft-paper);
+  background: var(--warm-mist);
   color: var(--ink);
 }
 
@@ -186,14 +194,14 @@ a:focus-visible {
   gap: 10px;
   padding: 11px 12px;
   border: none;
-  border-radius: 12px;
+  border-radius: var(--radius-button);
   background: transparent;
   color: var(--graphite);
   text-align: left;
 }
 
 .nav-item:hover {
-  background: var(--soft-paper);
+  background: var(--warm-mist);
   color: var(--ink);
 }
 
@@ -234,7 +242,7 @@ a:focus-visible {
 }
 
 .nav-item.active .nav-label {
-  font-weight: 500;
+  font-weight: 400;
 }
 
 .nav-hint {
@@ -370,15 +378,17 @@ a:focus-visible {
 .view-head h1 {
   margin: 0 0 6px;
   font-size: 32px;
-  font-weight: 400;
-  line-height: 1.25;
+  font-weight: 300;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
 }
 
 .eyebrow {
   margin: 0 0 8px;
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 400;
   line-height: 1.3;
+  letter-spacing: 0.04em;
   color: var(--ash);
 }
 
@@ -413,7 +423,7 @@ a:focus-visible {
   height: 32px;
   padding: 0 14px;
   border: 1px solid var(--warm-mist);
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-button);
   background: transparent;
   color: var(--graphite);
   font-size: 13px;
@@ -421,7 +431,7 @@ a:focus-visible {
 }
 
 .segmented button:hover {
-  background: var(--soft-paper);
+  background: var(--warm-mist);
   color: var(--ink);
 }
 
@@ -429,7 +439,7 @@ a:focus-visible {
   background: var(--teal);
   border-color: var(--teal);
   color: #ffffff;
-  font-weight: 500;
+  font-weight: 400;
 }
 
 /* ---------- Controls ---------- */
@@ -446,30 +456,30 @@ a:focus-visible {
 }
 
 .primary {
-  background: var(--ink);
-  border-radius: var(--radius-input);
-  color: var(--parchment);
-  font-weight: 500;
+  background: var(--teal);
+  border-radius: var(--radius-button);
+  color: #ffffff;
+  font-weight: 400;
 }
 
 .primary:hover:not(:disabled) {
-  background: var(--pure-black);
+  background: var(--teal-hover);
 }
 
 .ghost {
   background: transparent;
-  border-color: var(--warm-mist);
-  color: var(--graphite);
+  border-color: var(--teal-line);
+  color: var(--teal);
 }
 
 .ghost:hover:not(:disabled) {
-  background: var(--soft-paper);
-  color: var(--ink);
+  background: var(--teal-wash);
+  color: var(--teal);
 }
 
 .ghost.strong {
-  color: var(--ink);
-  font-weight: 500;
+  color: var(--teal);
+  font-weight: 400;
 }
 
 .ghost.danger {
@@ -500,13 +510,13 @@ button:disabled {
 
 .alert.error {
   background: var(--red-soft);
-  border: 1px solid #efd3ce;
+  border: 1px solid #f5c6c2;
   color: var(--red);
 }
 
 .alert.warn {
   background: var(--warn-bg);
-  border: 1px solid #e7d3c2;
+  border: 1px solid #f0dcc4;
   color: var(--warn-text);
 }
 
@@ -542,8 +552,9 @@ button:disabled {
 .answer-text h4 {
   margin: 18px 0 8px;
   color: var(--ink);
-  font-weight: 500;
+  font-weight: 400;
   line-height: 1.35;
+  letter-spacing: -0.01em;
 }
 
 .answer-text h1 {
@@ -574,8 +585,9 @@ button:disabled {
 }
 
 .answer-text a {
-  color: var(--ink);
+  color: var(--teal);
   text-decoration: underline;
+  text-decoration-color: var(--teal);
   text-underline-offset: 2px;
 }
 
@@ -583,7 +595,7 @@ button:disabled {
   padding: 1px 4px;
   border: 1px solid var(--hairline);
   border-radius: 4px;
-  background: var(--parchment);
+  background: var(--sidebar-bg);
   font-family: "Cascadia Mono", Consolas, monospace;
   font-size: 12px;
 }
@@ -593,7 +605,7 @@ button:disabled {
   padding: 12px 14px;
   border: 1px solid var(--hairline);
   border-radius: var(--radius-input);
-  background: var(--parchment);
+  background: var(--sidebar-bg);
   overflow-x: auto;
 }
 
@@ -728,7 +740,7 @@ button:disabled {
 .settings-grid select:focus {
   outline: none;
   border-color: var(--teal);
-  box-shadow: 0 0 0 3px rgba(1, 106, 113, 0.12);
+  box-shadow: 0 0 0 3px rgba(83, 58, 253, 0.16);
 }
 
 .settings-divider {
@@ -754,7 +766,7 @@ button:disabled {
 
 .synonym-input:focus {
   border-color: var(--teal);
-  box-shadow: 0 0 0 3px rgba(1, 106, 113, 0.12);
+  box-shadow: 0 0 0 3px rgba(83, 58, 253, 0.16);
 }
 
 .checkbox-line {
@@ -828,7 +840,7 @@ button:disabled {
 
 .chip.ok {
   border-color: transparent;
-  background: rgba(1, 106, 113, 0.08);
+  background: rgba(83, 58, 253, 0.06);
   color: var(--ink);
 }
 
@@ -928,7 +940,7 @@ button:disabled {
   flex: none;
   padding: 0;
   border: 1px solid var(--warm-mist);
-  border-radius: 50%;
+  border-radius: var(--radius-button);
   background: transparent;
   color: var(--graphite);
   transition: border-color 0.12s ease, color 0.12s ease;
@@ -960,7 +972,7 @@ button:disabled {
 
 .deep-parse.running {
   border-color: var(--teal);
-  background: rgba(1, 106, 113, 0.08);
+  background: rgba(83, 58, 253, 0.06);
   color: var(--teal);
 }
 
@@ -1008,7 +1020,7 @@ button:disabled {
 
 .parse-filter.active {
   border-color: var(--teal);
-  background: rgba(1, 106, 113, 0.08);
+  background: rgba(83, 58, 253, 0.06);
   color: var(--teal);
 }
 
@@ -1102,7 +1114,8 @@ button:disabled {
   margin: 0 0 4px;
   color: var(--ink);
   font-size: 18px;
-  font-weight: 500;
+  font-weight: 400;
+  letter-spacing: -0.01em;
 }
 
 .update-control-main p {
@@ -1136,7 +1149,6 @@ button:disabled {
   height: 20px;
   border-radius: 50%;
   background: #ffffff;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
   transition: transform 0.15s ease;
 }
 
@@ -1257,8 +1269,9 @@ button:disabled {
   margin: 0;
   color: var(--ink);
   font-size: 18px;
-  font-weight: 500;
+  font-weight: 400;
   line-height: 1.3;
+  letter-spacing: -0.01em;
 }
 
 .chat-head-sub {
@@ -1333,7 +1346,7 @@ button:disabled {
 }
 
 .icon-btn:hover {
-  background: var(--soft-paper);
+  background: var(--warm-mist);
   color: var(--ink);
 }
 
@@ -1369,11 +1382,11 @@ button:disabled {
 .chat-session-list li {
   display: flex;
   align-items: flex-start;
-  border-radius: 12px;
+  border-radius: var(--radius-button);
 }
 
 .chat-session-list li:hover {
-  background: var(--soft-paper);
+  background: var(--warm-mist);
 }
 
 .chat-session-list li.active {
@@ -1450,6 +1463,10 @@ button:disabled {
   color: var(--ink);
 }
 
+.chat-session-list li.active .chat-session-actions button:hover {
+  color: #ffffff;
+}
+
 .chat-main {
   display: flex;
   flex-direction: column;
@@ -1475,8 +1492,8 @@ button:disabled {
   align-self: flex-end;
   max-width: 82%;
   padding: 10px 14px;
-  background: var(--soft-paper);
-  border: 1px solid var(--warm-mist);
+  background: var(--teal-wash);
+  border: 1px solid var(--teal-line-soft);
   border-radius: var(--radius-card);
 }
 
@@ -1590,7 +1607,7 @@ button:disabled {
 
 .composer-box:focus-within {
   border-color: var(--teal);
-  box-shadow: 0 0 0 4px rgba(1, 106, 113, 0.1);
+  box-shadow: 0 0 0 4px rgba(83, 58, 253, 0.14);
 }
 
 .composer-box textarea {
@@ -1636,7 +1653,7 @@ button:disabled {
 }
 
 .composer-action:hover {
-  background: var(--parchment);
+  background: var(--warm-mist);
   color: var(--ink);
 }
 
@@ -1677,8 +1694,9 @@ button:disabled {
   margin: 0 0 4px;
   color: var(--ink);
   font-size: 24px;
-  font-weight: 500;
-  line-height: 1.3;
+  font-weight: 300;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
 }
 
 .inventory-summary {
@@ -1705,8 +1723,9 @@ button:disabled {
 .inventory-summary strong {
   color: var(--ink);
   font-size: 22px;
-  font-weight: 500;
+  font-weight: 300;
   line-height: 1.2;
+  letter-spacing: -0.01em;
 }
 
 .inventory-panel {
@@ -1725,7 +1744,7 @@ button:disabled {
   margin: 0;
   color: var(--ink);
   font-size: 16px;
-  font-weight: 500;
+  font-weight: 400;
 }
 
 .ext-grid {
@@ -1756,7 +1775,7 @@ button:disabled {
 
 .ext-chip.selected {
   border-color: var(--teal);
-  background: rgba(1, 106, 113, 0.08);
+  background: rgba(83, 58, 253, 0.06);
   color: var(--ink);
 }
 
@@ -2046,8 +2065,9 @@ button:disabled {
 .stat-value {
   color: var(--ink);
   font-size: 24px;
-  font-weight: 400;
-  line-height: 1.25;
+  font-weight: 300;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
 }
 
 .stat-foot {
@@ -2075,7 +2095,7 @@ button:disabled {
   margin: 0;
   color: var(--ink);
   font-size: 16px;
-  font-weight: 500;
+  font-weight: 400;
 }
 
 .panel-actions {
@@ -2135,7 +2155,7 @@ button:disabled {
 .bar-track {
   height: 6px;
   border-radius: var(--radius-pill);
-  background: #ece8e2;
+  background: var(--warm-mist);
   overflow: hidden;
 }
 
@@ -2143,7 +2163,7 @@ button:disabled {
   display: block;
   height: 100%;
   border-radius: var(--radius-pill);
-  background: var(--graphite);
+  background: var(--teal);
 }
 
 .bar-count {
@@ -2624,7 +2644,7 @@ button:disabled {
   margin-bottom: 10px;
   padding: 10px;
   border: 1px dashed var(--warm-mist);
-  border-radius: 10px;
+  border-radius: var(--radius-card);
 }
 
 .family-modified-head {
@@ -2649,7 +2669,7 @@ button:disabled {
 .family-group {
   padding: 10px 12px;
   border: 1px solid var(--hairline);
-  border-radius: 10px;
+  border-radius: var(--radius-card);
 }
 
 .family-group-text {
@@ -2684,7 +2704,7 @@ button:disabled {
 .citation-family-title {
   color: var(--ink);
   font-size: 13px;
-  font-weight: 600;
+  font-weight: 500;
 }
 
 .citation-family-list {
@@ -2722,7 +2742,7 @@ button:disabled {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: rgba(20, 20, 19, 0.42);
+  background: rgba(6, 27, 49, 0.32);
 }
 
 .family-modal {
@@ -2734,7 +2754,6 @@ button:disabled {
   border: 1px solid var(--warm-mist);
   border-radius: var(--radius-card);
   background: var(--parchment);
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.18);
 }
 
 .family-modal-head {
@@ -2750,7 +2769,8 @@ button:disabled {
   margin: 0 0 2px;
   color: var(--ink);
   font-size: 18px;
-  font-weight: 500;
+  font-weight: 400;
+  letter-spacing: -0.01em;
 }
 
 .family-modal-head p {

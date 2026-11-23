@@ -5,7 +5,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from shiyuan import answer, db, indexer, planner, query, scanner, store
+from shiyuan import answer, db, indexer, planner, query, rerank, scanner, store
 
 
 @pytest.fixture()
@@ -165,6 +165,95 @@ def test_plan_reports_missing_coverage(conn, tmp_path):
     plan = result["plan"]
     assert plan["facets"]
     assert "毒素基因" in plan["missing"]
+
+
+def test_rerank_orders_candidates_by_model(monkeypatch):
+    from types import SimpleNamespace
+
+    hits = [SimpleNamespace(path=f"D:\\候选{index}.md", text=f"内容{index}")
+            for index in range(3)]
+    settings = {"provider": "openai", "model": "gpt-test", "api_key": "sk-test",
+                "allow_cloud": True}
+    monkeypatch.setattr(rerank, "_post_json", lambda *args, **kwargs: {
+        "choices": [{"message": {"content": '{"relevant": [3, 1]}'}}]})
+
+    ranked, stats = rerank.rerank(settings, "问题", hits)
+
+    assert [hit.text for hit in ranked] == ["内容2", "内容0"]
+    assert stats["reranked"] is True
+    assert stats["kept"] == 2
+    assert stats["error"] is None
+
+
+def test_rerank_falls_back_to_local_order(monkeypatch):
+    from types import SimpleNamespace
+
+    hits = [SimpleNamespace(path=f"D:\\候选{index}.md", text=f"内容{index}")
+            for index in range(3)]
+    settings = {"provider": "openai", "model": "gpt-test", "api_key": "sk-test",
+                "allow_cloud": True}
+
+    def boom(*args, **kwargs):
+        raise rerank.RerankError("上游超时")
+
+    monkeypatch.setattr(rerank, "_post_json", boom)
+
+    ranked, stats = rerank.rerank(settings, "问题", hits)
+
+    assert ranked == hits
+    assert stats["reranked"] is False
+    assert "上游超时" in stats["error"]
+
+
+def test_rerank_empty_keeps_local_order(monkeypatch):
+    from types import SimpleNamespace
+
+    hits = [SimpleNamespace(path=f"D:\\候选{index}.md", text=f"内容{index}")
+            for index in range(3)]
+    settings = {"provider": "openai", "model": "gpt-test", "api_key": "sk-test",
+                "allow_cloud": True}
+    monkeypatch.setattr(rerank, "_post_json", lambda *args, **kwargs: {
+        "choices": [{"message": {"content": '{"relevant": []}'}}]})
+
+    ranked, stats = rerank.rerank(settings, "问题", hits)
+
+    assert ranked == hits
+    assert stats["reranked"] is False
+    assert stats["empty"] is True
+    assert stats["error"] is None
+
+
+def test_retrieve_reranks_before_selecting_evidence(conn, tmp_path, monkeypatch):
+    root = tmp_path / "重排"
+    root.mkdir()
+    topics = ["斑马鱼", "蓝子鱼", "草鱼", "鲫鱼", "鲤鱼"]
+    for index, topic in enumerate(topics):
+        (root / f"记录{index}.md").write_text(
+            f"{topic}的样本量是 {index + 1} 尾，采样地点编号 {index * 7}，"
+            f"测序批次 {topic} 批次，分析流程与其它批次不同。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    answer.update_settings(conn, {"provider": "openai", "model": "gpt-test",
+                                  "api_key": "sk-test", "allow_cloud": True})
+
+    def fake_rerank(settings, question, hits, **kwargs):
+        kept = list(reversed(hits))[:2]
+        return kept, {"reranked": True, "model": settings["model"],
+                      "considered": len(hits), "kept": len(kept), "error": None}
+
+    monkeypatch.setattr(answer.rerank, "rerank", fake_rerank)
+    stats: dict = {}
+    plan = planner.make("介绍一下样本量")
+    evidence = answer.retrieve(conn, "样本量是多少", limit=2, plan=plan, stats=stats)
+
+    assert stats["candidates"] > 2
+    assert stats["reranked"] is True
+    assert stats["rerank_kept"] == 2
+    assert stats["rerank_error"] is None
+    assert 0 < stats["used"] <= 2
+    assert evidence
+    assert evidence[0].name == "记录4.md"
 
 
 def test_duplicate_check_report_is_demoted(conn, tmp_path):

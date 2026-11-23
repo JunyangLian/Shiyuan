@@ -591,6 +591,9 @@ describe("固定对话输入框", () => {
           { name: "毒素基因", covered: false },
         ],
         missing: ["毒素基因"],
+        reranked: true,
+        rerank_kept: 5,
+        rerank_error: null,
       },
       coverage: {
         content_indexed: 3,
@@ -613,7 +616,8 @@ describe("固定对话输入框", () => {
     expect(await screen.findByText(/归并为 1 个文档家族/)).toBeTruthy();
     expect(screen.getByText("写作规范.doc")).toBeTruthy();
     expect(screen.getByText("综合探索")).toBeTruthy();
-    expect(screen.getByText(/候选 18 · 采用 3 · 覆盖 2 个家族/)).toBeTruthy();
+    expect(screen.getByText(/候选 18 · 相关 5 · 采用 3 · 覆盖 2 个家族/)).toBeTruthy();
+    expect(screen.getByText("模型重排")).toBeTruthy();
     expect(screen.getByText(/证据缺口：毒素基因/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /30 个关联版本/ }));

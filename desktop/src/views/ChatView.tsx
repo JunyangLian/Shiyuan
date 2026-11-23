@@ -197,9 +197,22 @@ function AnswerCard({ result }: { result: AnswerResult }) {
         <div className="answer-plan">
           <span className="chip subtle">{result.plan.label}</span>
           <span className="muted small-text">
-            候选 {result.plan.candidates ?? 0} · 采用 {result.plan.used ?? result.citations.length}
+            候选 {result.plan.candidates ?? 0}
+            {result.plan.reranked && ` · 相关 ${result.plan.rerank_kept ?? 0}`}
+            {" "}· 采用 {result.plan.used ?? result.citations.length}
             {" "}· 覆盖 {result.plan.families ?? 0} 个家族
           </span>
+          {result.plan.reranked && <span className="chip subtle">模型重排</span>}
+          {result.plan.rerank_empty && (
+            <span className="chip subtle" title="模型没有从候选里筛出明确相关项">
+              模型未筛出，按本地排序
+            </span>
+          )}
+          {result.plan.rerank_error && (
+            <span className="chip warn" title={result.plan.rerank_error}>
+              重排不可用，已按本地排序
+            </span>
+          )}
           {(result.plan.missing?.length ?? 0) > 0 && (
             <span className="chip warn" title="这些关键词没有在证据中出现">
               证据缺口：{result.plan.missing!.join("、")}

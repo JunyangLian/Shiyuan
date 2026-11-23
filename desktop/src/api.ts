@@ -434,6 +434,10 @@ export interface RetrievalPlan {
   families?: number;
   facets?: { name: string; covered: boolean }[];
   missing?: string[];
+  reranked?: boolean;
+  rerank_kept?: number;
+  rerank_empty?: boolean;
+  rerank_error?: string | null;
 }
 
 export interface AnswerResult {
