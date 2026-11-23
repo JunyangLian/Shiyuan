@@ -13,6 +13,7 @@ import type {
   QuerySettings,
 } from "../api";
 import { openFile } from "../tauri";
+import Icon from "../Icon";
 
 const PROVIDER_LABEL: Record<string, string> = {
   extractive: "本地摘录",
@@ -88,7 +89,8 @@ function CitationRow({
           </div>
         )}
       </div>
-      <button className="ghost small" onClick={() => void openFile(citation.path)}>
+      <button className="ghost small icon-label" onClick={() => void openFile(citation.path)}>
+        <Icon name="arrow-up-right" size={14} />
         打开
       </button>
     </li>
@@ -662,7 +664,8 @@ export default function ChatView({ active = true }: { active?: boolean }) {
           <div className="chat-sessions-head">
             {!sessionsCollapsed && <strong>对话</strong>}
             {!sessionsCollapsed && (
-              <button className="ghost small" onClick={() => void newSession()}>
+              <button className="ghost small icon-label" onClick={() => void newSession()}>
+                <Icon name="plus" size={14} />
                 新建
               </button>
             )}
@@ -672,7 +675,7 @@ export default function ChatView({ active = true }: { active?: boolean }) {
               aria-label={sessionsCollapsed ? "展开对话列表" : "收起对话列表"}
               title={sessionsCollapsed ? "展开对话列表" : "收起对话列表"}
             >
-              {sessionsCollapsed ? "›" : "‹"}
+              <Icon name={sessionsCollapsed ? "chevron-right" : "chevron-left"} size={16} />
             </button>
           </div>
           {sessionsCollapsed ? (
@@ -946,16 +949,18 @@ export default function ChatView({ active = true }: { active?: boolean }) {
                 <span className="composer-hint">Ctrl + Enter 发送 · 对话自动保存在本机</span>
                 <div className="composer-actions">
                   <button
-                    className="composer-action"
+                    className="composer-action icon-label"
                     onClick={() => setShowSettings((value) => !value)}
                   >
+                    <Icon name="settings" size={14} />
                     {showSettings ? "收起设置" : "回答设置"}
                   </button>
                   <button
-                    className="primary small"
+                    className="primary small icon-label"
                     disabled={loading || !question.trim()}
                     onClick={() => void ask()}
                   >
+                    <Icon name="send" size={14} />
                     {loading ? "检索中…" : "提问"}
                   </button>
                 </div>

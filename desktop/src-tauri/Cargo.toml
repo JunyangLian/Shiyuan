@@ -1,6 +1,6 @@
 [package]
 name = "shiyuan"
-version = "0.1.4"
+version = "0.1.5"
 description = "拾源：原位知识工作台"
 edition = "2021"
 

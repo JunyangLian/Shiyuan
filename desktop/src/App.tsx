@@ -4,16 +4,17 @@ import ChatView from "./views/ChatView";
 import LibraryView from "./views/LibraryView";
 import ExternalView from "./views/ExternalView";
 import HealthView from "./views/HealthView";
+import Icon, { type IconName } from "./Icon";
 
 type View = "chat" | "library" | "external" | "health";
 
 const SIDEBAR_COLLAPSED_KEY = "shiyuan.sidebar.collapsed";
 
-const NAV: { key: View; label: string; hint: string; icon: string }[] = [
-  { key: "library", label: "数据", hint: "授权 · 同步", icon: "数" },
-  { key: "chat", label: "对话", hint: "知识库问答", icon: "话" },
-  { key: "external", label: "外部调用", hint: "Agent · 只读", icon: "外" },
-  { key: "health", label: "更新", hint: "索引 · 覆盖", icon: "更" },
+const NAV: { key: View; label: string; hint: string; icon: IconName }[] = [
+  { key: "library", label: "数据", hint: "授权 · 同步", icon: "library" },
+  { key: "chat", label: "对话", hint: "知识库问答", icon: "chat" },
+  { key: "external", label: "外部调用", hint: "Agent · 只读", icon: "external" },
+  { key: "health", label: "更新", hint: "索引 · 覆盖", icon: "updates" },
 ];
 
 export default function App() {
@@ -69,7 +70,7 @@ export default function App() {
             aria-label={sidebarCollapsed ? "展开导航" : "收起导航"}
             title={sidebarCollapsed ? "展开导航" : "收起导航"}
           >
-            {sidebarCollapsed ? "›" : "‹"}
+            <Icon name={sidebarCollapsed ? "chevron-right" : "chevron-left"} size={16} />
           </button>
         </div>
 
@@ -81,7 +82,7 @@ export default function App() {
               onClick={() => changeView(item.key)}
               title={item.label}
             >
-              <span className="nav-icon" aria-hidden="true">{item.icon}</span>
+              <span className="nav-icon" aria-hidden="true"><Icon name={item.icon} size={18} /></span>
               <span className="nav-text">
                 <span className="nav-label">{item.label}</span>
                 <span className="nav-hint">{item.hint}</span>

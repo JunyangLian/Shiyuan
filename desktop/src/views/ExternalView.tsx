@@ -6,6 +6,7 @@ import type {
   ExternalPreset,
   ExternalTransport,
 } from "../api";
+import Icon from "../Icon";
 
 const PRESETS: {
   key: ExternalPreset;
@@ -288,9 +289,10 @@ export default function ExternalView() {
                                 : "HTTP 接口信息"}
                             </span>
                             <button
-                              className="ghost small"
+                              className="ghost small icon-label"
                               onClick={() => void copy(client.client_id)}
                             >
+                              <Icon name={copiedId === client.client_id ? "check" : "copy"} size={14} />
                               {copiedId === client.client_id ? "已复制" : "复制配置"}
                             </button>
                           </div>

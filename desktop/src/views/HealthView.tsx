@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, formatTime } from "../api";
 import type { OcrSettings, UpdateOverview } from "../api";
+import Icon from "../Icon";
 
 const PROFILES: { key: "quiet" | "balanced" | "fast"; label: string }[] = [
   { key: "quiet", label: "安静" },
@@ -209,7 +210,8 @@ export default function HealthView() {
           >
             {rebuilding ? "提交中…" : "重建文档家族"}
           </button>
-          <button className="ghost small" disabled={checking} onClick={() => void checkNow()}>
+          <button className="ghost small icon-label" disabled={checking} onClick={() => void checkNow()}>
+            <Icon name="refresh" size={14} />
             {checking ? "检查中…" : "立即检查"}
           </button>
         </div>

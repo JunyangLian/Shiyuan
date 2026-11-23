@@ -3,6 +3,7 @@ import { api, formatTime } from "../api";
 import type { Source } from "../api";
 import { pickDirectory } from "../tauri";
 import type { InventorySource } from "./InventoryView";
+import Icon from "../Icon";
 
 export default function SourcesView({
   embedded = false,
@@ -99,7 +100,8 @@ export default function SourcesView({
           <span className="muted small-text">
             只授权目录，不搬迁文件；任何时候都可以暂停或撤销。
           </span>
-          <button className="primary" disabled={busy === "add"} onClick={() => void addFolder()}>
+          <button className="primary icon-label" disabled={busy === "add"} onClick={() => void addFolder()}>
+            <Icon name="folder-plus" size={16} />
             {busy === "add" ? "正在添加…" : "添加文件夹"}
           </button>
         </div>
@@ -109,7 +111,8 @@ export default function SourcesView({
             <h1>数据源</h1>
             <p className="sub">只授权目录，不搬迁文件；任何时候都可以暂停或撤销。</p>
           </div>
-          <button className="primary" disabled={busy === "add"} onClick={() => void addFolder()}>
+          <button className="primary icon-label" disabled={busy === "add"} onClick={() => void addFolder()}>
+            <Icon name="folder-plus" size={16} />
             {busy === "add" ? "正在添加…" : "添加文件夹"}
           </button>
         </header>
@@ -184,18 +187,7 @@ export default function SourcesView({
                   aria-label={source.scanning ? "扫描中" : "扫描"}
                   onClick={() => void runAction(source.source_id, () => api.scan(source.source_id))}
                 >
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M21 12a9 9 0 1 1-2.64-6.36" />
-                    <path d="M21 3v6h-6" />
-                  </svg>
+                  <Icon name="refresh" size={20} strokeWidth={1.8} />
                 </button>
                 <button
                   className={

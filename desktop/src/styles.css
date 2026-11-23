@@ -444,6 +444,17 @@ a:focus-visible {
 
 /* ---------- Controls ---------- */
 
+.icon-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.icon-label svg {
+  flex: none;
+}
+
 .primary,
 .ghost {
   height: 36px;

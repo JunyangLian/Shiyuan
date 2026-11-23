@@ -3,6 +3,7 @@ import { api, formatTime } from "../api";
 import type { ParseResultStatus, ParseResults } from "../api";
 import { openFile } from "../tauri";
 import type { InventorySource } from "./InventoryView";
+import Icon from "../Icon";
 
 type Filter = "all" | ParseResultStatus;
 
@@ -117,8 +118,9 @@ export default function ParseResultsView({
     <div className="view-section parse-results-view">
       <div className="inventory-head">
         <div>
-          <button className="ghost small inventory-back" onClick={onBack}>
-            ← 返回数据源
+          <button className="ghost small icon-label inventory-back" onClick={onBack}>
+            <Icon name="arrow-left" size={15} />
+            返回数据源
           </button>
           <div className="inventory-kicker">解析结果</div>
           <h2>{source.label}</h2>

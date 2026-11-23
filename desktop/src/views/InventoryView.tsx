@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, formatSize } from "../api";
 import type { ContentPolicy, InventoryFileTypes } from "../api";
+import Icon from "../Icon";
 
 const POLICY_LABEL: Record<ContentPolicy, string> = {
   deep_parse: "深度解析",
@@ -153,8 +154,9 @@ export default function InventoryView({
     <div className="view-section inventory-view">
       <div className="inventory-head">
         <div>
-          <button className="ghost small inventory-back" onClick={onBack}>
-            ← 返回数据源
+          <button className="ghost small icon-label inventory-back" onClick={onBack}>
+            <Icon name="arrow-left" size={15} />
+            返回数据源
           </button>
           <div className="inventory-kicker">盘点与策略</div>
           <h2>{source.label}</h2>

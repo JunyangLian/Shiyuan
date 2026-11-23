@@ -7,6 +7,7 @@ import type {
   FamilyDiffItem,
 } from "../api";
 import { openFile } from "../tauri";
+import Icon from "../Icon";
 
 const PAGE = 8;
 
@@ -106,8 +107,9 @@ export default function FamilyDetailView({
     <div className="view-section family-view">
       <div className="inventory-head">
         <div>
-          <button className="ghost small inventory-back" onClick={onBack}>
-            ← 返回数据
+          <button className="ghost small icon-label inventory-back" onClick={onBack}>
+            <Icon name="arrow-left" size={15} />
+            返回数据
           </button>
           <div className="inventory-kicker">文档家族</div>
           <h2>{family.title}</h2>
@@ -115,7 +117,8 @@ export default function FamilyDetailView({
             {family.size} 个关联版本。原文件保持不变，拾源只整理关系，不判断哪个版本更好。
           </p>
         </div>
-        <button className="ghost small" disabled={loading} onClick={() => void load()}>
+        <button className="ghost small icon-label" disabled={loading} onClick={() => void load()}>
+          <Icon name="refresh" size={14} />
           {loading ? "刷新中…" : "刷新"}
         </button>
       </div>
@@ -147,9 +150,10 @@ export default function FamilyDetailView({
                   </div>
                   {member.path && (
                     <button
-                      className="ghost small"
+                      className="ghost small icon-label"
                       onClick={() => void openFile(member.path as string)}
                     >
+                      <Icon name="arrow-up-right" size={14} />
                       打开
                     </button>
                   )}
