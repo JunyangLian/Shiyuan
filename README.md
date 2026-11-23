@@ -43,8 +43,12 @@
 
 - 三路召回：**文件夹路径 + 文件名 + 正文**，目录层级越深权重越高；通用目录词（实验/数据/报告）不单独构成证据
 - 查询理解：剥离疑问词与口水词，中文 2/3-gram 展开，内置科研同义词（样本数 ↔ 样本量）
-- 目录概览：问「大三下有哪些课」「pilot_batches 里有什么」直接列出子目录与文件数
+- 目录概览：问「大三下有哪些课」「pilot_batches 里有什么」直接列出子目录与文件数；
+  子目录不多时额外展开一层文件名，省掉一次追问
 - 位置问句：「放在哪个文件夹」「课程表在哪」只认具体路径命中，找不到就明确拒答
+- 统计问句：「单据金额合计多少」这类需要跨行汇总的问题，明确说明不做求和，并列出命中的表格与工作表，
+  不编造数字
+- 查重 / 比对报告在普通问题里自动后置，问「重复率多少」时再正常召回
 - 多轮追问：同一会话里「那第三章呢」「它的环境变量怎么配」会带上上一轮问题检索，
   上一轮只涉及一个数据源时自动收窄
 - 回答默认本地摘录（不联网），可切换 OpenAI 兼容接口或 Ollama；每条结论带 `[n]` 引用，
@@ -109,7 +113,7 @@ core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            scanner · watcher · ingest · extractors · ocr · indexer
                       query · retrieval · families · answer · chat
                       external · mcp_server · inventory · maintenance · api
-  tests/              172 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 安全 / 基线）
+  tests/              175 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 安全 / 基线）
   benchmarks/         目录级扫描基准
 desktop/              Tauri v2 + React + TypeScript
   src/                数据 · 对话 · 外部调用 · 更新 四个模块
@@ -218,7 +222,7 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 172 passed（另需 pip install pytest httpx）
+cd core; python -m pytest -q          # 175 passed（另需 pip install pytest httpx）
 cd desktop; npm test                  # 14 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
@@ -237,6 +241,7 @@ cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
 - **新建 / 删除 / 改名文件夹**会触发整源重扫，大目录会明显变慢
 - **短词检索**（<3 字符）走 LIKE 扫描，语料很大时比 FTS 慢
 - **引用只校验编号**：无法证明模型每句话都忠于证据，仍需点开来源核对
+- **不做表格汇总**：合计 / 平均 / 总额这类问题只定位表格并说明，不会真的计算
 
 ## 文档
 

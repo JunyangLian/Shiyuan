@@ -41,6 +41,11 @@ _DOC_HINT = re.compile(
     r"(使用说明|操作说明|快速开始|快速上手|使用手册|操作手册|使用指南|上手教程|入门教程)")
 _TEMPLATE_NAME = re.compile(r"(模板|规范|封面|样表|格式要求|撰写)")
 _FORMAT_QUERY = re.compile(r"(模板|规范|格式|封面|排版|撰写)")
+# 查重/比对报告与正文主题高度重合，但通常不是用户要找的内容。
+_DUP_NAME = re.compile(
+    r"(查重|重复率|相似度检测|比对报告|对照报告|片段对照|原文对照|全文对照|简洁报告"
+    r"|去除引用|报告单|检测结果|格式分析|AIGC|检测报告|降重)")
+_DUP_QUERY = re.compile(r"(查重|重复率|相似度|降重|比对|对照|检测报告|格式分析)")
 
 
 def name_prior(path: str, analysis: dict) -> int:
@@ -52,6 +57,9 @@ def name_prior(path: str, analysis: dict) -> int:
     if (not _FORMAT_QUERY.search(analysis.get("normalized") or "")
             and _TEMPLATE_NAME.search(name)):
         score -= 200
+    if (not _DUP_QUERY.search(analysis.get("normalized") or "")
+            and _DUP_NAME.search(name)):
+        score -= 260
     return score
 
 _SELECT = (

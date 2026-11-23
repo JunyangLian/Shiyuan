@@ -306,6 +306,8 @@ def _messages(question: str, evidence: list[Evidence],
         "若证据之间数值或结论不一致，请并列呈现，并说明各自来自哪个文件/时间条件。"
         "证据只是本次检索命中的少量片段，不代表知识库的全部文件或全部内容；"
         "不要根据证据条数推断文件总数、知识库规模或用户拥有的资料范围。"
+        "不要自行做跨行汇总或算术计算（求和、平均、总计），也不要根据片段推算数字；"
+        "若问题需要这类统计，说明拾源当前不做表格汇总，并指出相关文件。"
         "若证据不足，直接回答：根据现有资料无法确定。"
     )
     user = f"<问题>\n{question}"
@@ -557,27 +559,140 @@ def _folder_overview(conn: sqlite3.Connection, match: retrieval.PathMatch) -> st
     if total == 0:
         return None
     children: dict[str, int] = {}
-    direct = 0
+    child_dirs: dict[str, set[str]] = {}
+    child_files: dict[str, list[str]] = {}
+    direct_names: list[str] = []
     for row in rows:
         relative = row["path"][len(prefix):]
-        head, separator, _rest = relative.partition("\\")
-        if separator:
-            children[head] = children.get(head, 0) + 1
+        head, separator, rest = relative.partition("\\")
+        if not separator:
+            direct_names.append(head)
+            continue
+        children[head] = children.get(head, 0) + 1
+        sub, sub_separator, _tail = rest.partition("\\")
+        if sub_separator:
+            child_dirs.setdefault(head, set()).add(sub)
         else:
-            direct += 1
+            child_files.setdefault(head, []).append(sub)
     label = Path(folder).name or folder
     lines = [f"「{label}」位于 `{folder}`，共有 {total} 个可检索文件。"]
     if children:
         ordered = sorted(children.items(), key=lambda item: (-item[1], item[0]))
         lines.append(f"包含 {len(children)} 个子目录：")
+        # 子目录很少时补一层内容，避免用户再追问一次「里面有什么」。
+        expand = len(ordered) <= 8
         for name, count in ordered[:15]:
             lines.append(f"- {name}（{count} 个文件）")
+            if not expand:
+                continue
+            dirs = sorted(child_dirs.get(name, ()))
+            if dirs:
+                shown = "、".join(dirs[:6])
+                more = " 等" if len(dirs) > 6 else ""
+                lines.append(f"  - 目录：{shown}{more}")
+            files = sorted(child_files.get(name, ()))
+            if files:
+                shown = "、".join(files[:5])
+                more = " 等" if len(files) > 5 else ""
+                lines.append(f"  - 文件：{shown}{more}")
         if len(ordered) > 15:
             lines.append(f"- 另有 {len(ordered) - 15} 个子目录未列出")
-    if direct:
-        lines.append(f"该目录下还有 {direct} 个直属文件。")
+    if direct_names:
+        ordered_names = sorted(direct_names)
+        shown = "、".join(ordered_names[:8])
+        more = "…" if len(ordered_names) > 8 else ""
+        lines.append(f"该目录下还有 {len(ordered_names)} 个直属文件：{shown}{more}")
     lines.append("以上为本地索引统计，可在检索页点开具体文件查看内容。")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 表格统计
+
+_AGG_INTENT = re.compile(
+    r"(合计|总计|总额|总和|加总|求和|汇总|一共|总共|平均|均值|最大值|最小值"
+    r"|花了|花销|花费|多少钱)")
+_TABLE_ENTITY = re.compile(
+    r"(单据|收据|发票|账单|明细|台账|流水|报表|报销|金额|支出|收入|成本|工资|费用|成绩|分数)")
+_TABLE_EXTS = {".csv", ".tsv", ".xlsx", ".xlsm", ".xls"}
+
+
+def _is_stat_question(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact or len(compact) > 30:
+        return False
+    return bool(_AGG_INTENT.search(compact)) and bool(_TABLE_ENTITY.search(compact))
+
+
+def _sheet_names(conn: sqlite3.Connection, asset_id: str) -> list[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT sheet FROM chunks"
+        " WHERE asset_id = ? AND sheet IS NOT NULL ORDER BY sheet",
+        (asset_id,),
+    ).fetchall()
+    return [row["sheet"] for row in rows if row["sheet"]]
+
+
+def _stats_answer(conn: sqlite3.Connection, question: str, *,
+                  source_id: str | None, ext: str | None) -> dict | None:
+    """表格统计问句：给出命中的表格与工作表，明确说明不做汇总。"""
+    analysis = query.analyze(question, synonyms=query.synonym_map(conn))
+    matches = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    tables: list[retrieval.PathMatch] = []
+    seen: set[str] = set()
+    for match in sorted(matches.values(), key=lambda item: -item.score):
+        if Path(match.path).suffix.lower() not in _TABLE_EXTS:
+            continue
+        key = Path(match.path).name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tables.append(match)
+        if len(tables) >= 5:
+            break
+    if not tables:
+        return None
+
+    evidence: list[Evidence] = []
+    lines = [
+        "这是需要跨行汇总的统计问题（合计 / 平均 / 总额）。",
+        "拾源目前只做检索与摘录，不会替你求和或求平均，以免给出错误数字。",
+        "",
+        "命中的表格：",
+    ]
+    for match in tables:
+        name = Path(match.path).name
+        sheets = _sheet_names(conn, match.asset_id)
+        detail = f"（工作表 {'、'.join(sheets[:3])}）" if sheets else ""
+        lines.append(f"- {name}{detail}")
+        row = conn.execute(
+            "SELECT c.chunk_id, c.text, c.page, c.sheet, c.version_id, l.mtime_ns"
+            " FROM chunks c JOIN asset_locations l ON l.asset_id = c.asset_id"
+            " WHERE c.asset_id = ? LIMIT 1",
+            (match.asset_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        evidence.append(Evidence(
+            chunk_id=row["chunk_id"],
+            asset_id=match.asset_id,
+            location_id=match.location_id,
+            path=match.path,
+            name=name,
+            text=(row["text"] or "")[:200],
+            page=row["page"],
+            sheet=row["sheet"],
+            matches=0,
+            version_id=row["version_id"] or "",
+            mtime=_iso_mtime(row["mtime_ns"]),
+        ))
+    lines += [
+        "",
+        "建议：打开表格核对，或换个问法，例如「…里有哪些字段」「哪些…需要人工复核」。",
+    ]
+    return {
+        "answer": "\n".join(lines),
+        "citations": [item.citation(index) for index, item in enumerate(evidence, 1)],
+    }
 
 
 # ---------------------------------------------------------------- 多轮追问
@@ -734,6 +849,23 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
                     "coverage": coverage,
                     "context_used": previous,
                 }
+
+    if _is_stat_question(text):
+        stats = _stats_answer(conn, context_text, source_id=effective_source, ext=ext)
+        if stats is not None:
+            return {
+                "question": text,
+                "answer": stats["answer"],
+                "refused": False,
+                "reason": "table_stats_hint",
+                "provider": "library",
+                "model": None,
+                "citations": stats["citations"],
+                "evidence_count": len(stats["citations"]),
+                "warning": None,
+                "coverage": coverage,
+                "context_used": previous,
+            }
 
     evidence = retrieve(conn, context_text, source_id=effective_source, ext=ext, limit=limit,
                         focus=_focus_terms(text) if previous else None,

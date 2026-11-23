@@ -15,14 +15,14 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 124 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 175 passed | `cd core && python -m pytest -q` |
 | 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
 | 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
-| 前端单元测试 | 6 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
+| 前端单元测试 | 14 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `Shiyuan_0.1.2_x64-setup.exe`（约 180MiB，含多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），静默安装后 `/api/health` 无令牌 401、带令牌 200 |
+| 桌面端安装包 | 完成 | `Shiyuan_0.1.3_x64-setup.exe`（约 180MiB，含多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），静默安装后 `/api/health` 无令牌 401、带令牌 200 |
 
 ## 二、已实现范围（M1）
 
@@ -360,6 +360,18 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
   直接列出课程子目录（优先问题里点名的目录）；「专利的创新点」回到两份专利文件，不再被查重
   报告挤占；「怎么运行测试」优先 README；「我的课程表在哪」按路径找，找不到就拒答。
 - 测试：后端 172 项通过。
+
+## 三点六、本轮（v0.1.3）继续收敛检索噪声
+
+- `retrieval.name_prior`：新增查重 / 比对报告降权（查重、重复率、简洁报告、全文对照、片段对照、
+  AIGC 检测等）。普通问题里这些文件自动后置，只有问题本身在问查重时才正常召回。
+- `answer._is_stat_question` / `_stats_answer`：合计 / 平均 / 总额 / 花了多少这类跨行汇总问题，
+  不再交给模型从片段里推算，而是直接给出命中的表格与工作表，并明确说明"不做汇总"，避免编数字。
+- `answer._folder_overview`：子目录 ≤ 8 时额外展开一层「目录 / 文件」名单，并列出目录直属文件名。
+- `answer._messages`：提示词增加"不要跨行汇总或算术推算"约束。
+- 实测：「专利的创新点」引用里不再出现查重报告；「上个月单据金额合计多少」「这个月单据花了多少」
+  返回表格清单而非伪造总额；「大三下有哪些课」列出 8 门课并展开每门的课件与子目录。
+- 测试：后端 175 项通过。
 
 ## 四、禁止操作
 

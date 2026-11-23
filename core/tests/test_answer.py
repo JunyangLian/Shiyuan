@@ -108,6 +108,70 @@ def test_question_words_in_the_middle_are_removed():
     assert query.analyze("我毕业论文写了什么")["core"] == "我毕业论文"
 
 
+def test_duplicate_check_report_is_demoted(conn, tmp_path):
+    root = tmp_path / "论文"
+    root.mkdir()
+    (root / "专利说明.md").write_text(
+        "本发明公开了一种基于混池测序的性别决定区定位方法，创新点在于全局比对策略。",
+        encoding="utf-8")
+    (root / "专利查重报告.md").write_text(
+        "专利 创新点 混池测序 全局比对策略 重复率 12% 比对报告 片段对照 原文对照",
+        encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "专利的创新点是什么")
+
+    assert result["citations"][0]["name"] == "专利说明.md"
+
+    explicit = answer.ask(conn, "专利的查重报告重复率多少")
+    assert explicit["citations"]
+    assert explicit["citations"][0]["name"] == "专利查重报告.md"
+
+
+def test_stat_question_lists_tables_instead_of_summing(conn, tmp_path):
+    root = tmp_path / "单据"
+    root.mkdir()
+    rows = ["单据编号,日期,金额"] + [f"D{i},2026-10-0{i % 9 + 1},100" for i in range(1, 20)]
+    (root / "单据明细.csv").write_text("\n".join(rows), encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "上个月单据金额合计多少")
+
+    assert result["reason"] == "table_stats_hint"
+    assert result["citations"][0]["name"] == "单据明细.csv"
+    assert "不会替你求和" in result["answer"]
+    assert "1900" not in result["answer"]
+
+    chapters = answer.ask(conn, "论文一共几章")
+    assert chapters["reason"] != "table_stats_hint"
+
+    spoken = answer.ask(conn, "这个月单据花了多少")
+    assert spoken["reason"] == "table_stats_hint"
+
+
+def test_folder_overview_expands_second_level(conn, tmp_path):
+    root = tmp_path / "大学"
+    (root / "大三" / "系统工程").mkdir(parents=True)
+    (root / "大三" / "云计算").mkdir(parents=True)
+    (root / "大三" / "系统工程" / "课件.md").write_text("系统工程课件", encoding="utf-8")
+    (root / "大三" / "云计算" / "笔记.md").write_text("云计算笔记", encoding="utf-8")
+    (root / "大三" / "课程说明.md").write_text("大三课程说明", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "大三有哪些课程")
+
+    assert result["reason"] == "folder_overview"
+    assert "系统工程" in result["answer"]
+    assert "文件：课件.md" in result["answer"]
+    assert "课程说明.md" in result["answer"]
+
+
 def test_folder_question_answers_with_subfolder_list(conn, tmp_path):
     root = tmp_path / "大学"
     (root / "大三" / "系统工程").mkdir(parents=True)
