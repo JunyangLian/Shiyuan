@@ -418,6 +418,24 @@ export interface Citation {
   }[];
 }
 
+export interface RetrievalPlan {
+  intent: string;
+  label: string;
+  budget: number;
+  per_family: number;
+  per_asset: number;
+  min_families: number;
+  output_mode: string;
+  deduplicate_by: string[];
+  required_coverage: string[];
+  reason: string;
+  candidates?: number;
+  used?: number;
+  families?: number;
+  facets?: { name: string; covered: boolean }[];
+  missing?: string[];
+}
+
 export interface AnswerResult {
   question: string;
   answer: string;
@@ -429,6 +447,7 @@ export interface AnswerResult {
   evidence_count: number;
   warning: string | null;
   session_id?: string | null;
+  plan?: RetrievalPlan | null;
   coverage: {
     content_indexed: number;
     content_pending: number;

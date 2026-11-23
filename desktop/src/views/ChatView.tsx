@@ -193,6 +193,21 @@ function AnswerCard({ result }: { result: AnswerResult }) {
       </div>
       {result.warning && <div className="alert warn answer-warning">{result.warning}</div>}
 
+      {result.plan && (
+        <div className="answer-plan">
+          <span className="chip subtle">{result.plan.label}</span>
+          <span className="muted small-text">
+            候选 {result.plan.candidates ?? 0} · 采用 {result.plan.used ?? result.citations.length}
+            {" "}· 覆盖 {result.plan.families ?? 0} 个家族
+          </span>
+          {(result.plan.missing?.length ?? 0) > 0 && (
+            <span className="chip warn" title="这些关键词没有在证据中出现">
+              证据缺口：{result.plan.missing!.join("、")}
+            </span>
+          )}
+        </div>
+      )}
+
       {result.citations.length > 0 && (
         <div className="answer-sources">
           <div className="answer-sources-head">

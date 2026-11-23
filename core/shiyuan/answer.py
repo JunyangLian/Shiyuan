@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import embeddings, families, indexer, query, retrieval, secrets_store, store
+from . import (embeddings, families, indexer, planner, query, retrieval,
+               secrets_store, store)
 
 SETTINGS_KEY = "answer"
 PROVIDERS = {"extractive", "openai", "ollama"}
@@ -179,35 +180,68 @@ def _snippet(text: str, focus: list[str] | None) -> str:
     return (text or "")[:MAX_EVIDENCE_CHARS]
 
 
+def _shingles(text: str, size: int = 4) -> set[str]:
+    compact = re.sub(r"\s+", "", text or "")
+    if len(compact) <= size:
+        return {compact} if compact else set()
+    return {compact[index:index + size] for index in range(len(compact) - size + 1)}
+
+
+def _duplicate_of(signature: set[str], chosen: list[set[str]],
+                  threshold: float = 0.88) -> bool:
+    """短片段被长片段包含时也算重复，避免同一段落换个版本再占一个证据位。"""
+    if not signature:
+        return False
+    for other in chosen:
+        if not other:
+            continue
+        overlap = len(signature & other) / max(1, min(len(signature), len(other)))
+        if overlap >= threshold:
+            return True
+    return False
+
+
 def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None = None,
              ext: str | None = None, limit: int = 6,
              focus: list[str] | None = None,
-             path_only: bool = False) -> list[Evidence]:
+             path_only: bool = False,
+             plan: planner.Plan | None = None,
+             stats: dict | None = None) -> list[Evidence]:
     analysis = query.analyze(question, synonyms=query.synonym_map(conn))
     if not analysis["variants"]:
         return []
-    evidence: list[Evidence] = []
-    per_asset: dict[str, int] = {}
-    per_family: dict[str, int] = {}
+    per_asset_limit = plan.mode.per_asset if plan else 1
+    per_family_limit = plan.mode.per_family if plan else 2
 
-    def take(hit_asset: str, family_id: str | None) -> bool:
-        """限制同一文件/同一家族占用的证据位，避免多个版本挤掉其他文件。"""
-        key = family_id or f"asset:{hit_asset}"
-        if per_asset.get(hit_asset, 0) >= 1:
+    evidence: list[Evidence] = []
+    chosen_sigs: list[set[str]] = []
+    used_chunks: set[str] = set()
+    per_asset_count: dict[str, int] = {}
+    per_family_count: dict[str, int] = {}
+
+    def family_key(asset_id: str, family_id: str | None) -> str:
+        return family_id or f"asset:{asset_id}"
+
+    def take(asset_id: str, family_id: str | None, text: str,
+             *, allow_second: bool) -> bool:
+        """按计划控制同文件/同家族配额，并跳过与已选内容高度重合的片段。"""
+        key = family_key(asset_id, family_id)
+        if per_asset_count.get(asset_id, 0) >= per_asset_limit:
             return False
-        if per_family.get(key, 0) >= 2:
+        cap = per_family_limit if allow_second else 1
+        if per_family_count.get(key, 0) >= cap:
             return False
-        per_asset[hit_asset] = per_asset.get(hit_asset, 0) + 1
-        per_family[key] = per_family.get(key, 0) + 1
+        signature = _shingles(text)
+        if _duplicate_of(signature, chosen_sigs):
+            return False
+        per_asset_count[asset_id] = per_asset_count.get(asset_id, 0) + 1
+        per_family_count[key] = per_family_count.get(key, 0) + 1
+        chosen_sigs.append(signature)
         return True
 
-    for hit in retrieval.find_chunks(conn, question, analysis=analysis,
-                                     source_id=source_id, ext=ext, focus=focus,
-                                     path_only=path_only):
-        if not take(hit.asset_id, hit.family_id):
-            continue
+    def build(hit: retrieval.ChunkHit) -> Evidence:
         name = hit.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-        evidence.append(Evidence(
+        return Evidence(
             chunk_id=hit.chunk_id,
             asset_id=hit.asset_id,
             location_id=hit.location_id,
@@ -226,13 +260,38 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
             family_title=hit.family_title,
             version_label=hit.version_label,
             sources=hit.sources,
-        ))
+        )
+
+    candidates = retrieval.find_chunks(conn, question, analysis=analysis,
+                                       source_id=source_id, ext=ext, focus=focus,
+                                       path_only=path_only)
+
+    # 先按家族取样，凑够计划要求的最小覆盖面；再回头补同家族的第二条。
+    min_families = plan.mode.min_families if plan else 1
+    if min_families > 1:
+        families_seen: set[str] = set()
+        for hit in candidates:
+            if len(evidence) >= limit or len(families_seen) >= min_families:
+                break
+            key = family_key(hit.asset_id, hit.family_id)
+            if key in families_seen:
+                continue
+            if take(hit.asset_id, hit.family_id, hit.text, allow_second=False):
+                evidence.append(build(hit))
+                used_chunks.add(hit.chunk_id)
+                families_seen.add(key)
+
+    for hit in candidates:
         if len(evidence) >= limit:
             break
+        if hit.chunk_id in used_chunks:
+            continue
+        if take(hit.asset_id, hit.family_id, hit.text, allow_second=True):
+            evidence.append(build(hit))
+            used_chunks.add(hit.chunk_id)
 
     settings = embeddings.load_settings(conn)
     if embeddings.enabled(settings) and len(evidence) < limit:
-        seen = {item.chunk_id for item in evidence}
         try:
             semantic_hits = embeddings.semantic_chunks(
                 conn, analysis["core"] or question, source_id=source_id, ext=ext,
@@ -243,7 +302,10 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
         for hit in semantic_hits:
             if len(evidence) >= limit:
                 break
-            if hit["chunk_id"] in seen or not take(hit["asset_id"], hit.get("family_id")):
+            if hit["chunk_id"] in used_chunks:
+                continue
+            if not take(hit["asset_id"], hit.get("family_id"), hit["text"],
+                        allow_second=True):
                 continue
             name = hit["path"].rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
             evidence.append(Evidence(
@@ -267,6 +329,21 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
                 version_label=hit.get("version_label", ""),
                 sources=hit.get("sources", []),
             ))
+            used_chunks.add(hit["chunk_id"])
+
+    if stats is not None:
+        blob = [f"{item.name}\n{item.text}".lower() for item in evidence]
+        facets = [
+            {"name": facet, "covered": any(facet.lower() in text for text in blob)}
+            for facet in (plan.facets if plan else [])
+        ]
+        stats.update({
+            "candidates": len(candidates),
+            "used": len(evidence),
+            "families": len({item.family_id or item.asset_id for item in evidence}),
+            "facets": facets,
+            "missing": [item["name"] for item in facets if not item["covered"]],
+        })
     return evidence
 
 
@@ -290,8 +367,22 @@ def _evidence_block(evidence: list[Evidence]) -> str:
     return "\n\n".join(parts)
 
 
+def _plan_note(plan: planner.Plan, stats: dict) -> str:
+    """把检索计划与覆盖情况交给模型，避免它对缺失信息装作完整。"""
+    note = (
+        f"检索模式：{plan.mode.label}（{plan.reason}）。"
+        f"候选 {stats.get('candidates', 0)} 条，采用 {stats.get('used', 0)} 条，"
+        f"覆盖 {stats.get('families', 0)} 个文档家族。"
+    )
+    missing = stats.get("missing") or []
+    if missing:
+        note += f"以下关键词没有可用证据：{'、'.join(missing)}；请在回答里明确说明这部分资料不足。"
+    return note
+
+
 def _messages(question: str, evidence: list[Evidence],
-              previous: str | None = None) -> list[dict]:
+              previous: str | None = None,
+              plan_note: str | None = None) -> list[dict]:
     system = (
         "你是本地知识库的检索助手，只能依据用户消息中的<证据>回答。"
         "禁止补充证据之外的事实或推测。每个事实句末用 [数字] 标注对应证据。"
@@ -313,6 +404,8 @@ def _messages(question: str, evidence: list[Evidence],
     user = f"<问题>\n{question}"
     if previous:
         user += f"\n（对话追问，上一轮问题：{previous}）"
+    if plan_note:
+        user += f"\n\n<检索规划>\n{plan_note}"
     user += f"\n\n<证据>\n{_evidence_block(evidence)}"
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -322,7 +415,7 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float | None = N
     request = urllib.request.Request(url, data=data, method="POST",
                                      headers={"Content-Type": "application/json", **headers})
     if timeout is None:
-        timeout = float(os.environ.get("SHIYUAN_MODEL_TIMEOUT", "60"))
+        timeout = float(os.environ.get("SHIYUAN_MODEL_TIMEOUT", "90"))
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
@@ -338,7 +431,8 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float | None = N
 
 
 def _openai_answer(settings: dict, question: str, evidence: list[Evidence],
-                   previous: str | None = None) -> str:
+                   previous: str | None = None,
+                   plan_note: str | None = None) -> str:
     if not settings.get("allow_cloud"):
         raise AnswerError("云端回答未获授权：请先在对话设置里允许上传证据片段")
     if not settings.get("api_key") or not settings.get("model"):
@@ -347,7 +441,7 @@ def _openai_answer(settings: dict, question: str, evidence: list[Evidence],
     payload = {
         "model": settings["model"],
         "temperature": 0.2,
-        "messages": _messages(question, evidence, previous),
+        "messages": _messages(question, evidence, previous, plan_note),
     }
     data = _post_json(f"{base}/chat/completions", payload,
                       {"Authorization": f"Bearer {settings['api_key']}"})
@@ -358,12 +452,13 @@ def _openai_answer(settings: dict, question: str, evidence: list[Evidence],
 
 
 def _ollama_answer(settings: dict, question: str, evidence: list[Evidence],
-                   previous: str | None = None) -> str:
+                   previous: str | None = None,
+                   plan_note: str | None = None) -> str:
     if not settings.get("model"):
         raise AnswerError("Ollama 回答尚未填写模型名称")
     base = (settings.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
     payload = {"model": settings["model"], "stream": False,
-               "messages": _messages(question, evidence, previous)}
+               "messages": _messages(question, evidence, previous, plan_note)}
     data = _post_json(f"{base}/api/chat", payload, {})
     try:
         return str(data["message"]["content"]).strip()
@@ -851,25 +946,32 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
                 }
 
     if _is_stat_question(text):
-        stats = _stats_answer(conn, context_text, source_id=effective_source, ext=ext)
-        if stats is not None:
+        stats_hint = _stats_answer(conn, context_text, source_id=effective_source, ext=ext)
+        if stats_hint is not None:
             return {
                 "question": text,
-                "answer": stats["answer"],
+                "answer": stats_hint["answer"],
                 "refused": False,
                 "reason": "table_stats_hint",
                 "provider": "library",
                 "model": None,
-                "citations": stats["citations"],
-                "evidence_count": len(stats["citations"]),
+                "citations": stats_hint["citations"],
+                "evidence_count": len(stats_hint["citations"]),
                 "warning": None,
                 "coverage": coverage,
                 "context_used": previous,
             }
 
-    evidence = retrieve(conn, context_text, source_id=effective_source, ext=ext, limit=limit,
+    plan = planner.make(context_text)
+    plan_stats: dict = {}
+    budget = limit if top_k else plan.mode.budget
+    evidence = retrieve(conn, context_text, source_id=effective_source, ext=ext,
+                        limit=budget,
                         focus=_focus_terms(text) if previous else None,
-                        path_only=_is_path_question(text))
+                        path_only=_is_path_question(text),
+                        plan=plan, stats=plan_stats)
+    plan_payload = {**plan.as_dict(), **plan_stats}
+    plan_note = _plan_note(plan, plan_stats)
 
     if not evidence:
         indexed = coverage["content_indexed"]
@@ -889,16 +991,17 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
             "evidence_count": 0,
             "warning": None,
             "coverage": coverage,
+            "plan": plan_payload,
         }
 
     if provider == "extractive":
         answer = _extractive_answer(evidence)
         warning = None
     elif provider == "openai":
-        answer = _openai_answer(settings, text, evidence, previous)
+        answer = _openai_answer(settings, text, evidence, previous, plan_note)
         warning = _citation_warning(answer, len(evidence))
     else:
-        answer = _ollama_answer(settings, text, evidence, previous)
+        answer = _ollama_answer(settings, text, evidence, previous, plan_note)
         warning = _citation_warning(answer, len(evidence))
 
     if not answer:
@@ -916,4 +1019,5 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
         "warning": warning,
         "coverage": coverage,
         "context_used": previous,
+        "plan": plan_payload,
     }

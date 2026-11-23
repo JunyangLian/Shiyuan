@@ -5,7 +5,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from shiyuan import answer, db, indexer, query, scanner, store
+from shiyuan import answer, db, indexer, planner, query, scanner, store
 
 
 @pytest.fixture()
@@ -106,6 +106,65 @@ def test_question_words_in_the_middle_are_removed():
 
     assert query.analyze("专利里写了什么")["core"] == "专利"
     assert query.analyze("我毕业论文写了什么")["core"] == "我毕业论文"
+
+
+def test_planner_classifies_four_modes():
+    assert planner.make("论文中 BUSCO 的完整度是多少").mode.key == "precision"
+    assert planner.make("介绍一下群体基因组分析").mode.key == "explain"
+    assert planner.make("实验室之前做过哪些群体基因组研究").mode.key == "comprehensive"
+    assert planner.make("论文修改了哪些内容").mode.key == "history"
+
+
+def test_comprehensive_plan_covers_multiple_families(conn, tmp_path):
+    root = tmp_path / "研究"
+    root.mkdir()
+    for index in range(6):
+        (root / f"研究主题{index}.md").write_text(
+            f"实验室研究主题 {index}：鱼类基因组分析，样本与测序方案各不相同。",
+            encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "实验室做过哪些鱼类研究")
+
+    plan = result["plan"]
+    assert plan["intent"] == "comprehensive"
+    assert plan["used"] >= 5
+    assert plan["families"] >= 5
+    assert plan["candidates"] >= plan["used"]
+
+
+def test_precision_plan_keeps_evidence_small(conn, tmp_path):
+    root = tmp_path / "参数"
+    root.mkdir()
+    for index in range(6):
+        (root / f"参数记录{index}.md").write_text(
+            f"第 {index} 次运行：测序参数为 -t 8，接头阈值 0.2。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "测序参数是多少")
+
+    assert result["plan"]["intent"] == "precision"
+    assert 0 < result["plan"]["used"] <= 4
+
+
+def test_plan_reports_missing_coverage(conn, tmp_path):
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "蓝子鱼.md").write_text(
+        "蓝子鱼样本采集于 2024 年，共 30 尾，用于群体基因组分析。", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "蓝子鱼的毒素基因有哪些")
+
+    plan = result["plan"]
+    assert plan["facets"]
+    assert "毒素基因" in plan["missing"]
 
 
 def test_duplicate_check_report_is_demoted(conn, tmp_path):

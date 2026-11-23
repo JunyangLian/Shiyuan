@@ -355,10 +355,11 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             or (path_match.name_matched and path_match.specific)
         ))
         lowered = text_value.lower()
-        maximal_hit = sum(
-            1 for concept in maximal
+        matched_terms = [
+            concept["term"] for concept in maximal
             if any(variant in lowered for variant in concept["variants"])
-        )
+        ]
+        maximal_hit = len(matched_terms)
         if not path_ok and maximal_hit < 1:
             # 只有 gram 命中时：说明类问题允许命中一个词，其余问题要求至少两个。
             if analysis.get("howto"):

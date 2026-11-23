@@ -51,6 +51,9 @@
 - 查重 / 比对报告在普通问题里自动后置，问「重复率多少」时再正常召回
 - 多轮追问：同一会话里「那第三章呢」「它的环境变量怎么配」会带上上一轮问题检索，
   上一轮只涉及一个数据源时自动收窄
+- 检索规划：按问题区分「精确查找 / 知识解释 / 综合探索 / 历史追溯」，决定证据预算（4 / 6 / 10 / 6 条）、
+  同家族配额与最小覆盖面；回答下方会显示候选数、采用数、覆盖家族数与「证据缺口」
+- 动态证据选择：先跨家族取样保证覆盖面，再补同家族细节；与已选片段高度重合的内容直接跳过
 - 回答默认本地摘录（不联网），可切换 OpenAI 兼容接口或 Ollama；每条结论带 `[n]` 引用，
   没有证据直接拒答并说明内容覆盖
 
@@ -104,7 +107,7 @@ npm run tauri dev
 | `SHIYUAN_RECONCILE_SECONDS` | `600` | 周期对账间隔（最小 30 秒） |
 | `SHIYUAN_DAILY_PARSE_BUDGET` | `500` | 每日正文解析文件数上限，`0` 为不限 |
 | `SHIYUAN_DAILY_OCR_BUDGET` | `200` | 每日 OCR 文件数上限，`0` 为不限 |
-| `SHIYUAN_MODEL_TIMEOUT` | `60` | 模型单次回答超时秒数（推理模型可调 120） |
+| `SHIYUAN_MODEL_TIMEOUT` | `90` | 模型单次回答超时秒数（推理模型可调 120） |
 
 ## 架构
 
@@ -113,7 +116,7 @@ core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            scanner · watcher · ingest · extractors · ocr · indexer
                       query · retrieval · families · answer · chat
                       external · mcp_server · inventory · maintenance · api
-  tests/              175 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 安全 / 基线）
+  tests/              180 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 安全 / 基线）
   benchmarks/         目录级扫描基准
 desktop/              Tauri v2 + React + TypeScript
   src/                数据 · 对话 · 外部调用 · 更新 四个模块
@@ -126,13 +129,15 @@ docs/                 PRD、解析说明、开发断点
 ## 检索是怎么打分的
 
 1. **查询理解**：去掉疑问结构与口水词，按「的」切词，剥句尾方位词，展开同义词
-2. **路径召回**：按数据源内相对路径打分（根目录名不参与），文件夹按深度加权，文件名权重更高
-3. **正文召回**：FTS5 trigram + 两字词 LIKE 兜底；正文命中的文件同时获得路径分
-4. **证据门槛**：按「最大词」计（避免 `创新 / 新点 / 创新点` 这类 gram 膨胀误杀），
+2. **检索规划**：判断意图模式，给出证据预算、家族配额、最小覆盖面与需要覆盖的关键词
+3. **路径召回**：按数据源内相对路径打分（根目录名不参与），文件夹按深度加权，文件名权重更高
+4. **正文召回**：FTS5 trigram + 两字词 LIKE 兜底；正文命中的文件同时获得路径分
+5. **证据门槛**：按「最大词」计（避免 `创新 / 新点 / 创新点` 这类 gram 膨胀误杀），
    纯通用目录词不构成证据
-5. **排序**：`追问词命中 × 120 + 最大词命中 × 10 + min(路径分, 300)`，
-   同文件最多 1 条、同家族最多 2 条证据，避免多版本占位
-6. **生成**：只喂入选片段，要求逐句标注引用；证据不足直接拒答
+6. **选择与去重**：先每家族取一条凑够覆盖面，再补同家族第二条；4-gram 重合度 ≥ 0.88 的片段跳过
+7. **排序**：`追问词命中 × 120 + 最大词命中 × 10 + min(路径分, 300)`，
+   同文件最多 1 条、同家族最多 2 条证据
+8. **生成**：只喂入选片段，并把「模式 / 覆盖 / 缺口」一起交给模型；证据不足直接拒答
 
 ## 本机安全边界
 
@@ -222,7 +227,7 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 175 passed（另需 pip install pytest httpx）
+cd core; python -m pytest -q          # 180 passed（另需 pip install pytest httpx）
 cd desktop; npm test                  # 14 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
@@ -242,6 +247,8 @@ cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
 - **短词检索**（<3 字符）走 LIKE 扫描，语料很大时比 FTS 慢
 - **引用只校验编号**：无法证明模型每句话都忠于证据，仍需点开来源核对
 - **不做表格汇总**：合计 / 平均 / 总额这类问题只定位表格并说明，不会真的计算
+- **没有重排序模型**：候选仍靠关键词与路径打分，语义相近但主题不同的文件可能混入；
+  问「实验室做过哪些鱼类研究」这类宽泛问题时，如果语料里没有对应主题，会如实拒答而不是归纳
 
 ## 文档
 

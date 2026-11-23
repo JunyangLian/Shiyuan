@@ -572,6 +572,26 @@ describe("固定对话输入框", () => {
       ],
       evidence_count: 3,
       warning: null,
+      plan: {
+        intent: "comprehensive",
+        label: "综合探索",
+        budget: 10,
+        per_family: 2,
+        per_asset: 1,
+        min_families: 5,
+        output_mode: "topic_grouped_summary",
+        deduplicate_by: ["document_family", "content_similarity"],
+        required_coverage: ["论文", "毒素基因"],
+        reason: "问题需要跨资料归纳",
+        candidates: 18,
+        used: 3,
+        families: 2,
+        facets: [
+          { name: "论文", covered: true },
+          { name: "毒素基因", covered: false },
+        ],
+        missing: ["毒素基因"],
+      },
       coverage: {
         content_indexed: 3,
         content_pending: 0,
@@ -592,6 +612,9 @@ describe("固定对话输入框", () => {
     expect(await screen.findByText("30 个关联版本")).toBeTruthy();
     expect(await screen.findByText(/归并为 1 个文档家族/)).toBeTruthy();
     expect(screen.getByText("写作规范.doc")).toBeTruthy();
+    expect(screen.getByText("综合探索")).toBeTruthy();
+    expect(screen.getByText(/候选 18 · 采用 3 · 覆盖 2 个家族/)).toBeTruthy();
+    expect(screen.getByText(/证据缺口：毒素基因/)).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /30 个关联版本/ }));
     const dialog = await screen.findByRole("dialog", { name: "毕业论文 的关联版本" });
