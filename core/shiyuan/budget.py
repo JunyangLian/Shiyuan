@@ -1,6 +1,6 @@
-"""每日解析预算：按自然日统计 L1 / L2 处理文件数，超额后把任务留给下一天。
+"""每日解析与知识预算：按自然日统计 L1 / L2 解析文件数与衍生知识生成数。
 
-预算存在 app_settings 的 `budget` 键里（日期 + 两个计数），跨天自动归零。
+预算存在 app_settings 的 `budget` 键里（日期 + 三个计数），跨天自动归零。
 0 表示不限制，便于本地长期使用或测试。
 """
 
@@ -17,7 +17,7 @@ KEY = "budget"
 
 def _load(conn: sqlite3.Connection) -> dict:
     today = date.today().isoformat()
-    data = {"date": today, "l1": 0, "l2": 0}
+    data = {"date": today, "l1": 0, "l2": 0, "knowledge": 0}
     row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (KEY,)).fetchone()
     if row is not None:
         try:
@@ -27,6 +27,7 @@ def _load(conn: sqlite3.Connection) -> dict:
         if isinstance(stored, dict) and stored.get("date") == today:
             data["l1"] = max(0, int(stored.get("l1", 0)))
             data["l2"] = max(0, int(stored.get("l2", 0)))
+            data["knowledge"] = max(0, int(stored.get("knowledge", 0)))
     return data
 
 
@@ -54,6 +55,18 @@ def add(conn: sqlite3.Connection, stage: str, count: int) -> None:
     _save(conn, data)
 
 
+def remaining_knowledge(conn: sqlite3.Connection) -> int:
+    return max(0, config.daily_knowledge_budget() - _load(conn)["knowledge"])
+
+
+def add_knowledge(conn: sqlite3.Connection, count: int = 1) -> None:
+    if count <= 0:
+        return
+    data = _load(conn)
+    data["knowledge"] += count
+    _save(conn, data)
+
+
 def info(conn: sqlite3.Connection) -> dict:
     data = _load(conn)
     return {
@@ -62,4 +75,6 @@ def info(conn: sqlite3.Connection) -> dict:
         "l1_limit": config.daily_parse_budget(),
         "l2_used": data["l2"],
         "l2_limit": config.daily_ocr_budget(),
+        "knowledge_used": data["knowledge"],
+        "knowledge_limit": config.daily_knowledge_budget(),
     }

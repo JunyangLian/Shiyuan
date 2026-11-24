@@ -22,7 +22,14 @@ _GENERIC_PATH_TERMS = {
     "实验", "数据", "记录", "报告", "总结", "笔记", "论文", "文档", "结果",
     "处理", "文件", "资料", "表格", "分析", "研究", "内容", "项目", "工作",
     "附件", "备份", "副本", "新建", "未命名", "图片", "照片",
+    "整理", "系统", "企业",
     "课程", "科目", "作业", "考试", "试卷", "课件", "讲义", "习题", "章节",
+    # 英文通用词：工具/教程/工程文件里极常见，仅命中这些不应压过语义命中。
+    "mapping", "development", "configuration", "config", "tutorial", "tutorials",
+    "sample", "samples", "index", "page", "pages", "content", "extension",
+    "project", "main", "test", "tests", "docs", "doc", "readme", "license",
+    "changelog", "build", "src", "lib", "assets", "static", "output", "out",
+    "sex", "chromosome", "exception", "error", "document", "documents",
 }
 
 
@@ -46,6 +53,12 @@ _DUP_NAME = re.compile(
     r"(查重|重复率|相似度检测|比对报告|对照报告|片段对照|原文对照|全文对照|简洁报告"
     r"|去除引用|报告单|检测结果|格式分析|AIGC|检测报告|降重)")
 _DUP_QUERY = re.compile(r"(查重|重复率|相似度|降重|比对|对照|检测报告|格式分析)")
+# 试卷/题库/复习资料是资料库里最大的噪声源之一：除非问题本身在找考试材料，
+# 否则不应压过正文文档（「共线性」被「线性代数试卷」抢走就是典型）。
+_EXAM_NAME = re.compile(
+    r"(试卷|试题|参考答案|评分标准|题库|复习|考集|期末|期中|真题|模拟题|习题集"
+    r"|选择题|问答题|考试题|答案)")
+_EXAM_QUERY = re.compile(r"(试卷|试题|答案|题库|复习|期末|期中|真题|考试题|习题|模拟题)")
 
 
 def name_prior(path: str, analysis: dict) -> int:
@@ -60,6 +73,9 @@ def name_prior(path: str, analysis: dict) -> int:
     if (not _DUP_QUERY.search(analysis.get("normalized") or "")
             and _DUP_NAME.search(name)):
         score -= 260
+    if (not _EXAM_QUERY.search(analysis.get("normalized") or "")
+            and _EXAM_NAME.search(name)):
+        score -= 300
     return score
 
 _SELECT = (
@@ -134,6 +150,9 @@ class PathMatch:
     folder_specific: bool = False
     specific_folder: str | None = None
     specific_folder_path: str | None = None
+    # 文件名里命中的最长关键词长度：2 字 gram 太容易巧合（「染色」之于「染色体」），
+    # 不足以说明这个文件就是问题的主体。
+    name_strength: int = 0
 
 
 def _relative_path(path: str, root: str | None) -> str:
@@ -148,7 +167,15 @@ def _relative_path(path: str, root: str | None) -> str:
     return path or ""
 
 
-def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | None, int, bool, bool, str | None, int]:
+def _term_in(value: str, variant: str) -> bool:
+    """路径里的词面匹配：两字母缩写只接受独立成词（fe 不应命中 different）。"""
+    if len(variant) == 2 and variant.isascii():
+        return re.search(r"(?<![a-z0-9])" + re.escape(variant) + r"(?![a-z0-9])",
+                         value) is not None
+    return variant in value
+
+
+def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | None, int, bool, bool, str | None, int, int]:
     """路径匹配评分：文件夹名与文件名都参与，越深的文件夹命中越具体。
 
     path 应当是数据源内的相对路径；根目录名不参与打分。
@@ -156,14 +183,19 @@ def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | N
     lowered = (path or "").lower()
     parts = [part for part in re.split(r"[\\/]+", lowered) if part]
     if not parts:
-        return 0, 0, 0, False, None, -1, False, False, None, -1
-    name = parts[-1]
-    folders = parts[:-1]
+        return 0, 0, 0, False, None, -1, False, False, None, -1, 0
+    # 文件名里的下划线/连字符按空格处理：「cover_letter」要能被「cover letter」命中。
+    keys = [re.sub(r"[_\-]+", " ", part) for part in parts]
+    name = keys[-1]
+    folders = keys[:-1]
+    display_folders = parts[:-1]
+    lowered_key = re.sub(r"[_\-]+", " ", lowered)
 
     score = 0
     matched_concepts = 0
     matched_variants = 0
     name_matched = False
+    name_strength = 0
     specific = False
     folder_specific = False
     best_folder: str | None = None
@@ -178,15 +210,18 @@ def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | N
         for variant in concept["variants"]:
             if len(variant) < 2:
                 continue
-            if variant in name:
+            # 与路径同样把下划线/连字符当成空格，否则「pilot_batches」匹配不上自己的目录。
+            probe = re.sub(r"[_\-]+", " ", variant)
+            if _term_in(name, probe):
                 score += 12 + 2 * len(variant)
                 matched_variants += 1
                 concept_hit = True
                 name_matched = True
                 if variant not in _GENERIC_PATH_TERMS:
                     specific = True
+                    name_strength = max(name_strength, len(variant))
             for depth, folder in enumerate(folders):
-                if variant not in folder:
+                if not _term_in(folder, probe):
                     continue
                 weight = (4 + 2 * len(variant)) * (1 + min(depth, 4) / 4)
                 score += int(weight)
@@ -197,30 +232,35 @@ def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | N
                     folder_specific = True
                     if weight > specific_folder_score:
                         specific_folder_score = weight
-                        specific_folder = folder
+                        specific_folder = display_folders[depth]
                         specific_folder_index = depth
                 if weight > best_folder_score:
                     best_folder_score = weight
-                    best_folder = folder
+                    best_folder = display_folders[depth]
                     best_folder_index = depth
         if concept_hit:
             matched_concepts += 1
 
-    core = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (analysis.get("core") or "").lower())
+    # 多词问题（如「FE RE」）不能把空格去掉拼成 fere 再去匹配 different；
+    # 整句核心词奖励只对单个词/短语生效。
+    core_text = (analysis.get("core") or "").strip().lower()
+    core_key = re.sub(r"[_\-]+", " ", core_text)
+    core = "" if re.search(r"\s", core_key) else re.sub(
+        r"[^0-9a-z\u4e00-\u9fff]+", "", core_key)
     if len(core) >= 2:
         if core == name:
             score += 1000
-        elif core in name:
+        elif _term_in(name, core):
             score += 300
-        elif core in lowered:
+        elif _term_in(lowered_key, core_key):
             score += 120
     # 「专利的创新点」这类问法，主体词出现在文件名里应该更靠前。
     for part in re.split(r"[的\s]+", core):
-        if len(part) >= 2 and part != core and part in name:
+        if len(part) >= 2 and part != core and _term_in(name, part):
             score += 60
     return (score, matched_concepts, matched_variants, name_matched,
             best_folder, best_folder_index, specific, folder_specific,
-            specific_folder, specific_folder_index)
+            specific_folder, specific_folder_index, name_strength)
 
 
 def path_matches(conn: sqlite3.Connection, analysis: dict, *,
@@ -230,6 +270,12 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
     variants = [variant for variant in analysis["variants"] if len(variant) >= 2][:48]
     if not variants:
         return {}
+    # 词表里的「cover letter」要同时匹配文件名里的 cover_letter / cover-letter。
+    terms: list[str] = []
+    for variant in variants:
+        for form in (variant, variant.replace(" ", "_"), variant.replace(" ", "-")):
+            if form not in terms:
+                terms.append(form)
 
     clauses = ["s.state = 'active'", "l.availability = 'AVAILABLE'"]
     params: list[object] = []
@@ -240,9 +286,9 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
         clauses.append("l.ext = ?")
         params.append(ext.lower().lstrip("."))
     clauses.append(
-        "(" + " OR ".join("instr(lower(l.path), ?) > 0" for _ in variants) + ")"
+        "(" + " OR ".join("instr(lower(l.path), ?) > 0" for _ in terms) + ")"
     )
-    params.extend(variants)
+    params.extend(terms)
     rows = conn.execute(
         "SELECT l.location_id, l.asset_id, l.path, s.root_uri FROM asset_locations l"
         " JOIN sources s ON s.source_id = l.source_id"
@@ -256,7 +302,8 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
         relative = _relative_path(row["path"], root)
         (score, concepts, matched_variants, name_matched,
          folder, folder_index, specific, folder_specific,
-         specific_folder, specific_folder_index) = _path_score(relative, analysis)
+         specific_folder, specific_folder_index, name_strength) = _path_score(
+            relative, analysis)
         if score <= 0:
             continue
         parts = [part for part in re.split(r"[\\/]+", relative) if part]
@@ -280,8 +327,26 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
             folder_specific=folder_specific,
             specific_folder=specific_folder,
             specific_folder_path=folder_abs(specific_folder_index),
+            name_strength=name_strength,
         )
     return matches
+
+
+def _path_only_bonus(match: PathMatch | None, path_only: bool) -> int:
+    """位置问题里，文件名/文件夹真正命中主题词的候选优先。
+
+    「结果文件放在哪个目录」这类追问补上上下文后，黄姑鱼小课题下所有文件
+    都会命中「黄姑鱼」；若只看路径 gram 总分，结果取决于数据库返回顺序。
+    因此文件名命中主题词额外加权，命中主题文件夹再补一档。
+    """
+    if not path_only or match is None:
+        return 0
+    bonus = 0
+    if match.name_matched and match.specific and match.name_strength >= 3:
+        bonus += 240
+    if match.folder_specific:
+        bonus += 120
+    return bonus
 
 
 def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = None,
@@ -335,6 +400,23 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
                 merged.setdefault((row["chunk_id"], row["location_id"]), row)
             rows = list(merged.values())
 
+        # 两字母缩写（FE/RE/GO/GC）用 LIKE 会命中英文子串（fe → different），
+        # 候选里混满无关文档。这些短词只接受独立成词的出现，中文短词仍按子串。
+        ascii_short = [unit for unit in short_units
+                       if re.fullmatch(r"[a-z0-9_]{2}", unit)]
+        if ascii_short:
+            boundary = [re.compile(r"(?<![a-z0-9])" + re.escape(unit) + r"(?![a-z0-9])")
+                        for unit in ascii_short]
+            other_units = [unit for unit in variants if unit not in ascii_short]
+
+            def row_ok(text_value: str) -> bool:
+                lowered = (text_value or "").lower()
+                if any(unit in lowered for unit in other_units):
+                    return True
+                return any(pattern.search(lowered) for pattern in boundary)
+
+            rows = [row for row in rows if row_ok(row["text"])]
+
     threshold = query.minimum_concepts(analysis)
     raw_required = 1 if len(analysis["concepts"]) <= 2 else 2
     maximal = query.maximal_terms(analysis)
@@ -381,14 +463,16 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             version_id=row["version_id"] or "",
             mtime_ns=row["mtime_ns"] or 0,
             bbox=_parse_bbox(row["bbox"]),
-            path_score=path_match.score if path_match else 0,
+            path_score=(path_match.score if path_match else 0)
+                       + _path_only_bonus(path_match, path_only),
             maximal=maximal_hit,
         ))
 
     seen = {hit.location_id for hit in hits}
     extra_matches = sorted(
         (match for location_id, match in path_index.items() if location_id not in seen),
-        key=lambda match: -(match.score + name_prior(match.path, analysis)),
+        key=lambda match: -(match.score + _path_only_bonus(match, path_only)
+                            + name_prior(match.path, analysis)),
     )
     added = 0
     for match in extra_matches:
@@ -424,7 +508,7 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             version_id=row["version_id"] or "",
             mtime_ns=row["mtime_ns"] or 0,
             bbox=_parse_bbox(row["bbox"]),
-            path_score=match.score,
+            path_score=match.score + _path_only_bonus(match, path_only),
         ))
         added += 1
 
@@ -435,11 +519,20 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             hit.focus = min(3, sum(1 for term in focus
                                    if len(term) >= 2 and term in lowered))
 
-    hits.sort(key=lambda hit: (
-        -(hit.focus * 120 + hit.maximal * 10 + min(hit.path_score, 300)),
-        -hit.concepts,
-        -hit.variants,
-        -len(hit.text),
-    ))
+    if path_only:
+        # 位置问题只关心路径：正文里碰巧出现「结果」不该压过文件名命中。
+        hits.sort(key=lambda hit: (
+            -(hit.focus * 120 + hit.maximal * 10 + hit.path_score),
+            -hit.concepts,
+            -hit.variants,
+            -len(hit.text),
+        ))
+    else:
+        hits.sort(key=lambda hit: (
+            -(hit.focus * 120 + hit.maximal * 10 + min(hit.path_score, 300)),
+            -hit.concepts,
+            -hit.variants,
+            -len(hit.text),
+        ))
     # 重复段落合并为一条并保留全部来源；各版本独有段落继续保留。
-    return families.dedupe_chunk_hits(conn, hits)
+    return families.dedupe_chunk_hits(conn, hits, path_only=path_only)

@@ -19,8 +19,8 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from . import (__version__, answer, chat, config, db, embeddings, external, families,
-               indexer, ingest, inventory, maintenance, ocr, query, scanner, search,
-               secrets_store, store, updates, watcher)
+               indexer, ingest, inventory, knowledge, maintenance, ocr, query, scanner,
+               search, secrets_store, store, updates, watcher)
 from .config import db_path
 
 
@@ -84,9 +84,14 @@ async def lifespan(app: FastAPI):
     scanner.resume_incomplete_sources()
     # 文档家族在后台重建，不阻塞核心启动。
     families.rebuild_async()
+    # 衍生知识（摘要/实体/FAQ）后台消费队列，不阻塞核心启动。
+    knowledge.start_worker()
+    # 语义向量缓存后台预热，避免第一次检索等建缓存。
+    embeddings.warm_cache_async()
     try:
         yield
     finally:
+        knowledge.stop_worker()
         if manager is not None:
             manager.stop()
         _remove_api_token(app)
@@ -233,6 +238,7 @@ def list_sources(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
             "full_coverage_at": row["full_coverage_at"],
             "excludes": row["excludes"],
             "stats": store.source_stats(conn, row["source_id"]),
+            "parse": indexer.parse_progress(conn, row["source_id"]),
             "scanning": scanner.is_running(row["source_id"]),
         })
     return {"items": items}
@@ -824,3 +830,10 @@ def maintenance_embed(source_id: str | None = None,
     if not embeddings.enabled(settings):
         raise HTTPException(status_code=400, detail="语义检索未启用或缺少配置")
     return _start_maintenance("embed", source_id, conn)
+
+
+@app.post("/api/maintenance/knowledge", status_code=202)
+def maintenance_knowledge(source_id: str | None = None,
+                          conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """立即跑一轮衍生知识（摘要/实体/FAQ）生成队列。"""
+    return _start_maintenance("knowledge", source_id, conn)

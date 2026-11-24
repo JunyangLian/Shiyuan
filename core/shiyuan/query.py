@@ -26,6 +26,22 @@ STOP_TERMS = {
     "写", "写了", "做", "做了", "跑", "跑了", "说", "讲", "看", "介绍", "总结", "概括",
 }
 
+# 英文虚词与高频词：都是子串匹配的噪声源（如 to 命中 photo、photoshop），
+# 单独出现时几乎不携带检索意图。
+STOP_TERMS_EN = {
+    "a", "an", "the", "of", "to", "in", "on", "at", "by", "for", "with", "from",
+    "and", "or", "is", "are", "was", "were", "be", "been", "being", "it", "its",
+    "this", "that", "these", "those", "as", "if", "do", "does", "did", "done",
+    "how", "what", "which", "who", "whom", "whose", "when", "where", "why",
+    "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+    "not", "no", "yes", "you", "your", "yours", "we", "our", "ours", "they",
+    "their", "them", "he", "she", "his", "her", "him", "me", "my", "us", "i",
+    "am", "so", "than", "then", "there", "here", "about", "into", "onto", "over",
+    "under", "between", "via", "per", "use", "uses", "using", "used", "have",
+    "has", "had", "also", "more", "most", "some", "any", "all", "each", "other",
+    "one", "two", "first", "second", "hi", "hello",
+}
+
 PREFIXES = ("请问", "帮我找", "帮我查", "帮我", "麻烦", "我想找", "我想查",
             "我想看看", "我想知道", "我想问", "你还记得", "你记得", "还记得",
             "那个", "这个", "请找")
@@ -40,6 +56,8 @@ QUESTION_PHRASES = (
         r"(?:了|过)?(?:些)?(?:什么|哪些|啥)"
     ),
     re.compile(r"(?:怎么|怎样|如何)(?:用|做|弄|操作|使用|处理|配置|设置|看|查)?"),
+    # 来源问句：「数据是从哪里来的」整体去掉，别把「从/来」留成检索词。
+    re.compile(r"(?:是)?从哪(?:里|儿)?(?:来|来的|得来)?"),
     # 位置问句要整体去掉，否则「文件/放在」会变成通用检索词。
     re.compile(r"(?:放在|存放|保存|存在|放到|存到|保存在)(?:了)?哪(?:个)?(?:文件夹|目录|盘)?"),
     re.compile(r"(?:在)?哪(?:个)?(?:文件夹|目录|盘)(?:里|中|内)?"),
@@ -56,7 +74,7 @@ _LOCATIVE_TAIL = re.compile(r"(?:里面?|里边?|中|内)$")
 
 # 「怎么用 / 如何配置 / 使用教程」这类问题优先给说明类文档。
 _HOWTO = re.compile(
-    r"(?:怎么|怎样|如何|咋)(?:用|使用|操作|配置|设置|安装|运行|启动|跑|做|弄)"
+    r"(?:怎么|怎样|如何|咋)(?:用|使用|操作|配置|设置|安装|运行|启动|跑|做|弄|整理|归档|处理|管理|分类)"
     r"|(?:使用说明|操作说明|快速上手|快速开始|使用手册|入门教程|教程|指南)"
 )
 
@@ -81,8 +99,9 @@ def _remove_question_phrases(value: str) -> str:
     return _strip_locative(value.strip("，,。.；;：:！!？?、 "))
 
 SYNONYMS = {
-    "样本量": ["样本数", "样本数量", "case数"],
+    "样本量": ["样本数", "样本数量", "case数", "sample size"],
     "样本数": ["样本量", "样本数量"],
+    "样本": ["sample"],
     "测序": ["sequencing", "测序数据"],
     "阈值": ["threshold", "cutoff", "临界值"],
     "实验记录": ["实验日志", "实验笔记", "lab notebook"],
@@ -91,6 +110,56 @@ SYNONYMS = {
     "蛋白": ["protein", "蛋白质"],
     "论文": ["paper", "文献"],
     "文库": ["library", "建库"],
+    "滑窗": ["sliding", "sliding window", "滑动窗口"],
+    "窗口": ["window"],
+    "共线性": ["collinearity", "synteny", "共线"],
+    # 语料里的文件名多为英文，问题多为中文：补一批科研场景名词，
+    # 让「结果文件」「权重」「染色体」这类词也能命中英文文件名。
+    # 注意只映射「结果文件」而不是宽泛的「结果」，否则任何带 result 的
+    # 输出文件都会盖过「滑窗分析结果」这类真正的主题。
+    "结果文件": ["result", "results", "output"],
+    "权重": ["weight"],
+    "回归": ["regression"],
+    "异方差": ["heteroskedasticity", "heteroscedasticity"],
+    "面板数据": ["panel"],
+    "染色体": ["chromosome"],
+    "长度": ["length"],
+    "基序": ["motif"],
+    "注释": ["annotation", "annot"],
+    "基因组": ["genome"],
+    "组装": ["assembly"],
+    "深度": ["depth"],
+    "亲本": ["parent"],
+    "筛选": ["filter"],
+    "鉴定": ["identify", "identification"],
+    "比对": ["alignment", "align"],
+    "参数": ["parameter", "param"],
+    "脚本": ["script"],
+    "微卫星": ["microsatellite", "ssr"],
+    "分子标记": ["marker", "markers"],
+    "引物": ["primer"],
+    "序列": ["sequence"],
+    "富集": ["enrichment"],
+    "通路": ["pathway"],
+    "突变": ["mutation", "variant"],
+    "群体": ["population"],
+    "遗传": ["genetic"],
+    "多样性": ["diversity"],
+    "性别决定": ["sex determination", "sdr"],
+    "雌雄": ["性别", "sex"],
+    "混池": ["pool", "pooled"],
+    "异常": ["abnormal", "exception", "error"],
+    "单据": ["receipt", "document", "invoice"],
+    # 文件名多为英文、问题多为中文：补一批“中文说法 → 英文文件名”的映射。
+    "单据识别": ["receipt recognition", "receipt ocr", "document extraction"],
+    "提示词": ["prompt", "prompts", "prompt template"],
+    "封面信": ["cover letter", "cover_letter"],
+    "投稿信": ["cover letter", "cover_letter"],
+    "投稿": ["submission", "submit"],
+    "完美标记": ["perfect marker", "perfect markers", "perfect_markers"],
+    "标记": ["marker", "markers"],
+    "引物设计": ["primer design", "primer"],
+    "结果表": ["result table", "result_table", "results table"],
 }
 
 MAX_CONCEPTS = 24
@@ -141,6 +210,8 @@ def analyze(text: str, synonyms: dict[str, list[str]] | None = None) -> dict:
         concepts.append({"term": term, "variants": variants})
 
     for word in re.findall(r"[a-z0-9_]{2,}", core):
+        if word in STOP_TERMS_EN:
+            continue
         add(word)
     for run in re.findall(r"[\u4e00-\u9fff]+", core):
         # 「的」通常只是连接词，按它切开可避免「鱼的候选」这类跨词 gram。

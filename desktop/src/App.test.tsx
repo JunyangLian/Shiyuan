@@ -167,6 +167,7 @@ const SOURCE_CARD = {
     offline: 0,
     last_run: null,
   },
+  parse: { total: 10, parsed: 6, failed: 1, empty: 1, pending: 2, locked: 0, unsupported: 0 },
   scanning: false,
 };
 
@@ -383,6 +384,19 @@ describe("页面整合", () => {
     const stop = await screen.findByRole("button", { name: "暂停解析" });
     fireEvent.click(stop);
     await waitFor(() => expect(mocks.setState).toHaveBeenCalledWith("src_1", "paused"));
+  });
+
+  it("深度解析进度条显示在扫描图标左边", async () => {
+    mocks.sources.mockResolvedValue({ items: [SOURCE_CARD] });
+    await renderApp();
+    fireEvent.click(screen.getByRole("button", { name: /^数据/ }));
+    await settle();
+
+    const bar = await screen.findByRole("progressbar", { name: "深度解析进度" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("80");
+    expect(bar.textContent).toContain("80%");
+    const scan = screen.getByRole("button", { name: "扫描" });
+    expect(bar.compareDocumentPosition(scan) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("解析结果按钮打开该数据源的结果页", async () => {
@@ -641,6 +655,57 @@ describe("固定对话输入框", () => {
     ).toBeTruthy();
     expect(within(composer).getByPlaceholderText("找点啥？")).toBeTruthy();
     expect(within(composer).getByRole("button", { name: "提问" })).toBeTruthy();
+  });
+
+  it("等待回答时立即显示问题、检索进度与已用时间", async () => {
+    let resolveAsk: (value: unknown) => void = () => undefined;
+    mocks.createChatSession.mockResolvedValue({
+      session_id: "s1",
+      title: "新会话",
+      created_at: "2026-11-24T10:00:00+08:00",
+    });
+    mocks.ask.mockImplementation(
+      () => new Promise((resolve) => {
+        resolveAsk = resolve;
+      }),
+    );
+
+    const { container } = await renderApp();
+    fireEvent.change(await screen.findByPlaceholderText("找点啥？"), {
+      target: { value: "样本量是多少" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "提问" }));
+
+    expect(await screen.findByText("正在检索本地资料…")).toBeTruthy();
+    expect(container.querySelector(".chat-pending-time")).toBeTruthy();
+    expect(screen.getByText("样本量是多少")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /检索中/ })).toBeTruthy();
+
+    await act(async () => {
+      resolveAsk({
+        question: "样本量是多少",
+        answer: "样本量是 42。",
+        refused: false,
+        reason: null,
+        provider: "extractive",
+        model: null,
+        citations: [],
+        evidence_count: 0,
+        warning: null,
+        coverage: {
+          content_indexed: 1,
+          content_pending: 0,
+          content_empty: 0,
+          content_failed: 0,
+          ocr_indexed: 0,
+          ocr_pending: 0,
+        },
+      });
+    });
+    await settle();
+
+    expect(await screen.findByText("样本量是 42。")).toBeTruthy();
+    expect(screen.queryByText("正在检索本地资料…")).toBeNull();
   });
 
   it("样式表把 composer 固定在视口底部", () => {

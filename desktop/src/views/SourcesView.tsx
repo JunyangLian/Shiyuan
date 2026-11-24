@@ -180,6 +180,33 @@ export default function SourcesView({
                 )}
               </div>
               <div className="source-actions">
+                {source.parse.total > 0 && (() => {
+                  const done = source.parse.total - source.parse.pending;
+                  const percent = Math.round((done / source.parse.total) * 100);
+                  return (
+                    <div
+                      className={`source-progress${source.scanning ? " active" : ""}`}
+                      role="progressbar"
+                      aria-label="深度解析进度"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={percent}
+                      title={
+                        `已处理 ${done}/${source.parse.total} 个文件` +
+                        (source.parse.pending > 0 ? `，待解析 ${source.parse.pending}` : "") +
+                        (source.parse.failed > 0 ? `，失败 ${source.parse.failed}` : "")
+                      }
+                    >
+                      <span className="source-progress-track">
+                        <span
+                          className="source-progress-fill"
+                          style={{ width: `${percent}%` }}
+                        />
+                      </span>
+                      <span className="source-progress-label">{percent}%</span>
+                    </div>
+                  );
+                })()}
                 <button
                   className={`scan-icon${source.scanning ? " spinning" : ""}`}
                   disabled={isBusy || source.scanning}

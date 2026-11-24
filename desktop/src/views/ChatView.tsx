@@ -14,6 +14,7 @@ import type {
 } from "../api";
 import { openFile } from "../tauri";
 import Icon from "../Icon";
+import logoMark from "../assets/shiyuan-mark.svg";
 
 const PROVIDER_LABEL: Record<string, string> = {
   extractive: "本地摘录",
@@ -29,6 +30,7 @@ interface Draft {
   apiKey: string;
   allowCloud: boolean;
   topK: number;
+  reasoningEffort: "low" | "high" | "max";
 }
 
 const EMPTY_DRAFT: Draft = {
@@ -38,6 +40,7 @@ const EMPTY_DRAFT: Draft = {
   apiKey: "",
   allowCloud: false,
   topK: 6,
+  reasoningEffort: "low",
 };
 
 const ACTIVE_CHAT_KEY = "shiyuan.chat.active";
@@ -180,7 +183,7 @@ function AnswerCard({ result }: { result: AnswerResult }) {
   return (
     <section className="chat-answer">
       <div className="chat-answer-head">
-        <span className="assistant-mark">拾</span>
+        <img className="assistant-mark" src={logoMark} alt="" />
         <span className="assistant-name">拾源</span>
         <span className={`chip ${result.refused ? "warn" : "ok"}`}>
           {result.reason === "source_recall"
@@ -213,6 +216,29 @@ function AnswerCard({ result }: { result: AnswerResult }) {
           {result.plan.rerank_error && (
             <span className="chip warn" title={result.plan.rerank_error}>
               重排不可用，已按本地排序
+            </span>
+          )}
+          {(result.plan.summary_sources ?? 0) > 0 && (
+            <span className="chip accent">
+              摘要 × {result.plan.summary_sources}
+            </span>
+          )}
+          {(result.plan.relation_sources ?? 0) > 0 && (
+            <span className="chip accent">
+              关系 × {result.plan.relation_sources}
+            </span>
+          )}
+          {(result.plan.faq_sources ?? 0) > 0 && (
+            <span className="chip accent">
+              问答 × {result.plan.faq_sources}
+            </span>
+          )}
+          {(result.plan.knowledge_pending ?? 0) > 0 && (
+            <span
+              className="chip subtle"
+              title="衍生知识（摘要/实体/FAQ）正在后台生成，生成完成后自动参与检索"
+            >
+              衍生知识生成中 · {result.plan.knowledge_pending}
             </span>
           )}
           {(result.plan.missing?.length ?? 0) > 0 && (
@@ -333,9 +359,17 @@ function AnswerCard({ result }: { result: AnswerResult }) {
   );
 }
 
+function loadingStage(seconds: number): string {
+  if (seconds < 3) return "正在检索本地资料…";
+  if (seconds < 8) return "正在匹配相关片段…";
+  if (seconds < 20) return "正在筛选证据…";
+  return "正在生成回答…";
+}
+
 export default function ChatView({ active = true }: { active?: boolean }) {
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
+  const [pendingElapsed, setPendingElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -390,6 +424,7 @@ export default function ChatView({ active = true }: { active?: boolean }) {
         apiKey: "",
         allowCloud: data.allow_cloud,
         topK: data.top_k,
+        reasoningEffort: data.reasoning_effort ?? "low",
       });
       setEmbedding(vector);
       setEmbedDraft({
@@ -474,6 +509,19 @@ export default function ChatView({ active = true }: { active?: boolean }) {
   }, [messages, loading, active]);
 
   useEffect(() => {
+    if (!loading) {
+      setPendingElapsed(0);
+      return;
+    }
+    const started = Date.now();
+    setPendingElapsed(0);
+    const timer = window.setInterval(() => {
+      setPendingElapsed(Math.floor((Date.now() - started) / 1000));
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [loading]);
+
+  useEffect(() => {
     if (!showSettings) return;
     const end = messagesEndRef.current;
     if (!end) return;
@@ -543,6 +591,18 @@ export default function ChatView({ active = true }: { active?: boolean }) {
     if (!text || loading) return;
     setLoading(true);
     setError(null);
+    setQuestion("");
+    // 先把问题放到对话里，避免等待检索/生成时界面毫无变化、像卡住了。
+    setMessages((current) => [
+      ...current,
+      {
+        message_id: `local-user-${Date.now()}`,
+        role: "user",
+        content: text,
+        created_at: new Date().toISOString(),
+        payload: null,
+      },
+    ]);
     try {
       let sessionId = activeId;
       if (!sessionId) {
@@ -553,16 +613,8 @@ export default function ChatView({ active = true }: { active?: boolean }) {
         rememberActiveSession(sessionId);
       }
       const data = await api.ask(text, { sessionId });
-      setQuestion("");
       setMessages((current) => [
         ...current,
-        {
-          message_id: `local-user-${Date.now()}`,
-          role: "user",
-          content: text,
-          created_at: new Date().toISOString(),
-          payload: null,
-        },
         {
           message_id: `local-assistant-${Date.now()}`,
           role: "assistant",
@@ -591,6 +643,7 @@ export default function ChatView({ active = true }: { active?: boolean }) {
         model: draft.model.trim(),
         allow_cloud: draft.allowCloud,
         top_k: draft.topK,
+        reasoning_effort: draft.reasoningEffort,
       };
       if (draft.apiKey.trim()) payload.api_key = draft.apiKey.trim();
       const saved = await api.saveAnswerSettings(payload);
@@ -785,6 +838,22 @@ export default function ChatView({ active = true }: { active?: boolean }) {
               }
             />
 
+            <label htmlFor="reasoning-effort">回答速度</label>
+            <select
+              id="reasoning-effort"
+              value={draft.reasoningEffort}
+              onChange={(event) =>
+                setDraft({
+                  ...draft,
+                  reasoningEffort: event.target.value as Draft["reasoningEffort"],
+                })
+              }
+            >
+              <option value="low">快速（默认，不展开推理）</option>
+              <option value="high">深入（更慢，复杂问题用）</option>
+              <option value="max">最深入（最慢）</option>
+            </select>
+
             <label htmlFor="allow-cloud">云端授权</label>
             <label className="checkbox-line" htmlFor="allow-cloud">
               <input
@@ -885,6 +954,11 @@ export default function ChatView({ active = true }: { active?: boolean }) {
               {embedSaving ? "保存中…" : "保存语义设置"}
             </button>
           </div>
+          {embedding?.last_error && (
+            <div className="alert error" style={{ marginTop: 10 }}>
+              向量生成失败：{embedding.last_error}
+            </div>
+          )}
           {embedNote && <div className="notice" style={{ marginTop: 10 }}>{embedNote}</div>}
 
           <div className="settings-divider" />
@@ -925,6 +999,18 @@ export default function ChatView({ active = true }: { active?: boolean }) {
               ) : message.payload ? (
                 <AnswerCard key={message.message_id} result={message.payload} />
               ) : null,
+            )}
+            {loading && (
+              <div className="chat-pending" role="status" aria-live="polite">
+                <div className="chat-pending-head">
+                  <span className="spinner" aria-hidden="true" />
+                  <span>{loadingStage(pendingElapsed)}</span>
+                  <span className="chat-pending-time">{pendingElapsed}s</span>
+                </div>
+                <div className="chat-pending-hint">
+                  正在本地检索证据并生成回答，通常 10–60 秒；复杂问题或模型响应慢时会更久。
+                </div>
+              </div>
             )}
             <div ref={messagesEndRef} className="chat-end" />
           </div>

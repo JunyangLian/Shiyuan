@@ -9,13 +9,16 @@ from __future__ import annotations
 import array
 import json
 import math
+import re
 import sqlite3
+import threading
 import urllib.error
 import urllib.request
 
 from . import db, secrets_store, store
 
 SETTINGS_KEY = "embedding"
+ERROR_KEY = "embedding_last_error"
 PROVIDERS = {"none", "openai", "ollama"}
 DEFAULT_SETTINGS = {
     "provider": "none",
@@ -27,6 +30,27 @@ DEFAULT_SETTINGS = {
 }
 BATCH = 32
 MAX_TEXT_CHARS = 1200
+
+# 制表符数据表按精确文本检索即可，语义向量既贵又几乎没有区分度。
+SKIP_EXTENSIONS = {"tsv"}
+_SEQUENCE_TEXT = re.compile(r"[acgtnACGTN\s\d,;._-]+")
+
+
+def _embeddable(text: str) -> tuple[bool, str | None]:
+    """判断一段正文是否值得做语义向量；返回（是否可向量化，跳过原因）。"""
+    sample = (text or "").strip()
+    if len(sample) < 5:
+        return False, "文本过短"
+    if _SEQUENCE_TEXT.fullmatch(sample):
+        return False, "序列或数字数据"
+    total = len(sample)
+    letters = sum(1 for char in sample if char.isalpha())
+    digits = sum(1 for char in sample if char.isdigit())
+    if letters / total < 0.05:
+        return False, "缺少文字"
+    if letters / total < 0.12 and digits / total > 0.25:
+        return False, "数字表格"
+    return True, None
 
 
 class EmbeddingError(RuntimeError):
@@ -60,10 +84,27 @@ def load_settings(conn: sqlite3.Connection) -> dict:
     return settings
 
 
+# ---------------------------------------------------------------- 错误可见
+
+def _set_last_error(conn: sqlite3.Connection, message: str | None) -> None:
+    if message:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (ERROR_KEY, str(message)[:500]),
+        )
+    else:
+        conn.execute("DELETE FROM app_settings WHERE key = ?", (ERROR_KEY,))
+    conn.commit()
+
+
 def public_settings(conn: sqlite3.Connection) -> dict:
     settings = load_settings(conn)
     has_key = bool(settings.pop("api_key", ""))
     settings["has_key"] = has_key
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = ?", (ERROR_KEY,)).fetchone()
+    settings["last_error"] = row["value"] if row else None
     return settings
 
 
@@ -88,6 +129,8 @@ def update_settings(conn: sqlite3.Connection, payload: dict) -> dict:
         settings["api_key"] = ""
     elif payload.get("api_key"):
         settings["api_key"] = secrets_store.protect(str(payload["api_key"]).strip())
+    # 配置已变，上一次的失败原因不再有参考价值。
+    conn.execute("DELETE FROM app_settings WHERE key = ?", (ERROR_KEY,))
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES (?, ?)"
         " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -113,16 +156,30 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float = 30.0) ->
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json", **headers})
+    box: dict = {}
+
+    def worker() -> None:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                box["body"] = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+            box["error"] = EmbeddingError(f"向量接口返回 {exc.code}：{detail}")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            box["error"] = EmbeddingError(f"无法连接向量接口：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 线程内异常必须带回主线程
+            box["error"] = EmbeddingError(f"向量接口异常：{exc}")
+
+    # 向量服务卡住时不能把整次检索拖死：超过墙钟上限直接回退词面检索。
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout + 5)
+    if thread.is_alive():
+        raise EmbeddingError("向量接口超时（超过墙钟上限）")
+    if "error" in box:
+        raise box["error"]
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:300]
-        raise EmbeddingError(f"向量接口返回 {exc.code}：{detail}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise EmbeddingError(f"无法连接向量接口：{exc}") from exc
-    try:
-        return json.loads(body)
+        return json.loads(box.get("body", ""))
     except ValueError as exc:
         raise EmbeddingError("向量接口返回了非 JSON 内容") from exc
 
@@ -184,8 +241,7 @@ def _cosine(left, right) -> float:
 
 # ---------------------------------------------------------------- 索引
 
-def _pending_chunks(conn: sqlite3.Connection, model: str, source_id: str | None,
-                    limit: int) -> list[sqlite3.Row]:
+def _pending_sql(model: str, source_id: str | None) -> tuple[str, list]:
     sql = [
         "SELECT c.chunk_id, c.text FROM chunks c",
         "JOIN content_versions v ON v.version_id = c.version_id",
@@ -194,19 +250,41 @@ def _pending_chunks(conn: sqlite3.Connection, model: str, source_id: str | None,
         "WHERE v.is_current = 1 AND l.availability = 'AVAILABLE' AND s.state = 'active'",
         "AND NOT EXISTS (SELECT 1 FROM chunk_embeddings e"
         " WHERE e.chunk_id = c.chunk_id AND e.model = ?)",
+        "AND NOT EXISTS (SELECT 1 FROM chunk_embedding_skips k"
+        " WHERE k.chunk_id = c.chunk_id AND k.model = ?)",
     ]
-    params: list = [model]
+    params: list = [model, model]
+    if SKIP_EXTENSIONS:
+        placeholders = ",".join("?" for _ in SKIP_EXTENSIONS)
+        sql.append(f"AND l.ext NOT IN ({placeholders})")
+        params.extend(sorted(SKIP_EXTENSIONS))
     if source_id:
         sql.append("AND l.source_id = ?")
         params.append(source_id)
-    sql.append(f"LIMIT {limit}")
-    return conn.execute(" ".join(sql), params).fetchall()
+    return " ".join(sql), params
+
+
+def _pending_chunks(conn: sqlite3.Connection, model: str, source_id: str | None,
+                    limit: int) -> list[sqlite3.Row]:
+    sql, params = _pending_sql(model, source_id)
+    return conn.execute(f"{sql} LIMIT {limit}", params).fetchall()
+
+
+def pending_count(conn: sqlite3.Connection, model: str | None = None,
+                  source_id: str | None = None) -> int:
+    settings = load_settings(conn)
+    model = model or settings["model"]
+    if not model:
+        return 0
+    sql, params = _pending_sql(model, source_id)
+    row = conn.execute(f"SELECT COUNT(*) FROM ({sql})", params).fetchone()
+    return int(row[0]) if row else 0
 
 
 def index_pending(conn: sqlite3.Connection, source_id: str | None = None,
                   limit: int = 400) -> dict:
     settings = load_settings(conn)
-    counters = {"available": False, "indexed": 0, "remaining": 0,
+    counters = {"available": False, "indexed": 0, "skipped": 0, "remaining": 0,
                 "model": settings["model"] or None, "message": None}
     if not enabled(settings):
         counters["message"] = "语义检索未启用"
@@ -214,15 +292,43 @@ def index_pending(conn: sqlite3.Connection, source_id: str | None = None,
     counters["available"] = True
 
     processed = 0
-    while processed < limit:
+    skipped = 0
+    scanned = 0
+    while scanned < limit:
         rows = _pending_chunks(conn, settings["model"], source_id,
-                               min(BATCH, limit - processed))
+                               min(BATCH, limit - scanned))
         if not rows:
             break
-        vectors = embed_texts(settings, [row["text"] for row in rows])
-        if len(vectors) != len(rows):
-            raise EmbeddingError("向量数量与文本数量不一致")
-        for row, vector in zip(rows, vectors):
+        scanned += len(rows)
+        embeddable = []
+        skips = []
+        for row in rows:
+            ok, reason = _embeddable(row["text"])
+            if ok:
+                embeddable.append(row)
+            else:
+                skips.append((row["chunk_id"], settings["model"], reason or "不适合向量",
+                              store.now_iso()))
+        if skips:
+            conn.executemany(
+                "INSERT INTO chunk_embedding_skips (chunk_id, model, reason, created_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(chunk_id) DO UPDATE SET model = excluded.model,"
+                " reason = excluded.reason, created_at = excluded.created_at",
+                skips)
+            conn.commit()
+            skipped += len(skips)
+        if not embeddable:
+            continue
+        try:
+            vectors = embed_texts(settings, [row["text"] for row in embeddable])
+            if len(vectors) != len(embeddable):
+                raise EmbeddingError("向量数量与文本数量不一致")
+        except EmbeddingError as exc:
+            _set_last_error(conn, str(exc))
+            raise
+        _set_last_error(conn, None)
+        for row, vector in zip(embeddable, vectors):
             conn.execute(
                 "INSERT INTO chunk_embeddings (chunk_id, model, dim, vector, updated_at)"
                 " VALUES (?, ?, ?, ?, ?)"
@@ -232,9 +338,35 @@ def index_pending(conn: sqlite3.Connection, source_id: str | None = None,
                  store.now_iso()),
             )
         conn.commit()
-        processed += len(rows)
+        processed += len(embeddable)
 
     counters["indexed"] = processed
+    counters["skipped"] = skipped
+    counters["remaining"] = len(_pending_chunks(conn, settings["model"], source_id, 1))
+    return counters
+
+
+def index_all_pending(conn: sqlite3.Connection, source_id: str | None = None,
+                      batch: int = 400) -> dict:
+    """循环补建直到没有待建 chunk；单轮 index_pending 只处理 batch 条。"""
+    settings = load_settings(conn)
+    counters = {"available": False, "indexed": 0, "skipped": 0, "remaining": 0,
+                "model": settings["model"] or None, "message": None}
+    if not enabled(settings):
+        counters["message"] = "语义检索未启用"
+        return counters
+    counters["available"] = True
+
+    total = 0
+    skipped = 0
+    while True:
+        result = index_pending(conn, source_id, limit=batch)
+        total += result["indexed"]
+        skipped += result["skipped"]
+        if result["indexed"] == 0 and result["skipped"] == 0:
+            break
+    counters["indexed"] = total
+    counters["skipped"] = skipped
     counters["remaining"] = len(_pending_chunks(conn, settings["model"], source_id, 1))
     return counters
 
@@ -261,21 +393,337 @@ def count(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0]
 
 
+def skipped_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM chunk_embedding_skips").fetchone()[0]
+
+
 # ---------------------------------------------------------------- 语义召回
+
+def _numpy_module():
+    """可选加速：有 numpy 时向量点积走 C 实现，十几秒的全库扫描降到 1~2 秒。"""
+    try:
+        import numpy  # noqa: PLC0415 - 可选依赖，缺失时回退纯 Python
+        return numpy
+    except Exception:
+        return None
+
+
+# 全库向量缓存：float32 向量在内存里太大（约 450MB），这里量化成 int8（约 112MB）。
+# 增量策略：新向量只追加到缓存尾部；删除/覆盖积累到阈值才后台压缩重建。
+_VECTOR_CACHE_LOCK = threading.RLock()
+_VECTOR_CACHE: dict = {
+    "model": None,
+    "dim": 0,
+    "ids": [],
+    "matrix": None,     # int8，预留 capacity 行，便于追加
+    "scales": None,
+    "norms": None,
+    "rows": 0,          # 矩阵里实际有效的向量行数
+    "count": 0,         # 上次同步时数据库里的向量总数
+    "max_rowid": 0,     # 已纳入缓存的最高 rowid（增量水位）
+}
+_VECTOR_REBUILD = {"running": False}
+
+_APPEND_LIMIT = 20000   # 单次追加上限，超出则交给后台整库重建
+_STALE_MIN = 2000       # 失效向量下限
+_STALE_RATIO = 0.02     # 失效向量占比阈值
+
+# 语义命中门槛：把余弦相似度换算成"这次查询自己的分布"里的 z 分数。
+# 原始相似度跨查询不可比（有的问题整体偏高），固定阈值会把无关片段也收进来。
+Z_GATE = 2.0            # 高于均值两个标准差才算语义命中
+Z_MIN_POPULATION = 200  # 向量太少时分布不稳定，退回相似度判断
+
+
+def _new_cache(model: str | None = None, dim: int = 0) -> dict:
+    return {
+        "model": model, "dim": dim, "ids": [], "matrix": None, "scales": None,
+        "norms": None, "rows": 0, "count": 0, "max_rowid": 0,
+    }
+
+
+def _vector_cache_key(conn: sqlite3.Connection, model: str) -> tuple:
+    """只查总数与 rowid 水位；MAX(updated_at) 会退化成全表扫描，约 0.6 秒。"""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(MAX(rowid), 0) AS r"
+        " FROM chunk_embeddings WHERE model = ?", (model,)).fetchone()
+    return (model, int(row["n"]), int(row["r"]))
+
+
+def _quantize(numpy, values):
+    """把 float32 向量压成 int8 + 缩放系数；零向量返回 None。"""
+    norm = float(numpy.linalg.norm(values))
+    peak = float(numpy.max(numpy.abs(values))) if values.size else 0.0
+    if norm <= 0 or peak <= 0:
+        return None
+    scale = peak / 127.0
+    quantized = numpy.rint(values / scale)
+    numpy.clip(quantized, -127, 127, out=quantized)
+    return quantized.astype(numpy.int8), scale, norm
+
+
+def _ensure_capacity(numpy, cache: dict, need: int) -> None:
+    capacity = 0 if cache["matrix"] is None else int(cache["matrix"].shape[0])
+    if capacity >= need:
+        return
+    grown = max(need, int(capacity * 1.5) + 1024)
+    matrix = numpy.empty((grown, cache["dim"]), dtype=numpy.int8)
+    scales = numpy.ones(grown, dtype=numpy.float32)
+    norms = numpy.ones(grown, dtype=numpy.float32)
+    if cache["rows"]:
+        matrix[:cache["rows"]] = cache["matrix"][:cache["rows"]]
+        scales[:cache["rows"]] = cache["scales"][:cache["rows"]]
+        norms[:cache["rows"]] = cache["norms"][:cache["rows"]]
+    cache["matrix"], cache["scales"], cache["norms"] = matrix, scales, norms
+
+
+def _append_rows(numpy, cache: dict, rows: list[sqlite3.Row]) -> int | None:
+    """把 rowid 水位之后的新向量追加进缓存；维度不一致返回 None 让调用方重建。"""
+    if not rows:
+        return cache["max_rowid"]
+    for row in rows:
+        if int(row["dim"]) != cache["dim"]:
+            return None
+        if numpy.frombuffer(row["vector"], dtype=numpy.float32).size != cache["dim"]:
+            return None
+    _ensure_capacity(numpy, cache, cache["rows"] + len(rows))
+    index = cache["rows"]
+    last_rowid = cache["max_rowid"]
+    for row in rows:
+        last_rowid = int(row["rowid"])
+        values = numpy.frombuffer(row["vector"], dtype=numpy.float32)
+        quantized = _quantize(numpy, values)
+        if quantized is None:
+            continue
+        cache["matrix"][index] = quantized[0]
+        cache["scales"][index] = quantized[1]
+        cache["norms"][index] = quantized[2]
+        cache["ids"].append(row["chunk_id"])
+        index += 1
+    cache["rows"] = index
+    return last_rowid
+
+
+def _build_cache(conn: sqlite3.Connection, model: str) -> dict | None:
+    """整库重建（只在冷启动、换模型或失效片段过多时发生）。"""
+    numpy = _numpy_module()
+    if numpy is None:
+        return None
+    key = _vector_cache_key(conn, model)
+    cache = _new_cache(model)
+    cache["count"] = key[1]
+    cache["max_rowid"] = key[2]
+    if key[1] == 0:
+        return cache
+    dim_row = conn.execute(
+        "SELECT dim FROM chunk_embeddings WHERE model = ? LIMIT 1", (model,)).fetchone()
+    if dim_row is None or not dim_row["dim"]:
+        return cache
+    cache["dim"] = int(dim_row["dim"])
+    _ensure_capacity(numpy, cache, max(1, key[1]))
+    for row in conn.execute(
+            "SELECT rowid, chunk_id, dim, vector FROM chunk_embeddings"
+            " WHERE model = ? ORDER BY rowid", (model,)):
+        if int(row["dim"]) != cache["dim"]:
+            continue
+        values = numpy.frombuffer(row["vector"], dtype=numpy.float32)
+        if values.size != cache["dim"]:
+            continue
+        quantized = _quantize(numpy, values)
+        if quantized is None:
+            continue
+        index = cache["rows"]
+        if index >= cache["matrix"].shape[0]:
+            _ensure_capacity(numpy, cache, index + 1)
+        cache["matrix"][index] = quantized[0]
+        cache["scales"][index] = quantized[1]
+        cache["norms"][index] = quantized[2]
+        cache["ids"].append(row["chunk_id"])
+        cache["rows"] = index + 1
+        cache["max_rowid"] = max(cache["max_rowid"], int(row["rowid"]))
+    return cache
+
+
+def _connection_path(conn: sqlite3.Connection) -> str | None:
+    """重建线程需要单独连接；沿用当前连接指向的数据库文件。"""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    path = row["file"] if row is not None else ""
+    return path or None
+
+
+def _start_rebuild(model: str, store_path: str | None) -> None:
+    """后台整库重建；查询继续用旧缓存，不把两秒重建塞进请求路径。"""
+    with _VECTOR_CACHE_LOCK:
+        if _VECTOR_REBUILD["running"]:
+            return
+        _VECTOR_REBUILD["running"] = True
+
+    def worker() -> None:
+        conn = None
+        try:
+            conn = db.connect(store_path) if store_path else db.connect()
+            built = _build_cache(conn, model)
+            if built is not None:
+                with _VECTOR_CACHE_LOCK:
+                    if _VECTOR_CACHE["model"] in (None, model):
+                        _VECTOR_CACHE.clear()
+                        _VECTOR_CACHE.update(built)
+        except Exception:  # noqa: BLE001 - 重建失败时下次查询会再触发
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+            with _VECTOR_CACHE_LOCK:
+                _VECTOR_REBUILD["running"] = False
+
+    threading.Thread(target=worker, daemon=True, name="embedding-rebuild").start()
+
+
+def _refresh_cache(conn: sqlite3.Connection, model: str) -> dict:
+    """确保缓存跟上数据库；新增走追加，过期片段过多才后台重建。调用方需持锁。"""
+    key = _vector_cache_key(conn, model)
+    cache = _VECTOR_CACHE
+    if (cache["model"] == model and cache["count"] == key[1]
+            and cache["max_rowid"] == key[2]):
+        return cache
+    if key[1] == 0:
+        cache.clear()
+        cache.update(_new_cache(model))
+        return cache
+    # 换模型、无缓存，或 rowid 水位回退（VACUUM 重排）时只能整库重建。
+    if cache["model"] != model or cache["matrix"] is None or key[2] < cache["max_rowid"]:
+        built = _build_cache(conn, model)
+        if built is None:
+            return cache
+        cache.clear()
+        cache.update(built)
+        return cache
+
+    added = conn.execute(
+        "SELECT COUNT(*) FROM chunk_embeddings WHERE model = ? AND rowid > ?",
+        (model, cache["max_rowid"])).fetchone()[0]
+    if added:
+        if added > _APPEND_LIMIT:
+            _start_rebuild(model, _connection_path(conn))
+            return cache
+        rows = conn.execute(
+            "SELECT rowid, chunk_id, dim, vector FROM chunk_embeddings"
+            " WHERE model = ? AND rowid > ? ORDER BY rowid",
+            (model, cache["max_rowid"])).fetchall()
+        last = _append_rows(_numpy_module(), cache, rows)
+        if last is None:
+            _start_rebuild(model, _connection_path(conn))
+            return cache
+        cache["max_rowid"] = last
+
+    # 改文件、删数据源会在库里留下失效 chunk；矩阵里的旧行先保留，超过阈值再压缩。
+    cache["count"] = _vector_cache_key(conn, model)[1]
+    stale = cache["rows"] - cache["count"]
+    if stale > max(_STALE_MIN, int(cache["count"] * _STALE_RATIO)):
+        _start_rebuild(model, _connection_path(conn))
+    return cache
+
+
+def _score_gate(numpy, similarities):
+    """把相似度换算成本次查询内的 z 分数，并按门槛筛出候选。
+
+    向量太少时分布没有参考价值，退回“相似度为正”的旧口径。
+    """
+    count = len(similarities)
+    if count == 0:
+        return []
+    if count < Z_MIN_POPULATION:
+        mean, deviation = 0.0, 1.0
+        keep = similarities > 0
+    else:
+        mean = float(similarities.mean())
+        deviation = max(float(similarities.std()), 0.02)
+        keep = (similarities - mean) / deviation >= Z_GATE
+    z_values = (similarities - mean) / max(deviation, 0.02)
+    z_values[~keep] = -numpy.inf
+    return z_values
+
+
+def _cached_scores(conn: sqlite3.Connection, model: str, query_vector: list[float],
+                   top_k: int):
+    """返回 [(similarity, z, chunk_id)]；numpy 不可用时返回 None 走原 SQL 扫描。"""
+    numpy = _numpy_module()
+    if numpy is None:
+        return None
+    with _VECTOR_CACHE_LOCK:
+        cache = _refresh_cache(conn, model)
+        rows = cache["rows"]
+        if not rows:
+            return []
+        matrix = cache["matrix"][:rows]
+        query = numpy.asarray(query_vector, dtype=numpy.float32)
+        query_norm = float(numpy.linalg.norm(query))
+        query_peak = float(numpy.max(numpy.abs(query))) if query.size else 0.0
+        if query_norm <= 0 or query_peak <= 0:
+            return []
+        query_scale = query_peak / 127.0
+        quantized = numpy.rint(query / query_scale)
+        numpy.clip(quantized, -127, 127, out=quantized)
+        quantized = quantized.astype(numpy.float32)
+        scores = numpy.empty(rows, dtype=numpy.float32)
+        # int8 矩阵分块转 float32 再乘，内存占用小，整库约 0.2 秒。
+        for start in range(0, rows, 16384):
+            block = matrix[start:start + 16384].astype(numpy.float32)
+            scores[start:start + 16384] = block @ quantized
+        scores *= (query_scale / query_norm)
+        scores /= cache["norms"][:rows]
+        scores *= cache["scales"][:rows]
+        z_values = _score_gate(numpy, scores)
+        candidates = numpy.flatnonzero(z_values > -numpy.inf)
+        if not candidates.size:
+            return []
+        take = min(len(candidates), max(1, int(top_k)))
+        if take < len(candidates):
+            picked = numpy.argpartition(-z_values[candidates], take - 1)[:take]
+            candidates = candidates[picked]
+        order = candidates[numpy.argsort(-z_values[candidates])]
+        return [(float(scores[index]), float(z_values[index]), cache["ids"][index])
+                for index in order]
+
+
+def warm_cache_async() -> None:
+    """后台预热 int8 向量缓存；有新增向量时顺带追加，不重复整库重建。"""
+    def worker() -> None:
+        conn = None
+        try:
+            conn = db.connect()
+            settings = load_settings(conn)
+            if not enabled(settings):
+                return
+            with _VECTOR_CACHE_LOCK:
+                _refresh_cache(conn, settings["model"])
+        except Exception:  # noqa: BLE001 - 预热失败不影响功能，查询时会再处理
+            return
+        finally:
+            if conn is not None:
+                conn.close()
+
+    threading.Thread(target=worker, daemon=True, name="embedding-warm").start()
+
 
 def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | None = None,
                     ext: str | None = None, top_k: int = 30) -> list[dict]:
     settings = load_settings(conn)
     if not enabled(settings):
         return []
-    query_vector = embed_texts(settings, [text])[0]
+    try:
+        query_vector = embed_texts(settings, [text])[0]
+    except EmbeddingError as exc:
+        _set_last_error(conn, str(exc))
+        raise
 
+    # 两段式：先只取 chunk_id + 向量做相似度，最后只回表取前 top_k 条的正文与路径。
     sql = [
-        "SELECT e.chunk_id, e.vector, c.text, c.page, c.sheet, c.bbox, c.asset_id, c.version_id,"
-        " l.location_id, l.path, l.mtime_ns, a.parser_signature",
+        "SELECT e.chunk_id, e.vector",
         "FROM chunk_embeddings e",
         "JOIN chunks c ON c.chunk_id = e.chunk_id",
-        "LEFT JOIN parse_artifacts a ON a.artifact_id = c.artifact_id",
         "JOIN content_versions v ON v.version_id = c.version_id",
         "JOIN asset_locations l ON l.asset_id = c.asset_id",
         "JOIN sources s ON s.source_id = l.source_id",
@@ -290,16 +738,91 @@ def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | Non
         sql.append("AND l.ext = ?")
         params.append(ext.lower().lstrip("."))
 
-    scored = []
-    for row in conn.execute(" ".join(sql), params):
-        similarity = _cosine(query_vector, _unpack(row["vector"]))
-        if similarity <= 0:
-            continue
-        scored.append((similarity, row))
-    scored.sort(key=lambda item: -item[0])
+    scored: list[tuple[float, float, str]] | None = None
+    if source_id is None and ext is None:
+        cached = _cached_scores(conn, settings["model"], query_vector, top_k * 2)
+        if cached is not None:
+            # 缓存里可能含已失效片段，回表时会过滤，所以多取一倍候选。
+            scored = cached
+    if scored is None:
+        # 带数据源/类型过滤时无法走全库缓存：同样按本次候选分布做 z 校准。
+        similarities: list[float] = []
+        chunk_ids: list[str] = []
+        numpy = _numpy_module()
+        if numpy is not None:
+            query = numpy.asarray(query_vector, dtype=numpy.float32)
+            query_norm = float(numpy.linalg.norm(query))
+            if query_norm <= 0:
+                return []
+            for row in conn.execute(" ".join(sql), params):
+                vector = numpy.frombuffer(row["vector"], dtype=numpy.float32)
+                if vector.size != query.size:
+                    continue
+                norm = float(numpy.linalg.norm(vector))
+                if norm <= 0:
+                    continue
+                similarities.append(float(numpy.dot(query, vector)) / (query_norm * norm))
+                chunk_ids.append(row["chunk_id"])
+        else:
+            for row in conn.execute(" ".join(sql), params):
+                similarities.append(_cosine(query_vector, _unpack(row["vector"])))
+                chunk_ids.append(row["chunk_id"])
+        if not similarities:
+            return []
+        if numpy is not None:
+            z_values = _score_gate(numpy, numpy.asarray(similarities, dtype=numpy.float32))
+            scored = [
+                (similarities[index], float(z_values[index]), chunk_ids[index])
+                for index in range(len(chunk_ids))
+                if z_values[index] > -numpy.inf
+            ]
+        else:
+            count = len(similarities)
+            mean = sum(similarities) / count
+            deviation = math.sqrt(sum((value - mean) ** 2 for value in similarities) / count)
+            deviation = max(deviation, 0.02)
+            threshold = mean + Z_GATE * deviation if count >= Z_MIN_POPULATION else 0.0
+            scored = [
+                (similarity, (similarity - mean) / deviation, chunk_ids[index])
+                for index, similarity in enumerate(similarities)
+                if (similarity >= threshold if count >= Z_MIN_POPULATION else similarity > 0)
+            ]
+        scored.sort(key=lambda item: (-item[1], item[2]))
+        scored = scored[:top_k]
+    if not scored:
+        return []
+
+    ids = [chunk_id for _, _, chunk_id in scored]
+    placeholders = ",".join("?" for _ in ids)
+    meta_sql = [
+        "SELECT c.chunk_id, c.text, c.page, c.sheet, c.bbox, c.asset_id, c.version_id,"
+        " l.location_id, l.path, l.mtime_ns, a.parser_signature",
+        "FROM chunks c",
+        "LEFT JOIN parse_artifacts a ON a.artifact_id = c.artifact_id",
+        "JOIN content_versions v ON v.version_id = c.version_id",
+        "JOIN asset_locations l ON l.asset_id = c.asset_id",
+        "JOIN sources s ON s.source_id = l.source_id",
+        f"WHERE c.chunk_id IN ({placeholders}) AND v.is_current = 1"
+        " AND l.availability = 'AVAILABLE' AND s.state = 'active'",
+    ]
+    meta_params: list = [*ids]
+    if source_id:
+        meta_sql.append("AND l.source_id = ?")
+        meta_params.append(source_id)
+    if ext:
+        meta_sql.append("AND l.ext = ?")
+        meta_params.append(ext.lower().lstrip("."))
+    rows: dict[str, sqlite3.Row] = {}
+    for row in conn.execute(" ".join(meta_sql), meta_params):
+        rows.setdefault(row["chunk_id"], row)
 
     hits = []
-    for similarity, row in scored[:top_k]:
+    for similarity, z_score, chunk_id in scored:
+        if len(hits) >= top_k:
+            break
+        row = rows.get(chunk_id)
+        if row is None:
+            continue
         try:
             bbox = json.loads(row["bbox"]) if row["bbox"] else None
         except (TypeError, ValueError):
@@ -314,6 +837,7 @@ def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | Non
             "sheet": row["sheet"],
             "parser_signature": row["parser_signature"] or "",
             "similarity": similarity,
+            "z": z_score,
             "version_id": row["version_id"] or "",
             "mtime_ns": row["mtime_ns"] or 0,
             "bbox": bbox,

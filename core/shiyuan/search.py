@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime
 
@@ -13,6 +14,48 @@ from . import embeddings, families, indexer, ingest, maintenance, query, retriev
 
 MAX_CANDIDATES = 5000
 SNIPPET_WIDTH = 120
+
+# 混合排序权重：词面证据按“查询概念覆盖率”给分，语义证据按本次查询的 z 分数给分。
+# 原始相似度跨查询不可比，固定加分会让弱语义命中混进结果。
+COVERAGE_WEIGHT = 90
+SEMANTIC_BASE = 60
+SEMANTIC_Z_WEIGHT = 60
+SEMANTIC_Z_CAP = 4.0
+STRONG_RATIO = 0.5
+CODE_EXTS = {
+    "py", "pl", "sh", "bat", "ps1", "js", "ts", "tsx", "jsx", "r", "java",
+    "c", "cc", "cpp", "h", "hpp", "go", "rs", "ipynb",
+}
+_CODE_QUERY = re.compile(
+    r"(脚本|代码|程序|函数|源码|命令行|code|script|function|notebook|ipynb)",
+    re.IGNORECASE,
+)
+
+
+def _is_lookup(text: str) -> bool:
+    """编号、错误码、文件名式查询：词面精确匹配比语义更可靠。"""
+    tokens = re.findall(r"[a-z0-9][a-z0-9_.\-]*", (text or "").lower())
+    if not tokens:
+        return False
+    return all(
+        any(ch.isdigit() for ch in token)
+        and (any(ch.isalpha() for ch in token) or len(token) >= 4)
+        for token in tokens
+    )
+
+
+def _compact(value: str) -> str:
+    return re.sub(r"[\s_\-]+", "", (value or "").lower())
+
+
+def _coverage(text: str, maximal: list[dict]) -> float:
+    if not maximal:
+        return 0.0
+    lowered = (text or "").lower()
+    matched = sum(
+        1 for concept in maximal
+        if any(variant in lowered for variant in concept["variants"]))
+    return matched / len(maximal)
 
 
 def _snippet(text: str, tokens: list[str]) -> str:
@@ -33,6 +76,8 @@ def _snippet(text: str, tokens: list[str]) -> str:
 def _content_hits(conn: sqlite3.Connection, text: str, analysis: dict, *,
                   source_id: str | None, ext: str | None) -> dict[str, dict]:
     hits: dict[str, dict] = {}
+    maximal = query.maximal_terms(analysis)
+    total = max(1, len(maximal))
     for hit in retrieval.find_chunks(conn, text, analysis=analysis,
                                      source_id=source_id, ext=ext):
         if hit.location_id in hits:
@@ -45,6 +90,7 @@ def _content_hits(conn: sqlite3.Connection, text: str, analysis: dict, *,
             "bbox": hit.bbox,
             "concepts": hit.concepts,
             "variants": hit.variants,
+            "coverage": hit.maximal / total,
         }
     return hits
 
@@ -110,11 +156,14 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     if not text:
-        return {"query": text, "total": 0, "items": [], "index_level": "L1",
+        return {"query": text, "total": 0, "strong": 0, "items": [], "index_level": "L1",
                 "content_hits": 0, "truncated": False, "rewritten": None,
                 "vector_used": False, "vector_model": None, "vector_error": None}
 
     analysis = query.analyze(text, synonyms=query.synonym_map(conn))
+    maximal = query.maximal_terms(analysis)
+    # 编号/文件名式查询靠精确词面，语义只会引入近义噪声。
+    lookup = _is_lookup(text)
     rewritten = analysis["core"] if analysis["core"] and analysis["core"] != text.lower() else None
     # 路径（文件夹名 + 文件名）和正文使用同一套查询概念，避免只搜正文漏掉目录信息。
     path_index = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
@@ -127,16 +176,17 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
     vector_model: str | None = None
     vector_error: str | None = None
     embed_settings = embeddings.load_settings(conn)
-    if embeddings.enabled(embed_settings):
+    if embeddings.enabled(embed_settings) and not lookup:
         try:
+            # 向量模型对自然语言整句更敏感；去掉疑问词后的关键词串反而会丢语境。
             hits = embeddings.semantic_chunks(
-                conn, analysis["core"] or text, source_id=source_id, ext=ext,
+                conn, text, source_id=source_id, ext=ext,
                 top_k=max(10, embed_settings["top_k"] * 4))
             vector_used = True
             vector_model = embed_settings["model"]
             for hit in hits:
                 current = vector_hits.get(hit["location_id"])
-                if current and current["similarity"] >= hit["similarity"]:
+                if current and current["z"] >= hit.get("z", 0.0):
                     continue
                 vector_hits[hit["location_id"]] = {
                     "snippet": _snippet(hit["text"], analysis["variants"]),
@@ -145,6 +195,8 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
                     "level": "L2" if hit["ocr"] else "L1",
                     "semantic": True,
                     "similarity": hit["similarity"],
+                    "z": hit.get("z", 0.0),
+                    "coverage": _coverage(hit["text"], maximal),
                     "bbox": hit.get("bbox"),
                 }
         except embeddings.EmbeddingError as exc:
@@ -159,9 +211,17 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
         path_match = path_index.get(location_id)
         score = path_match.score if path_match else 0
         score += retrieval.name_prior(row["path"], analysis)
-        if path_match is not None and path_match.name_matched and path_match.specific:
-            # 文件名命中主题词时补固定分，避免长文档靠正文 gram 数量压过真正的主角文件。
-            score += 240
+        if (path_match is not None and path_match.name_matched
+                and path_match.specific and path_match.name_strength >= 3
+                and path_match.concepts >= 2):
+            # 文件名命中主题词时补分，避免长文档靠正文 gram 数量压过真正的主角文件。
+            # 只命中 2 字 gram（如「染色」之于「染色体」）不算，否则染色体论文会抢走
+            # 「性染色体」的查询；命中的概念越多，越像“就是这份文件”。
+            score += 200 + 80 * min(int(path_match.concepts), 4)
+        if (not _CODE_QUERY.search(text)
+                and (row["ext"] or "").lower() in CODE_EXTS):
+            # 用户没在找代码时，脚本/源码不应压过同名的数据或文档。
+            score -= 140
         content = content_hits.get(location_id)
         semantic = vector_hits.get(location_id)
         name_matched = path_match is not None
@@ -171,8 +231,17 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
             score += 150
             score += 30 * int(content.get("concepts", 0))
             score += 4 * int(content.get("variants", 0))
+            # 覆盖率奖励“问题里的概念被答全了”，而不是某个词重复很多次。
+            coverage = float(content.get("coverage") or 0.0)
+            score += int(COVERAGE_WEIGHT * coverage ** 1.5)
         if semantic:
-            score += 120 + int(semantic["similarity"] * 100)
+            z_score = max(0.0, min(float(semantic.get("z") or 0.0), SEMANTIC_Z_CAP))
+            score += SEMANTIC_BASE + int(SEMANTIC_Z_WEIGHT * z_score)
+        if lookup:
+            name = row["path"].rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+            core = _compact(analysis["core"])
+            if core and core in _compact(name):
+                score += 400
         merged = content
         if semantic:
             merged = dict(content or semantic)
@@ -198,9 +267,14 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
             aggregated.append((*entries[0], family_id))
         scored = sorted(
             aggregated, key=lambda item: (-item[0], -item[1]["mtime_ns"]))
+    # 与最高分差距过大的结果只是“沾边”，单独标记，前端/外部调用可以折叠。
+    strong = len(scored)
+    if scored and scored[0][0] > 0:
+        top = scored[0][0]
+        strong = sum(1 for entry in scored if entry[0] >= top * STRONG_RATIO)
     window = scored[offset: offset + limit]
     items = []
-    for entry in window:
+    for index, entry in enumerate(window):
         _, row, match, content = entry[:4]
         family = family_info.get(row["asset_id"])
         path_match = path_index.get(row["location_id"])
@@ -208,12 +282,14 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
             row, match=match, content=content, family=family,
             matched_folder=path_match.folder if path_match else None,
         )
+        item["weak"] = offset + index >= strong
         if len(entry) == 5:
             item["family_versions"] = families.family_members(conn, entry[4])
         items.append(item)
     return {
         "query": text,
         "total": len(scored),
+        "strong": strong,
         "items": items,
         "index_level": "L1",
         "content_hits": len(content_hits),

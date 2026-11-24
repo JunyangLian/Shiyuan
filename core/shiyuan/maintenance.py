@@ -11,9 +11,9 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from . import budget, db, embeddings, indexer, scanner, store
+from . import budget, db, embeddings, indexer, knowledge, scanner, store
 
-ACTIONS = {"reindex", "retry", "ocr", "cleanup", "embed"}
+ACTIONS = {"reindex", "retry", "ocr", "cleanup", "embed", "knowledge"}
 
 _state = {"running": False, "kind": None, "source_id": None,
           "message": None, "started_at": None}
@@ -48,6 +48,14 @@ def _run(kind: str, source_id: str | None, store_path) -> None:
         targets = [source_id] if source_id else [
             row["source_id"] for row in rows if row["state"] == "active"
         ]
+        if kind == "knowledge":
+            # 衍生知识队列不按数据源划分，直接跑一轮。
+            result = knowledge.run_round(conn)
+            store.log_event(conn, "maintenance_knowledge", source_id,
+                            detail=json.dumps(result, ensure_ascii=False),
+                            outcome="ok")
+            conn.commit()
+            return
         totals = {"sources": 0, "artifacts": 0, "chunks": 0, "requeued": 0,
                   "indexed": 0, "failed": 0, "skipped": 0}
         for target in targets:
@@ -148,7 +156,9 @@ def _apply(conn: sqlite3.Connection, kind: str, source_id: str) -> dict:
         return {"artifacts": removed, "requeued": removed,
                 "indexed": l1["indexed"] + l2["indexed"]}
     if kind == "embed":
-        result = embeddings.index_pending(conn, source_id)
+        result = embeddings.index_all_pending(conn, source_id)
+        if not result.get("available"):
+            return {"indexed": 0, "skipped": 1}
         return {"indexed": result["indexed"]}
     # cleanup：只清理不再属于当前版本的缓存
     ids = []
@@ -167,8 +177,12 @@ def _apply(conn: sqlite3.Connection, kind: str, source_id: str) -> dict:
         " (SELECT version_id FROM content_versions)")
     conn.execute(
         "DELETE FROM chunk_embeddings WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks)")
+    conn.execute(
+        "DELETE FROM chunk_embedding_skips"
+        " WHERE chunk_id NOT IN (SELECT chunk_id FROM chunks)")
     conn.commit()
-    return {"artifacts": removed}
+    knowledge_removed = knowledge.cleanup_orphans(conn)
+    return {"artifacts": removed, **knowledge_removed}
 
 
 def stats(conn: sqlite3.Connection) -> dict:
@@ -197,5 +211,7 @@ def stats(conn: sqlite3.Connection) -> dict:
         "running": running_info(),
         "budget": budget.info(conn),
         "vectors": embeddings.count(conn),
+        "vector_skipped": embeddings.skipped_count(conn),
         "embedding": embeddings.public_settings(conn),
+        "knowledge": knowledge.stats(conn),
     }

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import budget, db, extractors, ingest, inventory, ocr, store
+from . import budget, db, extractors, ingest, inventory, knowledge, ocr, store
 
 # 解析器与切块策略的版本签名；改动提取逻辑或分块参数时必须同步升级。
 PARSER_SIGNATURE = (
@@ -226,6 +226,10 @@ def index_version(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
                     page_count=page_count, text_pages=text_pages,
                     image_count=image_count)
     _job_update(conn, row, "l1", "done" if state != "failed" else "failed", error=message)
+    if state == "ok":
+        # 解析完成即入队：文档级摘要（OCR 阶段完成时会再次重置任务，
+        # 用合并后的完整内容重新生成）。
+        knowledge.enqueue(conn, "summary", "document", row["asset_id"])
     return state
 
 
@@ -616,6 +620,8 @@ def index_ocr_version(conn: sqlite3.Connection, row, engine: str | None = None) 
     _write_artifact(conn, row, state=state, quality=quality, sections=sections,
                     message=message, chunks=chunks, signature=signature)
     _job_update(conn, row, "l2", "done" if state != "failed" else "failed", error=message)
+    if state == "ok":
+        knowledge.enqueue(conn, "summary", "document", row["asset_id"])
     return state
 
 
@@ -782,6 +788,31 @@ def retry_job(conn: sqlite3.Connection, job_id: str) -> dict:
     return {"job_id": job_id, "stage": job["stage"], "state": state}
 
 
+def _classify_parse(row: sqlite3.Row) -> tuple[str, str | None]:
+    """把一个文件的解析产物归为 成功/失败/占用/无文本/不支持/待处理。"""
+    ext = (row["ext"] or "").lower()
+    supported = extractors.is_supported(ext)
+    ocr_ext = ext in ocr.OCR_EXTS
+    l1_state = row["l1_state"]
+    l1_chars = int(row["char_count"] or 0)
+
+    if (l1_state == "ok" and l1_chars > 0) or row["ocr_ok"]:
+        if l1_state == "ok" and l1_chars > 0 and row["ocr_ok"]:
+            return "ok", "L1+L2"
+        if l1_state == "ok" and l1_chars > 0:
+            return "ok", "L1"
+        return "ok", "L2"
+    if row["error"] or l1_state == "failed" or row["ocr_failed"]:
+        return "failed", "L2" if row["job_stage"] == "l2" or row["ocr_failed"] else "L1"
+    if l1_state == "locked" or row["ocr_locked"]:
+        return "locked", "L2" if row["ocr_locked"] else "L1"
+    if l1_state == "empty" or row["ocr_empty"] or (l1_state == "ok" and l1_chars == 0):
+        return "empty", "L1"
+    if not supported and not ocr_ext:
+        return "unsupported", None
+    return "pending", None
+
+
 def parse_results(conn: sqlite3.Connection, source_id: str, *,
                   status: str | None = None, limit: int = 100,
                   offset: int = 0) -> dict:
@@ -822,35 +853,8 @@ def parse_results(conn: sqlite3.Connection, source_id: str, *,
     items: list[dict] = []
     for row in rows:
         ext = (row["ext"] or "").lower()
-        supported = extractors.is_supported(ext)
-        ocr_ext = ext in ocr.OCR_EXTS
-        l1_state = row["l1_state"]
         l1_chars = int(row["char_count"] or 0)
-
-        if (l1_state == "ok" and l1_chars > 0) or row["ocr_ok"]:
-            item_status = "ok"
-            if l1_state == "ok" and l1_chars > 0 and row["ocr_ok"]:
-                stage = "L1+L2"
-            elif l1_state == "ok" and l1_chars > 0:
-                stage = "L1"
-            else:
-                stage = "L2"
-        elif row["error"] or l1_state == "failed" or row["ocr_failed"]:
-            item_status = "failed"
-            stage = "L2" if row["job_stage"] == "l2" or row["ocr_failed"] else "L1"
-        elif l1_state == "locked" or row["ocr_locked"]:
-            item_status = "locked"
-            stage = "L2" if row["ocr_locked"] else "L1"
-        elif l1_state == "empty" or row["ocr_empty"] or (l1_state == "ok" and l1_chars == 0):
-            item_status = "empty"
-            stage = "L1"
-        elif not supported and not ocr_ext:
-            item_status = "unsupported"
-            stage = None
-        else:
-            item_status = "pending"
-            stage = None
-
+        item_status, stage = _classify_parse(row)
         counts[item_status] += 1
         items.append({
             "location_id": row["location_id"],
@@ -893,6 +897,46 @@ def parse_results(conn: sqlite3.Connection, source_id: str, *,
         "limit": max(1, min(limit, 500)),
         "offset": start,
         "generated_at": store.now_iso(),
+    }
+
+
+def parse_progress(conn: sqlite3.Connection, source_id: str) -> dict:
+    """数据源的深度解析进度：只统计文件数，供数据源卡片上的进度条使用。"""
+    rows = conn.execute(
+        "SELECT l.ext, a.state AS l1_state, a.char_count, j.stage AS job_stage, j.error,"
+        " o.ocr_ok, o.ocr_failed, o.ocr_locked, o.ocr_empty"
+        " FROM content_versions v"
+        " JOIN asset_locations l ON l.asset_id = v.asset_id"
+        " LEFT JOIN parse_artifacts a ON a.version_id = v.version_id"
+        "  AND a.parser_signature = ?"
+        " LEFT JOIN index_jobs j ON j.job_id = ("
+        "   SELECT j2.job_id FROM index_jobs j2"
+        "   WHERE j2.version_id = v.version_id AND j2.status = 'failed'"
+        "   ORDER BY j2.updated_at DESC LIMIT 1)"
+        " LEFT JOIN ("
+        "   SELECT version_id,"
+        "    MAX(CASE WHEN state = 'ok' THEN 1 ELSE 0 END) AS ocr_ok,"
+        "    MAX(CASE WHEN state = 'failed' THEN 1 ELSE 0 END) AS ocr_failed,"
+        "    MAX(CASE WHEN state = 'locked' THEN 1 ELSE 0 END) AS ocr_locked,"
+        "    MAX(CASE WHEN state = 'empty' THEN 1 ELSE 0 END) AS ocr_empty"
+        "   FROM parse_artifacts WHERE parser_signature LIKE 'l2.%'"
+        "   GROUP BY version_id) o ON o.version_id = v.version_id"
+        " WHERE v.is_current = 1 AND l.source_id = ?"
+        "  AND l.availability = 'AVAILABLE'",
+        (PARSER_SIGNATURE, source_id),
+    ).fetchall()
+    counts = {key: 0 for key in ("ok", "failed", "empty", "pending", "locked", "unsupported")}
+    for row in rows:
+        status, _ = _classify_parse(row)
+        counts[status] += 1
+    return {
+        "total": len(rows),
+        "parsed": counts["ok"],
+        "failed": counts["failed"],
+        "empty": counts["empty"],
+        "pending": counts["pending"],
+        "locked": counts["locked"],
+        "unsupported": counts["unsupported"],
     }
 
 

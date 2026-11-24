@@ -52,6 +52,8 @@ _PRECISION = re.compile(
     r"(参数|数值|是多少|多少|哪个软件|哪种软件|什么软件|版本号|日期|作者"
     r"|基因名|编号|阈值|浓度|剂量|比例|哪一年|什么时候|是谁)")
 _EXPLAIN = re.compile(r"(介绍|是什么|原理|机制|区别|为什么|怎么|如何|解释|含义|作用)")
+# 「X 和 Y 什么关系 / 有什么联系 / 之间有什么区别」→ 关系层检索提示。
+_RELATION = re.compile(r"(关系|关联|联系|之间|相通|异同|异同点)")
 
 
 @dataclass
@@ -59,11 +61,13 @@ class Plan:
     mode: Mode
     facets: list[str] = field(default_factory=list)
     reason: str = ""
+    intent_hint: str | None = None
 
     def as_dict(self) -> dict:
         return {
             "intent": self.mode.key,
             "label": self.mode.label,
+            "intent_hint": self.intent_hint,
             "budget": self.mode.budget,
             "per_family": self.mode.per_family,
             "per_asset": self.mode.per_asset,
@@ -84,6 +88,9 @@ def _facet_terms(analysis: dict) -> list[str]:
         for chunk in re.split(r"\s+|的", part):
             chunk = re.sub(r"(?:里面?|里边?|中|内)$", "", chunk.strip())
             if not (2 <= len(chunk) <= 6):
+                continue
+            # 追问词（那/这/它/还有…）不是覆盖目标，交给上下文锚点即可。
+            if re.match(r"^(?:那|这|它|该|其|上述|上面|还有|另外|然后|接着|所以)", chunk):
                 continue
             if chunk in query.STOP_TERMS or retrieval.is_generic_term(chunk):
                 continue
@@ -106,4 +113,6 @@ def make(question: str, analysis: dict | None = None) -> Plan:
     elif _PRECISION.search(text):
         mode, reason = MODES["precision"], "问题在找一个具体事实"
 
-    return Plan(mode=mode, facets=_facet_terms(analysis), reason=reason)
+    intent_hint = "relation" if _RELATION.search(text) else None
+    return Plan(mode=mode, facets=_facet_terms(analysis), reason=reason,
+                intent_hint=intent_hint)

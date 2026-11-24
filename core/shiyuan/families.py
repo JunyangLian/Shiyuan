@@ -22,7 +22,7 @@ import threading
 from collections import Counter
 from pathlib import Path
 
-from . import db, indexer, inventory, store
+from . import db, indexer, inventory, knowledge, store
 
 RULES_VERSION = "family.v1"
 TEXT_LIMIT = 20_000
@@ -304,6 +304,7 @@ def rebuild(conn: sqlite3.Connection) -> dict:
     conn.execute("DELETE FROM document_families")
     family_count = 0
     member_count = 0
+    family_ids: list[str] = []
     for members in clusters.values():
         if len(members) < 2 or len(members) > MAX_FAMILY_SIZE:
             continue
@@ -358,6 +359,7 @@ def rebuild(conn: sqlite3.Connection) -> dict:
             )
             member_count += 1
         _build_content_groups(conn, family_id, members, now)
+        family_ids.append(family_id)
         family_count += 1
 
     conn.execute(
@@ -371,6 +373,9 @@ def rebuild(conn: sqlite3.Connection) -> dict:
         }, ensure_ascii=False)),
     )
     conn.commit()
+    # 家族重建完成即入队：家族级摘要（zeroth/层级综合层的输入）。
+    for family_id in family_ids:
+        knowledge.enqueue(conn, "summary", "family", family_id)
     return {
         "families": family_count,
         "members": member_count,
@@ -703,10 +708,18 @@ def diff_versions(conn: sqlite3.Connection, family_id: str, left_asset_id: str,
     }
 
 
-def dedupe_chunk_hits(conn: sqlite3.Connection, hits: list) -> list:
+def dedupe_chunk_hits(conn: sqlite3.Connection, hits: list, *,
+                      path_only: bool = False) -> list:
     """按家族和段落内容去重：重复段落合并，各版本独有段落保留。"""
     if not hits:
         return hits
+
+    def sort_key(hit) -> tuple:
+        # 位置问题按完整路径分排序；其它问题保留原来的 300 分上限。
+        path_score = hit.path_score if path_only else min(hit.path_score, 300)
+        return (-(hit.focus * 120 + hit.maximal * 10 + path_score),
+                -hit.concepts, -hit.variants, -len(hit.text))
+
     mapping = family_map(conn)
     groups: dict[tuple, list] = {}
     for hit in hits:
@@ -717,12 +730,7 @@ def dedupe_chunk_hits(conn: sqlite3.Connection, hits: list) -> list:
 
     deduped = []
     for group_hits in groups.values():
-        group_hits.sort(key=lambda hit: (
-            -(hit.focus * 120 + hit.maximal * 10 + min(hit.path_score, 300)),
-            -hit.concepts,
-            -hit.variants,
-            -len(hit.text),
-        ))
+        group_hits.sort(key=sort_key)
         representative = group_hits[0]
         representative.focus = max(getattr(hit, "focus", 0) for hit in group_hits)
         info = mapping.get(representative.asset_id)
@@ -746,12 +754,7 @@ def dedupe_chunk_hits(conn: sqlite3.Connection, hits: list) -> list:
             })
         representative.sources = sources
         deduped.append(representative)
-    deduped.sort(key=lambda hit: (
-        -(hit.focus * 120 + hit.maximal * 10 + min(hit.path_score, 300)),
-        -hit.concepts,
-        -hit.variants,
-        -len(hit.text),
-    ))
+    deduped.sort(key=sort_key)
     return deduped
 
 

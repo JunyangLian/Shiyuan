@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <title>拾源</title>
+  <rect width="64" height="64" rx="16" fill="#533AFD"/>
+  <g stroke="#FFFFFF" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 提手旁：向上的挑画象征从原位置拾取资料。 -->
+    <path d="M12.5 25H25.5M20.5 15V45.5C20.5 47.5 19.5 48.5 17.5 48.5H15M12 40L27 33.5"/>
+    <!-- 合：人字形屋顶与方形“口”表达资料汇聚、各归其位。 -->
+    <path d="M29 27L40 15L52 27M34 29.5H47M33.5 37H48V48H33.5V37Z"/>
+  </g>
+</svg>

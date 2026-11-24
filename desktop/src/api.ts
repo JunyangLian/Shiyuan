@@ -23,6 +23,16 @@ export interface SourceStats {
   last_run: ScanRun | null;
 }
 
+export interface SourceParseProgress {
+  total: number;
+  parsed: number;
+  failed: number;
+  empty: number;
+  pending: number;
+  locked: number;
+  unsupported: number;
+}
+
 export interface Source {
   source_id: string;
   root_uri: string;
@@ -33,6 +43,7 @@ export interface Source {
   l0_completed_at: string | null;
   excludes: string;
   stats: SourceStats;
+  parse: SourceParseProgress;
   scanning: boolean;
 }
 
@@ -61,6 +72,7 @@ export interface SearchItem {
   family_title?: string;
   version_label?: string | null;
   matched_folder?: string | null;
+  weak?: boolean;
   family_versions?: {
     asset_id: string;
     location_id: string | null;
@@ -74,6 +86,7 @@ export interface SearchItem {
 export interface SearchResponse {
   query: string;
   total: number;
+  strong: number;
   items: SearchItem[];
   index_level: string;
   content_hits: number;
@@ -117,8 +130,11 @@ export interface MaintenanceInfo {
     l1_limit: number;
     l2_used: number;
     l2_limit: number;
+    knowledge_used: number;
+    knowledge_limit: number;
   };
   vectors: number;
+  vector_skipped?: number;
   embedding: {
     provider: "none" | "openai" | "ollama";
     base_url: string;
@@ -126,6 +142,25 @@ export interface MaintenanceInfo {
     allow_cloud: boolean;
     top_k: number;
     has_key: boolean;
+    last_error: string | null;
+  };
+  knowledge: {
+    summaries: number;
+    entities: number;
+    relations: number;
+    questions: number;
+    pending: number;
+    failed: number;
+    jobs: Record<string, number>;
+    budget: {
+      date: string;
+      l1_used: number;
+      l1_limit: number;
+      l2_used: number;
+      l2_limit: number;
+      knowledge_used: number;
+      knowledge_limit: number;
+    };
   };
 }
 
@@ -421,6 +456,7 @@ export interface Citation {
 export interface RetrievalPlan {
   intent: string;
   label: string;
+  intent_hint?: string | null;
   budget: number;
   per_family: number;
   per_asset: number;
@@ -438,6 +474,12 @@ export interface RetrievalPlan {
   rerank_kept?: number;
   rerank_empty?: boolean;
   rerank_error?: string | null;
+  knowledge_used?: number;
+  summary_sources?: number;
+  relation_sources?: number;
+  faq_sources?: number;
+  knowledge_pending?: number;
+  knowledge_error?: number;
 }
 
 export interface AnswerResult {
@@ -484,6 +526,8 @@ export interface AnswerSettings {
   model: string;
   allow_cloud: boolean;
   top_k: number;
+  reasoning_effort?: "low" | "high" | "max";
+  max_tokens?: number;
   has_key: boolean;
 }
 
@@ -494,6 +538,7 @@ export interface EmbeddingSettings {
   allow_cloud: boolean;
   top_k: number;
   has_key: boolean;
+  last_error: string | null;
 }
 
 export interface QuerySettings {
@@ -857,7 +902,7 @@ export const api = {
     request<ExternalTestResult>(`/api/external/clients/${id}/test`, { method: "POST" }),
   events: (limit = 30) => request<{ items: MaintenanceEvent[] }>(`/api/events?limit=${limit}`),
   maintenance: (
-    action: "reindex" | "retry" | "ocr" | "cleanup" | "embed",
+    action: "reindex" | "retry" | "ocr" | "cleanup" | "embed" | "knowledge",
     sourceId?: string,
   ) =>
     request<{ kind: string }>(

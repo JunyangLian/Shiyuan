@@ -5,7 +5,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from shiyuan import db, indexer, maintenance, ocr, scanner, search, store
+from shiyuan import (db, embeddings, indexer, maintenance, ocr, scanner,
+                     search, store)
 
 
 @pytest.fixture()
@@ -148,6 +149,34 @@ def test_stats_reports_cache_and_db_size(conn, tmp_path):
     assert info["running"]["running"] is False
 
 
+def test_stats_reports_knowledge_fields(conn, tmp_path):
+    _, source_id = _source(conn, tmp_path, {"记录.md": "样本量 42\n"})
+    scanner.scan_source(conn, source_id)
+    indexer.index_pending(conn, source_id)
+
+    info = search.stats(conn)["maintenance"]
+    assert "knowledge" in info
+    assert info["knowledge"]["summaries"] == 0
+    assert info["knowledge"]["pending"] >= 1
+    assert info["budget"]["knowledge_limit"] >= 0
+
+
+def test_embed_action_rebuilds_all_vectors(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    monkeypatch.setattr(embeddings, "embed_texts",
+                        lambda settings, texts: [[0.1, 0.2] for _ in texts])
+    _, source_id = _source(conn, tmp_path, {
+        "a.md": "样本量 42\n", "b.md": "样本量 43\n", "c.md": "样本量 44\n",
+    })
+    scanner.scan_source(conn, source_id)
+    indexer.index_pending(conn, source_id)
+
+    result = maintenance._apply(conn, "embed", source_id)
+
+    assert result["indexed"] == 3
+    assert embeddings.count(conn) == 3
+
+
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("SHIYUAN_HOME", str(tmp_path / "apphome"))
@@ -189,6 +218,11 @@ def test_api_maintenance_actions(client, tmp_path):
 
     assert client.post("/api/maintenance/cleanup").status_code == 202
     _wait_maintenance(client)
+
+    assert client.post("/api/maintenance/knowledge").status_code == 202
+    _wait_maintenance(client)
+    info = client.get("/api/stats").json()["maintenance"]
+    assert "knowledge" in info
 
     events = client.get("/api/events", params={"limit": 20}).json()["items"]
     assert any(event["type"].startswith("maintenance_") for event in events)

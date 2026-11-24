@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
+import logoMark from "./assets/shiyuan-mark.svg";
 import ChatView from "./views/ChatView";
 import LibraryView from "./views/LibraryView";
 import ExternalView from "./views/ExternalView";
@@ -59,7 +60,7 @@ export default function App() {
     <div className={`app${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark" title="拾源">拾</span>
+          <img className="brand-mark" src={logoMark} alt="拾源" title="拾源" />
           <div className="brand-text">
             <div className="brand-name">拾源</div>
             <div className="brand-sub">原位知识工作台</div>

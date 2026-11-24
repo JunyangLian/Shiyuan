@@ -68,3 +68,12 @@ def daily_ocr_budget() -> int:
     except ValueError:
         value = 200
     return value if value > 0 else 10 ** 9
+
+
+def daily_knowledge_budget() -> int:
+    """每日衍生知识生成（摘要/实体/FAQ）次数上限；0 表示不限制。"""
+    try:
+        value = int(os.environ.get("SHIYUAN_DAILY_KNOWLEDGE_BUDGET", "200"))
+    except ValueError:
+        value = 200
+    return value if value > 0 else 10 ** 9

@@ -16,6 +16,21 @@ def conn(tmp_path):
     connection.close()
 
 
+@pytest.fixture(autouse=True)
+def _reset_vector_cache():
+    """向量缓存是模块级状态，测试之间必须清空，避免不同数据库之间串数据。"""
+    with embeddings._VECTOR_CACHE_LOCK:
+        embeddings._VECTOR_CACHE.clear()
+        embeddings._VECTOR_CACHE.update(embeddings._new_cache())
+    yield
+    deadline = time.time() + 3
+    while time.time() < deadline and embeddings._VECTOR_REBUILD["running"]:
+        time.sleep(0.02)
+    with embeddings._VECTOR_CACHE_LOCK:
+        embeddings._VECTOR_CACHE.clear()
+        embeddings._VECTOR_CACHE.update(embeddings._new_cache())
+
+
 def _source(conn, tmp_path, files: dict[str, str]):
     root = tmp_path / "资料"
     root.mkdir(exist_ok=True)
@@ -76,6 +91,50 @@ def test_question_tail_does_not_block_content_search(conn, tmp_path):
 
     assert hits["total"] == 1
     assert hits["rewritten"] == "样本量"
+
+
+def test_two_letter_tokens_only_match_standalone_words(conn, tmp_path):
+    _source(conn, tmp_path, {
+        "different.md": "different coffee filter notes without any model\n",
+        "回归.md": "POOL FE RE 三种面板回归模型，FE 与 RE 通过 Hausman 检验。",
+    })
+
+    hits = search.search(conn, "FE RE")
+
+    names = [item["name"] for item in hits["items"]]
+    assert "回归.md" in names
+    assert "different.md" not in names
+
+
+def test_short_gram_in_filename_does_not_hijack_topic_query(conn, tmp_path):
+    _source(conn, tmp_path, {
+        "染色体水平基因组组装.md": "褐蓝子鱼染色体水平基因组组装，统计 Chr01 至 Chr16。",
+        "性染色体说明.md": "性染色体是控制性别分化的核心区域，包含 XY 与 ZW 两种系统。",
+    })
+
+    hits = search.search(conn, "性染色体")
+
+    assert hits["items"][0]["name"] == "性染色体说明.md"
+
+
+def test_path_followup_prefers_topic_result_file(conn, tmp_path):
+    root = tmp_path / "黄姑鱼小课题"
+    bsa = root / "bsa"
+    bsa.mkdir(parents=True)
+    (bsa / "BSA_Result_Strict.txt").write_text(
+        "Chrom\tPos\tRef\tAlt\nSuperscaffold1\t73571\tC\tG\n", encoding="utf-8")
+    (root / "draw_bsa.py").write_text("print('画图')\n", encoding="utf-8")
+    other = tmp_path / "其他项目"
+    other.mkdir()
+    (other / "machine_results.csv").write_text("result,output\n1,2\n", encoding="utf-8")
+    source = store.add_source(conn, root.parent)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    hits = answer.retrieve(conn, "黄姑鱼 结果文件放在哪个目录", limit=3, path_only=True)
+
+    assert hits
+    assert hits[0].name == "BSA_Result_Strict.txt"
 
 
 def test_search_matches_folder_and_file_names(conn, tmp_path):
@@ -158,6 +217,153 @@ def test_vector_index_builds_and_counts(conn, tmp_path, monkeypatch):
     assert result["indexed"] == 2
     assert result["remaining"] == 0
     assert embeddings.count(conn) == 2
+
+
+def test_embeddable_heuristic_skips_numeric_tables():
+    assert embeddings._embeddable("样本量 42 例，测序深度 30x")[0]
+    numeric, reason = embeddings._embeddable("1\t2\t3\n" * 60)
+    assert numeric is False and reason
+    assert embeddings._embeddable("ACGTACGT" * 60)[0] is False
+
+
+def test_index_pending_records_skipped_chunks(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    monkeypatch.setattr(embeddings, "embed_texts", lambda settings, texts: _fake_vectors(texts))
+    _source(conn, tmp_path, {"数值.txt": "1\t2\t3\n" * 60, "说明.md": "样本量 42\n"})
+
+    result = embeddings.index_pending(conn)
+
+    assert result["indexed"] >= 1
+    assert result["skipped"] >= 1
+    assert embeddings.skipped_count(conn) >= 1
+    pending = embeddings._pending_chunks(conn, "fake-embed", None, 50)
+    assert all("数值" not in row["text"] for row in pending)
+
+
+def test_tsv_is_not_scheduled_for_vectors(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    monkeypatch.setattr(embeddings, "embed_texts", lambda settings, texts: _fake_vectors(texts))
+    _source(conn, tmp_path, {"数据.tsv": "a\tb\n1\t2\n" * 60})
+
+    result = embeddings.index_pending(conn)
+
+    assert result["indexed"] == 0
+    assert result["skipped"] == 0
+    assert embeddings.pending_count(conn, "fake-embed") == 0
+
+
+def test_vector_cache_appends_new_rows_without_rebuild(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    monkeypatch.setattr(embeddings, "embed_texts", lambda settings, texts: _fake_vectors(texts))
+    root, source_id = _source(conn, tmp_path, {"a.md": "样本量 42\n"})
+    embeddings.index_pending(conn)
+
+    builds = []
+    original = embeddings._build_cache
+    monkeypatch.setattr(
+        embeddings, "_build_cache",
+        lambda c, m: builds.append(m) or original(c, m))
+
+    embeddings.semantic_chunks(conn, "样本量", top_k=5)
+    assert builds == ["fake-embed"]
+    before = embeddings._vector_cache_key(conn, "fake-embed")
+
+    (root / "b.md").write_text("深海鱼调查记录\n", encoding="utf-8")
+    scanner.scan_source(conn, source_id)
+    indexer.index_pending(conn, source_id)
+    embeddings.index_pending(conn)
+    hits = embeddings.semantic_chunks(conn, "海洋生物", top_k=5)
+
+    # 新向量只追加，没有再次整库重建。
+    assert builds == ["fake-embed"]
+    assert embeddings._VECTOR_CACHE["rows"] == 2
+    assert any("深海鱼" in hit["text"] for hit in hits)
+    after = embeddings._vector_cache_key(conn, "fake-embed")
+    assert after[1] == before[1] + 1
+    assert after[2] > before[2]
+
+
+def test_vector_cache_resets_when_all_vectors_removed(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    monkeypatch.setattr(embeddings, "embed_texts", lambda settings, texts: _fake_vectors(texts))
+    _source(conn, tmp_path, {"a.md": "样本量 42\n"})
+    embeddings.index_pending(conn)
+    assert embeddings.semantic_chunks(conn, "样本量", top_k=5)
+
+    embeddings.clear(conn)
+
+    assert embeddings.semantic_chunks(conn, "样本量", top_k=5) == []
+    assert embeddings._VECTOR_CACHE["rows"] == 0
+
+
+def test_vector_cache_compacts_after_mass_delete(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    monkeypatch.setattr(embeddings, "embed_texts", lambda settings, texts: _fake_vectors(texts))
+    _source(conn, tmp_path, {
+        "a.md": "样本量 42\n",
+        "b.md": "深海鱼调查\n",
+        "c.md": "样本量 48\n",
+    })
+    embeddings.index_pending(conn)
+    assert embeddings._VECTOR_CACHE["rows"] == 0
+
+    embeddings.semantic_chunks(conn, "样本量", top_k=5)
+    assert embeddings._VECTOR_CACHE["rows"] == 3
+
+    monkeypatch.setattr(embeddings, "_STALE_MIN", 0)
+    monkeypatch.setattr(embeddings, "_STALE_RATIO", 0.0)
+    conn.execute(
+        "DELETE FROM chunk_embeddings WHERE rowid IN"
+        " (SELECT rowid FROM chunk_embeddings ORDER BY rowid LIMIT 2)")
+    conn.commit()
+
+    assert embeddings.semantic_chunks(conn, "样本量", top_k=5)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not embeddings._VECTOR_REBUILD["running"] and embeddings._VECTOR_CACHE["rows"] == 1:
+            break
+        time.sleep(0.02)
+
+    assert embeddings._VECTOR_CACHE["rows"] == 1
+    assert embeddings._VECTOR_CACHE["count"] == 1
+
+
+def test_cross_language_synonym_matches_english_filename(conn, tmp_path):
+    _source(conn, tmp_path, {
+        "All_Perfect_Markers.txt": "marker,chr,pos\n",
+        "实验说明.md": "样本量 42\n",
+    })
+
+    hits = search.search(conn, "完美标记")
+
+    assert hits["items"][0]["name"] == "All_Perfect_Markers.txt"
+
+
+def test_lookup_query_skips_semantic(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    called = []
+    monkeypatch.setattr(
+        embeddings, "semantic_chunks",
+        lambda *args, **kwargs: called.append(1) or [])
+    _source(conn, tmp_path, {"TRX50记录.md": "TRX50 样本量 42\n"})
+
+    hits = search.search(conn, "TRX50")
+
+    assert hits["vector_used"] is False
+    assert called == []
+    assert hits["items"][0]["name"] == "TRX50记录.md"
+
+
+def test_search_marks_weak_results(conn, tmp_path):
+    files = {f"报告{i}.md": "样本量 42\n" for i in range(3)}
+    files["总览.md"] = "样本量 42\n" * 3
+    _source(conn, tmp_path, files)
+
+    result = search.search(conn, "样本量")
+
+    assert 1 <= result["strong"] <= result["total"]
+    flags = [item["weak"] for item in result["items"]]
+    assert flags == sorted(flags)
 
 
 def test_semantic_only_hit_is_merged_into_search(conn, tmp_path, monkeypatch):
@@ -249,6 +455,32 @@ def test_api_embed_rejects_when_disabled(client):
     assert client.post("/api/maintenance/embed").status_code == 400
 
 
+def test_english_stopwords_are_not_search_terms():
+    """英文虚词不做检索词，避免 to 这类子串命中 photo/photoshop。"""
+    analysis = query.analyze("how to evaluate high quality economic development")
+
+    assert "to" not in analysis["variants"]
+    assert "how" not in analysis["variants"]
+    assert "quality" in analysis["variants"]
+    assert "development" in analysis["variants"]
+
+
+def test_generic_english_filename_term_is_not_specific(conn, tmp_path):
+    """通用英文词命中文件名不算主题命中，避免工具/教程文件压过语义结果。"""
+    _source(conn, tmp_path, {
+        "LifecycleMappingPage.txt": "mapping page tutorial\n",
+        "黄姑鱼性别决定区.txt": "黄姑鱼性别决定区定位分析\n",
+    })
+    analysis = query.analyze("mapping")
+
+    matches = retrieval.path_matches(conn, analysis)
+    target = next(match for match in matches.values()
+                  if "LifecycleMappingPage" in match.path)
+    assert target.name_matched is True
+    assert target.specific is False
+    assert retrieval.is_generic_term("mapping") is True
+
+
 def test_api_query_settings_validation(client):
     initial = client.get("/api/settings/query").json()
     assert initial["custom"] == []
@@ -261,3 +493,37 @@ def test_api_query_settings_validation(client):
     assert client.put("/api/settings/query", json={"custom": "bad"}).status_code == 422
     too_long = [["长" * 40, "短"]]
     assert client.put("/api/settings/query", json={"custom": too_long}).status_code == 400
+
+
+def test_index_all_pending_rebuilds_all_chunk_vectors(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    monkeypatch.setattr(embeddings, "embed_texts",
+                        lambda settings, texts: _fake_vectors(texts))
+    _source(conn, tmp_path, {f"doc{i}.md": f"样本量 {i} 记录\n" for i in range(3)})
+
+    result = embeddings.index_all_pending(conn)
+
+    assert result["available"] is True
+    assert result["indexed"] == embeddings.count(conn)
+    assert result["remaining"] == 0
+
+
+def test_embed_failure_is_recorded_and_visible(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    _source(conn, tmp_path, {"记录.md": "样本量 42\n"})
+
+    def broken(settings, texts):
+        raise embeddings.EmbeddingError("向量接口返回 400：code 1210")
+
+    monkeypatch.setattr(embeddings, "embed_texts", broken)
+
+    with pytest.raises(embeddings.EmbeddingError):
+        embeddings.index_pending(conn)
+
+    public = embeddings.public_settings(conn)
+    assert public["last_error"] and "400" in public["last_error"]
+    assert "code 1210" in public["last_error"]
+
+    # 修改设置后旧错误清除（未做同步探测）。
+    embeddings.update_settings(conn, {"model": "another-model"})
+    assert embeddings.public_settings(conn)["last_error"] is None

@@ -195,6 +195,11 @@ def test_api_flow(client, tree):
     hits = client.get("/api/search", params={"q": "blast"}).json()
     assert hits["total"] == 1
 
+    progress = client.get("/api/sources").json()["items"][0]["parse"]
+    assert progress["total"] == 3
+    assert sum(progress[key] for key in (
+        "parsed", "failed", "empty", "pending", "locked", "unsupported")) == 3
+
     again = client.post("/api/sources", json={"root": str(tree)})
     assert again.status_code == 201
     assert again.json()["created"] is False

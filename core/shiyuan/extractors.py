@@ -29,7 +29,7 @@ TEXT_EXTS = {
     "txt", "md", "markdown", "csv", "tsv", "log", "json", "yaml", "yml",
     "toml", "ini", "cfg", "conf", "xml", "html", "htm", "css", "js", "jsx",
     "ts", "tsx", "py", "ipynb", "java", "c", "h", "cpp", "hpp", "cs", "go",
-    "rs", "rb", "php", "sh", "bat", "ps1", "sql", "r", "m", "tex", "bib",
+    "rs", "rb", "php", "sh", "bat", "ps1", "sql", "r", "m", "tex", "bib", "pl",
 }
 PDF_EXTS = {"pdf"}
 DOCX_EXTS = {"docx"}

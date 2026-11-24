@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, formatTime } from "../api";
-import type { OcrSettings, UpdateOverview } from "../api";
+import type { MaintenanceInfo, OcrSettings, UpdateOverview } from "../api";
 import Icon from "../Icon";
 
 const PROFILES: { key: "quiet" | "balanced" | "fast"; label: string }[] = [
@@ -29,6 +29,8 @@ export default function HealthView() {
   const [checking, setChecking] = useState(false);
   const [rebuilding, setRebuilding] = useState(false);
   const [retrying, setRetrying] = useState<string | null>(null);
+  const [knowledge, setKnowledge] = useState<MaintenanceInfo["knowledge"] | null>(null);
+  const [generating, setGenerating] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -40,6 +42,10 @@ export default function HealthView() {
     } finally {
       setLoading(false);
     }
+    api
+      .stats()
+      .then((data) => setKnowledge(data.maintenance.knowledge))
+      .catch(() => setKnowledge(null));
   }, []);
 
   useEffect(() => {
@@ -126,6 +132,20 @@ export default function HealthView() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setRebuilding(false);
+    }
+  };
+
+  const generateKnowledge = async () => {
+    setGenerating(true);
+    setError(null);
+    setNote(null);
+    try {
+      await api.maintenance("knowledge");
+      setNote("已开始生成衍生知识；随预算逐批完成，生成后自动参与检索。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGenerating(false);
     }
   };
 
@@ -314,6 +334,52 @@ export default function HealthView() {
           <strong>{summary?.failed ?? 0}</strong>
         </div>
       </div>
+
+      <section className="panel update-control">
+        <div className="update-control-main">
+          <div>
+            <h2>衍生知识（摘要 · 实体 · FAQ）</h2>
+            <p className="muted small-text">
+              解析完成后，已配置的生成模型会持续产出文档/家族摘要、实体关系与常用问答，
+              用于回答跨片段与整体性问题；生成失败自动回退本地检索。
+              今日额度 {knowledge?.budget.knowledge_used ?? 0} / {knowledge?.budget.knowledge_limit ?? "—"}。
+            </p>
+          </div>
+          <button
+            className="ghost small"
+            disabled={generating}
+            onClick={() => void generateKnowledge()}
+          >
+            {generating ? "提交中…" : "生成衍生知识"}
+          </button>
+        </div>
+        <div className="inventory-summary">
+          <div>
+            <span>摘要</span>
+            <strong>{knowledge?.summaries ?? 0}</strong>
+          </div>
+          <div>
+            <span>实体</span>
+            <strong>{knowledge?.entities ?? 0}</strong>
+          </div>
+          <div>
+            <span>关系</span>
+            <strong>{knowledge?.relations ?? 0}</strong>
+          </div>
+          <div>
+            <span>问答</span>
+            <strong>{knowledge?.questions ?? 0}</strong>
+          </div>
+          <div>
+            <span>待生成</span>
+            <strong>{knowledge?.pending ?? 0}</strong>
+          </div>
+          <div>
+            <span>生成失败</span>
+            <strong>{knowledge?.failed ?? 0}</strong>
+          </div>
+        </div>
+      </section>
 
       {summary && summary.awaiting_policy > 0 && (
         <div className="notice">

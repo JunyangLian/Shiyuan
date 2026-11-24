@@ -96,6 +96,23 @@ def test_conversational_fillers_are_not_search_terms():
     assert "那个" not in analysis["variants"]
 
 
+def test_locative_content_question_is_not_folder_overview():
+    assert answer._is_folder_question("专利里提到的比对软件有哪些") is False
+    assert answer._is_folder_question("pilot_batches 里有什么") is True
+    assert answer._is_folder_question("这个目录下有什么") is True
+
+
+def test_path_question_evidence_labels_include_directory():
+    evidence = answer.Evidence(
+        chunk_id="c1", asset_id="a1", location_id="l1",
+        path=r"E:\资料\bsa\BSA_Result_Strict.txt",
+        name="BSA_Result_Strict.txt", text="Chrom\tPos", page=None, sheet=None,
+        matches=0)
+
+    assert r"\bsa" not in evidence.label()
+    assert r"\bsa" in evidence.label(include_path=True)
+
+
 def test_question_words_in_the_middle_are_removed():
     analysis = query.analyze("MISA 跑了什么参数")
 
@@ -185,6 +202,27 @@ def test_rerank_orders_candidates_by_model(monkeypatch):
     assert stats["error"] is None
 
 
+def test_rerank_uses_fast_reasoning(monkeypatch):
+    from types import SimpleNamespace
+
+    hits = [SimpleNamespace(path=f"D:\\候选{index}.md", text=f"内容{index}")
+            for index in range(3)]
+    settings = {"provider": "openai", "model": "gpt-test", "api_key": "sk-test",
+                "allow_cloud": True}
+    seen = {}
+
+    def fake_post(url, payload, headers, timeout):
+        seen.update(payload)
+        return {"choices": [{"message": {"content": '{"relevant": [1]}'}}]}
+
+    monkeypatch.setattr(rerank, "_post_json", fake_post)
+
+    rerank.rerank(settings, "问题", hits)
+
+    assert seen["reasoning_effort"] == "low"
+    assert seen["max_tokens"] <= 400
+
+
 def test_rerank_falls_back_to_local_order(monkeypatch):
     from types import SimpleNamespace
 
@@ -221,6 +259,37 @@ def test_rerank_empty_keeps_local_order(monkeypatch):
     assert stats["reranked"] is False
     assert stats["empty"] is True
     assert stats["error"] is None
+
+
+def test_strong_local_evidence_skips_rerank(conn, tmp_path, monkeypatch):
+    root = tmp_path / "单据助手"
+    root.mkdir()
+    (root / "QUICKSTART.md").write_text(
+        "怎么整理单据：先建批次文件夹，再运行 pilot 流程。\n", encoding="utf-8")
+    (root / "README.md").write_text("单据助手说明：项目结构见下。\n", encoding="utf-8")
+    (root / "变更记录.md").write_text("2026-07 更新了单据分类规则。\n", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    answer.update_settings(conn, {"provider": "openai", "model": "gpt-test",
+                                  "api_key": "sk-test", "allow_cloud": True})
+
+    called = {"value": False}
+
+    def fail_rerank(*args, **kwargs):
+        called["value"] = True
+        raise AssertionError("强本地证据不应调用重排")
+
+    monkeypatch.setattr(answer.rerank, "rerank", fail_rerank)
+    stats: dict = {}
+    plan = planner.make("单据怎么整理")
+
+    evidence = answer.retrieve(conn, "单据怎么整理", plan=plan, stats=stats)
+
+    assert evidence, "强本地证据不应被丢掉"
+    assert called["value"] is False
+    assert stats["rerank_skipped"] == "strong_local"
+    assert stats["rerank_empty"] is False
 
 
 def test_retrieve_reranks_before_selecting_evidence(conn, tmp_path, monkeypatch):
@@ -471,6 +540,23 @@ def test_cloud_answer_validates_citations(conn, indexed, monkeypatch):
     assert result["warning"] and "[9]" in result["warning"]
 
 
+def test_cloud_answer_requests_fast_reasoning(conn, indexed, monkeypatch):
+    answer.update_settings(conn, {
+        "provider": "openai", "model": "gpt-test", "api_key": "sk-test", "allow_cloud": True,
+    })
+    seen = {}
+
+    def fake_post(url, payload, headers, timeout=30.0):
+        seen.update(payload)
+        return {"choices": [{"message": {"content": "样本量为 42 例 [1]"}}]}
+
+    monkeypatch.setattr(answer, "_post_json", fake_post)
+    answer.ask(conn, "样本量是多少")
+
+    assert seen["reasoning_effort"] == "low"
+    assert 200 <= seen["max_tokens"] <= 4000
+
+
 def test_cloud_answer_without_citation_warns(conn, indexed, monkeypatch):
     answer.update_settings(conn, {
         "provider": "openai", "model": "gpt-test", "api_key": "sk-test", "allow_cloud": True,
@@ -555,6 +641,72 @@ def test_filename_subject_outranks_generic_content(conn, tmp_path):
     result = answer.ask(conn, "专利的创新点是什么")
 
     assert result["citations"][0]["name"] == "专利说明.md"
+
+
+def test_rerank_empty_refuses_instead_of_forcing_answer(conn, tmp_path, monkeypatch):
+    """模型判断没有候选能回答时，应按无证据拒答，而不是硬凑答案。"""
+    root = tmp_path / "资料"
+    root.mkdir()
+    for index in range(3):
+        (root / f"军理题库{index}.md").write_text(
+            "军事理论复习题，推进国防建设。\n", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    answer.update_settings(conn, {"provider": "ollama", "model": "fake-model"})
+    monkeypatch.setattr(rerank, "_request",
+                        lambda settings, question, hits, timeout: '{"relevant": []}')
+
+    result = answer.ask(conn, "火星探测器的推进剂配方是什么")
+
+    assert result["refused"] is True
+    assert result["reason"] == "no_evidence"
+    assert result["citations"] == []
+
+
+def test_semantic_only_hit_requires_min_similarity(conn, tmp_path, monkeypatch):
+    """没有词面证据时，弱相似语义片段不能单独构成证据。"""
+    from shiyuan import embeddings
+
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "天气记录.md").write_text("天气记录：今天多云转晴。\n", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    row = conn.execute(
+        "SELECT c.chunk_id, c.asset_id, c.version_id, c.text, l.location_id, l.path,"
+        " l.mtime_ns FROM chunks c JOIN asset_locations l ON l.asset_id = c.asset_id"
+    ).fetchone()
+
+    def hit(similarity: float) -> list[dict]:
+        return [{
+            "chunk_id": row["chunk_id"], "asset_id": row["asset_id"],
+            "location_id": row["location_id"], "path": row["path"],
+            "text": row["text"], "page": None, "sheet": None,
+            "parser_signature": "", "similarity": similarity,
+            "version_id": row["version_id"], "mtime_ns": row["mtime_ns"],
+            "bbox": None, "ocr": False,
+        }]
+
+    monkeypatch.setattr(embeddings, "semantic_chunks", lambda *a, **k: hit(0.5))
+    weak = answer.ask(conn, "明天会下雨吗")
+    assert weak["refused"] is True
+
+    monkeypatch.setattr(embeddings, "semantic_chunks", lambda *a, **k: hit(0.7))
+    strong = answer.ask(conn, "明天会下雨吗")
+    assert strong["refused"] is False
+
+
+def test_short_path_followup_uses_previous_question():
+    anchored = answer._contextual_query(
+        "结果文件放在哪个目录？", ["黄姑鱼性别决定区怎么定位"])
+    assert anchored.startswith("黄姑鱼性别决定区怎么定位")
+
+    standalone = answer._contextual_query(
+        "论文的原始数据文件放在哪个目录", ["黄姑鱼性别决定区怎么定位"])
+    assert standalone == "论文的原始数据文件放在哪个目录"
 
 
 def test_api_ask_and_settings(client, tmp_path):

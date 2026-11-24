@@ -9,18 +9,23 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import urllib.error
 import urllib.request
 
-MAX_CANDIDATES = 50
-SNIPPET_CHARS = 200
-DEFAULT_TIMEOUT = 40.0
+MAX_CANDIDATES = 12
+SNIPPET_CHARS = 160
+# 重排只是排序：限制等待时间，超时就按本地顺序继续，不能拖住回答生成。
+DEFAULT_TIMEOUT = 12.0
+RERANK_MAX_TOKENS = 400
 
 SYSTEM = (
     "你是检索过滤器。根据用户问题，判断每条候选片段能否直接回答问题。"
-    "招生名单、课程作业、模板、与问题主题不同的材料都不要列出。\n"
+    "招生名单、课程作业、模板、与问题主题不同的材料都不要列出。"
+    "考试题、题库、课程课件、军事理论等与问题无关的材料必须排除。\n"
     "只输出 JSON，格式为 {\"relevant\": [3, 1, 2]}：数字是候选编号，"
-    "按相关性从高到低，只包含真正相关的候选，至少 1 个。"
+    "按相关性从高到低，只包含真正相关的候选。"
+    "如果没有任何候选能回答这个问题，输出 {\"relevant\": []}。"
     "不要输出解释，不要补充候选之外的信息。"
 )
 
@@ -44,16 +49,30 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float) -> dict:
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json", **headers})
+    box: dict = {}
+
+    def worker() -> None:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                box["body"] = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:200]
+            box["error"] = RerankError(f"重排接口返回 {exc.code}：{detail}")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            box["error"] = RerankError(f"无法连接重排接口：{exc}")
+        except Exception as exc:  # noqa: BLE001 - 线程内异常必须带回主线程
+            box["error"] = RerankError(f"重排接口异常：{exc}")
+
+    # 与回答接口一样加墙钟上限，避免上游慢速滴流把一次问答拖到几分钟。
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout + 5)
+    if thread.is_alive():
+        raise RerankError("重排接口超时（超过墙钟上限）")
+    if "error" in box:
+        raise box["error"]
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:200]
-        raise RerankError(f"重排接口返回 {exc.code}：{detail}") from exc
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RerankError(f"无法连接重排接口：{exc}") from exc
-    try:
-        return json.loads(body)
+        return json.loads(box.get("body", ""))
     except ValueError as exc:
         raise RerankError("重排接口返回了非 JSON 内容") from exc
 
@@ -116,10 +135,24 @@ def _request(settings: dict, question: str, hits: list, timeout: float) -> str:
         }, {}, timeout)
     else:
         base = (settings.get("base_url") or "https://api.openai.com/v1").rstrip("/")
-        data = _post_json(f"{base}/chat/completions", {
-            "model": settings["model"], "temperature": 0, "max_tokens": 2000,
+        payload = {
+            "model": settings["model"], "temperature": 0,
+            "max_tokens": RERANK_MAX_TOKENS,
+            "reasoning_effort": "low",
             "messages": messages,
-        }, {"Authorization": f"Bearer {settings['api_key']}"}, timeout)
+        }
+        try:
+            data = _post_json(f"{base}/chat/completions", payload,
+                              {"Authorization": f"Bearer {settings['api_key']}"}, timeout)
+        except RerankError as exc:
+            # 兼容不支持 reasoning_effort 的服务；超时仍直接回退本地顺序。
+            message = str(exc)
+            if ("reasoning_effort" not in message and "1210" not in message
+                    and "思考" not in message):
+                raise
+            payload.pop("reasoning_effort", None)
+            data = _post_json(f"{base}/chat/completions", payload,
+                              {"Authorization": f"Bearer {settings['api_key']}"}, timeout)
     return _answer_content(settings, data)
 
 
@@ -138,7 +171,15 @@ def rerank(settings: dict, question: str, hits: list,
     try:
         content = _request(settings, question, hits[:considered], timeout)
         ids = _parse_ids(content, considered)
-    except (RerankError, ValueError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError):
+        # 推理模型偶尔把额度耗在推理上、返回空正文；给一次重试机会。
+        try:
+            content = _request(settings, question, hits[:considered], timeout)
+            ids = _parse_ids(content, considered)
+        except (RerankError, ValueError, KeyError, TypeError) as exc:
+            stats["error"] = str(exc)[:200]
+            return hits, stats
+    except RerankError as exc:
         stats["error"] = str(exc)[:200]
         return hits, stats
     if not ids:

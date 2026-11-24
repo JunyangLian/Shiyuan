@@ -43,6 +43,19 @@ def test_classify_key_categories(tmp_path):
     assert inventory.classify("project/.metadata/settings.properties")["content_policy"] == "exclude_content"
 
 
+def test_non_knowledge_extensions_default_to_metadata_only():
+    """网页/前端脚本/日志/结构化数据/压缩包默认只登记，不进入正文索引。"""
+    for name in ("page.html", "style.css", "data.json", "index.xml",
+                 "app.js", "view.tsx", "run.log", "pack.zip", "bundle.7z"):
+        info = inventory.classify(name)
+        assert info["content_policy"] == "metadata_only", name
+        assert info["skip_reason"] == "non_knowledge_content", name
+    # 真正的文档与源码项目仍按标准解析。
+    assert inventory.classify("notes.md")["content_policy"] == "standard_parse"
+    assert inventory.classify("analysis.py")["content_policy"] == "standard_parse"
+    assert inventory.classify("paper.pdf")["content_policy"] == "standard_parse"
+
+
 def test_no_extension_sniffing(tmp_path):
     text = tmp_path / "README"
     text.write_text("这是说明文本\n", encoding="utf-8")
@@ -122,6 +135,23 @@ def test_policies_are_scoped_to_source(conn, tmp_path):
     assert second_data["policies"]["png"] == "metadata_only"
 
 
+def test_allowed_exts_adds_newly_supported_code(conn, tmp_path):
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "笔记.md").write_text("正文", encoding="utf-8")
+    (root / "脚本.pl").write_text("print 1;\n", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    inventory.save_policies(
+        conn, {"md": "standard_parse"}, source_id=source["source_id"])
+
+    allowed = inventory.allowed_exts(conn, source["source_id"])
+
+    # 策略快照里没有 pl，但源里实际存在，且 pl 是后来新增支持的解析类型。
+    assert "pl" in allowed
+    assert "md" in allowed
+
+
 def test_allowed_exts_filters_parse_queues(conn, tmp_path):
     root = tmp_path / "资料"
     root.mkdir()
@@ -171,6 +201,10 @@ def test_parse_results_lists_success_and_failure(conn, tmp_path):
     failed = indexer.parse_results(conn, source_id, status="failed")
     assert failed["total"] == 1
     assert failed["items"][0]["name"] == "坏.docx"
+
+    progress = indexer.parse_progress(conn, source_id)
+    assert progress == {"total": 3, "parsed": 1, "failed": 1, "empty": 0,
+                        "pending": 0, "locked": 0, "unsupported": 1}
 
 
 def test_incremental_parse_only_new_or_modified(conn, tmp_path):

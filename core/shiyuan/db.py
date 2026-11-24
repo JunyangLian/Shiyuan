@@ -172,6 +172,16 @@ CREATE TABLE IF NOT EXISTS chunk_embeddings (
 
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON chunk_embeddings(model);
 
+-- 不值得做语义向量的 chunk（纯数字表格、序列、空文本）：记下原因，避免每次重建都重新判断。
+CREATE TABLE IF NOT EXISTS chunk_embedding_skips (
+    chunk_id   TEXT PRIMARY KEY,
+    model      TEXT NOT NULL,
+    reason     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_embedding_skips_model ON chunk_embedding_skips(model);
+
 -- 对话管理：会话与消息（助手消息的完整结果存 payload JSON）。
 CREATE TABLE IF NOT EXISTS chat_sessions (
     session_id TEXT PRIMARY KEY,
@@ -256,6 +266,98 @@ CREATE TABLE IF NOT EXISTS external_clients (
     call_count   INTEGER NOT NULL DEFAULT 0,
     last_call_at TEXT
 );
+
+-- 衍生知识：由生成模型批量产出的层级摘要、实体关系与 FAQ。
+-- 任务账本 UNIQUE(kind, scope_id)：同一份内容（文档/家族）每种知识只有一条任务，
+-- 内容重新解析后重新入队会重置为 pending，再次生成。
+CREATE TABLE IF NOT EXISTS knowledge_jobs (
+    job_id     TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,              -- summary / entities / questions
+    scope_type TEXT NOT NULL,              -- document / family
+    scope_id   TEXT NOT NULL,
+    model      TEXT,
+    status     TEXT NOT NULL DEFAULT 'pending',  -- pending / running / done / failed
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    error      TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE (kind, scope_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_jobs_status
+    ON knowledge_jobs(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS knowledge_summaries (
+    summary_id TEXT PRIMARY KEY,
+    scope_type TEXT NOT NULL,              -- document / family
+    scope_id   TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    summary    TEXT NOT NULL,
+    model      TEXT,
+    status     TEXT NOT NULL DEFAULT 'ok', -- ok / failed
+    updated_at TEXT NOT NULL,
+    UNIQUE (scope_type, scope_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_summaries_scope
+    ON knowledge_summaries(scope_type, scope_id);
+
+-- 衍生知识 - 关系层：实体 / 关系 / FAQ。family_id 存生成时的分组键
+-- （家族级为 family_id，文档级为 asset_id）。
+CREATE TABLE IF NOT EXISTS knowledge_entities (
+    entity_id   TEXT PRIMARY KEY,
+    family_id   TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    type        TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    model       TEXT,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (family_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_entities_family
+    ON knowledge_entities(family_id);
+
+CREATE TABLE IF NOT EXISTS knowledge_relations (
+    relation_id TEXT PRIMARY KEY,
+    family_id   TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    predicate   TEXT NOT NULL,
+    object      TEXT NOT NULL,
+    confidence  REAL NOT NULL DEFAULT 0.5,
+    evidence    TEXT NOT NULL DEFAULT '',
+    model       TEXT,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (family_id, subject, predicate, object)
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_relations_family
+    ON knowledge_relations(family_id);
+
+CREATE TABLE IF NOT EXISTS knowledge_questions (
+    question_id        TEXT PRIMARY KEY,
+    family_id          TEXT NOT NULL,
+    question           TEXT NOT NULL,
+    answer             TEXT NOT NULL,
+    related_entity_ids TEXT NOT NULL DEFAULT '[]',
+    model              TEXT,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_questions_family
+    ON knowledge_questions(family_id);
+
+-- FAQ 的语义向量，独立于 chunk_embeddings：chunk 清理不会误删知识向量。
+CREATE TABLE IF NOT EXISTS knowledge_vectors (
+    knowledge_id TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,              -- question
+    model        TEXT NOT NULL,
+    dim          INTEGER NOT NULL,
+    vector       BLOB NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_vectors_model
+    ON knowledge_vectors(model);
 """
 
 

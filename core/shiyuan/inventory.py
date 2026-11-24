@@ -22,6 +22,9 @@ from typing import Any
 RULES_VERSION = "inventory.v1"
 SAMPLE_LIMIT_DEFAULT = 5
 POLICY_KEY = "inventory_policies"
+# 盘点策略确认后才新增支持的可解析类型：老数据源只要实际存在这类文件，
+# 就补进解析队列；用户显式设置过的类型仍以策略为准。
+NEWLY_SUPPORTED_EXTS = {"pl"}
 
 POLICIES = {"deep_parse", "standard_parse", "metadata_only", "exclude_content"}
 
@@ -54,22 +57,28 @@ _RESEARCH_EXT = {
     "ssr", "stat",
 }
 _IDE_PROJECT_EXT = {"sln", "vcxproj", "filters", "iml"}
-_ARCHIVE_EXT = {"zip", "7z", "rar"}
 _ARCHIVE_OTHER_EXT = {"tar", "gz", "bz2", "xz"}
+
+# 默认只登记、不解析的非知识文件：网页、前端脚本、日志、结构化数据与压缩包。
+# 资料库里这类内容多为工具/教程产物，全量索引进正文会淹没真正的文档；
+# 用户仍可在盘点策略里把个别类型改成 standard_parse 显式解析。
+_NON_KNOWLEDGE_EXT = {
+    "html", "htm", "css", "xml", "xsl", "xslt", "svg", "top", "json", "ipynb",
+    "js", "jsx", "ts", "tsx", "log", "zip", "7z", "rar",
+}
 
 _DOCUMENT_EXT = {"pdf", "doc", "docx", "odt", "rtf"}
 _SHEET_EXT = {"xls", "xlsx", "xlsm", "csv", "tsv", "ods"}
 _PRESENTATION_EXT = {"ppt", "pptx", "pptm", "odp"}
 _TEXT_EXT = {
-    "txt", "md", "markdown", "rst", "log", "properties", "ass",
+    "txt", "md", "markdown", "rst", "properties", "ass",
     "ini", "cfg", "conf", "toml", "yaml", "yml",
 }
 _CODE_EXT = {
-    "py", "java", "js", "jsx", "ts", "tsx", "c", "h", "cpp", "hpp", "cs",
+    "py", "java", "c", "h", "cpp", "hpp", "cs",
     "go", "rs", "rb", "php", "sh", "bat", "cmd", "ps1", "sql", "r", "m", "tex",
     "bib", "jsp", "kt", "kts", "scala", "lua", "pl", "vue", "svelte",
 }
-_WEB_EXT = {"html", "htm", "css", "xml", "xsl", "xslt", "svg", "top", "json", "ipynb"}
 _EMAIL_EXT = {"eml", "msg", "mbox"}
 _CAD_EXT = {"dxf", "dwg"}
 
@@ -322,6 +331,11 @@ def classify(path: str | Path, size: int | None = None) -> dict:
         return _result("image", ext, "deep_parse",
                        "图片资产，按深度策略执行 OCR", "high",
                        detected_format=detected)
+    if ext in _NON_KNOWLEDGE_EXT:
+        return _result("non_knowledge", ext, "metadata_only",
+                       "网页/前端脚本/日志/结构化数据/压缩包，默认仅登记不解析",
+                       "high", skip_reason="non_knowledge_content",
+                       detected_format=detected)
     if ext in _DOCUMENT_EXT:
         return _result("document", ext, "standard_parse",
                        "文档，执行标准正文解析", "high",
@@ -342,17 +356,9 @@ def classify(path: str | Path, size: int | None = None) -> dict:
         return _result("code", ext, "standard_parse",
                        "源代码，执行标准正文解析", "high",
                        detected_format=detected)
-    if ext in _WEB_EXT:
-        return _result("web", ext, "standard_parse",
-                       "Web/XML/JSON 文本，执行标准解析", "high",
-                       detected_format=detected)
     if ext in _EMAIL_EXT:
         return _result("email", ext, "standard_parse",
                        "邮件，执行标准正文解析", "high",
-                       detected_format=detected)
-    if ext in _ARCHIVE_EXT:
-        return _result("archive", ext, "standard_parse",
-                       "压缩归档，解析前检查内部目录与安全限制", "medium",
                        detected_format=detected)
     if ext in _ARCHIVE_OTHER_EXT:
         return _result("archive", ext, "metadata_only",
@@ -466,10 +472,19 @@ def allowed_exts(conn: sqlite3.Connection, source_id: str) -> set[str] | None:
     policies = load_policies(conn, source_id)
     if not policies:
         return None
-    return {
+    allowed = {
         ext for ext, policy in policies.items()
         if policy in {"standard_parse", "deep_parse"}
     }
+    for ext in NEWLY_SUPPORTED_EXTS:
+        if ext in policies:
+            continue
+        present = conn.execute(
+            "SELECT 1 FROM asset_locations WHERE source_id = ? AND lower(ext) = ?"
+            " LIMIT 1", (source_id, ext)).fetchone()
+        if present is not None:
+            allowed.add(ext)
+    return allowed
 
 
 def save_policies(conn: sqlite3.Connection, policies: dict,
