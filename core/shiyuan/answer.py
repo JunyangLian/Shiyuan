@@ -284,7 +284,8 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
              focus: list[str] | None = None,
              path_only: bool = False,
              plan: planner.Plan | None = None,
-             stats: dict | None = None) -> list[Evidence]:
+             stats: dict | None = None,
+             anchor_prefix: str | None = None) -> list[Evidence]:
     analysis = query.analyze(question, synonyms=query.synonym_map(conn))
     if not analysis["variants"]:
         return []
@@ -343,6 +344,10 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
     candidates = retrieval.find_chunks(conn, question, analysis=analysis,
                                        source_id=source_id, ext=ext, focus=focus,
                                        path_only=path_only)
+    if anchor_prefix:
+        # 追问限定上一轮数据源时在内存里过滤，避免 SQLite 为“MATCH + source”扫描全库。
+        candidates = [hit for hit in candidates if hit.path.startswith(anchor_prefix)]
+    original_candidates = candidates
     candidate_total = len(candidates)
     # 候选明显多于预算时，先让已授权的生成模型按「能否直接回答」筛选并排序；
     # 未配置、失败或超时都保持本地顺序，不影响问答。精确查找同样要过滤，
@@ -360,7 +365,12 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
             candidates, rerank_stats = rerank.rerank(
                 answer_settings, question, candidates)
             rerank_empty = bool(rerank_stats.get("empty"))
-            if rerank_empty:
+            if rerank_empty and _strong_local_evidence(original_candidates, analysis):
+                # 本地证据本来就强（文件名/目录或大量概念命中），不接受“全空”结论。
+                rerank_stats["fallback"] = "strong_local"
+                candidates = original_candidates
+                rerank_empty = False
+            elif rerank_empty:
                 # 模型判断没有任何候选能回答问题：按无证据处理，避免硬凑答案。
                 candidates = []
 
@@ -398,6 +408,9 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
         except embeddings.EmbeddingError:
             semantic_hits = []
         semantic_hits = families.dedupe_semantic_hits(conn, semantic_hits)
+        if anchor_prefix:
+            semantic_hits = [hit for hit in semantic_hits
+                             if hit["path"].startswith(anchor_prefix)]
         for hit in semantic_hits:
             if len(evidence) >= limit:
                 break
@@ -438,7 +451,11 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
     knowledge_used = 0
     relation_sources = 0
     faq_sources = 0
-    if plan is not None and plan.mode.key in {"explain", "comprehensive"} and not rerank_empty:
+    # 综合类问题允许摘要作为唯一证据；解释/操作类必须先有原文证据，
+    # 否则无关问题会被一条弱相关摘要硬凑出答案。
+    if (plan is not None and not rerank_empty
+            and plan.mode.key in {"explain", "comprehensive"}
+            and (evidence or plan.mode.key == "comprehensive")):
         # 有原文证据时只用具体词匹配摘要，避免「整理/系统」这类泛词把
         # 无关文档的摘要拉进来；没有原文证据时退回全部词，让摘要兜底。
         base_evidence = list(evidence)
@@ -449,6 +466,8 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
         except Exception:
             summary_items = []
         for item in summary_items:
+            if len(evidence) >= limit:
+                break
             evidence.append(Evidence(
                 chunk_id=f"summary:{item['summary_id']}",
                 asset_id=item["scope_id"],
@@ -470,6 +489,8 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
         except Exception:
             faq_items = []
         for item in faq_items:
+            if len(evidence) >= limit:
+                break
             evidence.append(Evidence(
                 chunk_id=f"faq:{item['question_id']}",
                 asset_id=item["family_id"],
@@ -494,6 +515,8 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
             except Exception:
                 relation_items = []
             for item in relation_items:
+                if len(evidence) >= limit:
+                    break
                 evidence.append(Evidence(
                     chunk_id=f"relation:{item['relation_id']}",
                     asset_id=item["family_id"],
@@ -583,6 +606,7 @@ def _messages(question: str, evidence: list[Evidence],
     system = (
         "你是本地知识库的检索助手，只能依据用户消息中的<证据>回答。"
         "禁止补充证据之外的事实或推测。每个事实句末用 [数字] 标注对应证据。"
+        "证据中的数字、日期、编号和专有名词必须原样引用，不要改写或省略。"
         f"今天是 {datetime.now().strftime('%Y-%m-%d')}（本地时区）。"
         "遇到「上个月/最近/今年」等相对时间，先按今天换算成具体年月再判断证据，"
         "并在回答里说明采用的日期范围。"
@@ -642,10 +666,79 @@ def _post_json(url: str, payload: dict, headers: dict, timeout: float | None = N
         raise AnswerError("模型接口返回了非 JSON 内容") from exc
 
 
+def _stream_sse(url: str, payload: dict, headers: dict, timeout: float,
+                on_delta) -> str:
+    """OpenAI 兼容接口的流式读取：只转发正文增量，忽略推理内容。"""
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", **headers})
+    parts: list[str] = []
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw in response:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    item = json.loads(data)
+                except ValueError:
+                    continue
+                choices = item.get("choices") or []
+                if not choices:
+                    continue
+                piece = (choices[0].get("delta") or {}).get("content")
+                if not piece:
+                    continue
+                parts.append(piece)
+                on_delta(piece)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        raise AnswerError(f"模型接口返回 {exc.code}：{detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise AnswerError(f"无法连接模型接口：{exc}") from exc
+    content = "".join(parts).strip()
+    if not content:
+        raise AnswerError("模型流式返回了空内容")
+    return content
+
+
+def _stream_ollama(url: str, payload: dict, timeout: float, on_delta) -> str:
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json"})
+    parts: list[str] = []
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            for raw in response:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                piece = (item.get("message") or {}).get("content")
+                if piece:
+                    parts.append(piece)
+                    on_delta(piece)
+                if item.get("done"):
+                    break
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise AnswerError(f"无法连接 Ollama：{exc}") from exc
+    content = "".join(parts).strip()
+    if not content:
+        raise AnswerError("Ollama 流式返回了空内容")
+    return content
+
+
 def _openai_answer(settings: dict, question: str, evidence: list[Evidence],
                    previous: str | None = None,
                    plan_note: str | None = None,
-                   include_path: bool = False) -> str:
+                   include_path: bool = False,
+                   on_delta=None) -> str:
     if not settings.get("allow_cloud"):
         raise AnswerError("云端回答未获授权：请先在对话设置里允许上传证据片段")
     if not settings.get("api_key") or not settings.get("model"):
@@ -660,33 +753,46 @@ def _openai_answer(settings: dict, question: str, evidence: list[Evidence],
     effort = settings.get("reasoning_effort")
     if effort:
         payload["reasoning_effort"] = effort
+    if on_delta is not None:
+        payload["stream"] = True
+
+    def send(current: dict) -> str:
+        url = f"{base}/chat/completions"
+        headers = {"Authorization": f"Bearer {settings['api_key']}"}
+        if on_delta is not None:
+            timeout = float(os.environ.get("SHIYUAN_MODEL_TIMEOUT", "90"))
+            return _stream_sse(url, current, headers, timeout, on_delta)
+        data = _post_json(url, current, headers)
+        try:
+            return str(data["choices"][0]["message"]["content"]).strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise AnswerError("模型接口返回结构不符合 OpenAI 兼容格式") from exc
+
     try:
-        data = _post_json(f"{base}/chat/completions", payload,
-                          {"Authorization": f"Bearer {settings['api_key']}"})
+        return send(payload)
     except AnswerError as exc:
         # 只对不支持该参数的兼容服务回退；超时等错误不重试，避免等待翻倍。
         message = str(exc)
         if "reasoning_effort" not in message and "1210" not in message and "思考" not in message:
             raise
         payload.pop("reasoning_effort", None)
-        data = _post_json(f"{base}/chat/completions", payload,
-                          {"Authorization": f"Bearer {settings['api_key']}"})
-    try:
-        return str(data["choices"][0]["message"]["content"]).strip()
-    except (KeyError, IndexError, TypeError) as exc:
-        raise AnswerError("模型接口返回结构不符合 OpenAI 兼容格式") from exc
+        return send(payload)
 
 
 def _ollama_answer(settings: dict, question: str, evidence: list[Evidence],
                    previous: str | None = None,
                    plan_note: str | None = None,
-                   include_path: bool = False) -> str:
+                   include_path: bool = False,
+                   on_delta=None) -> str:
     if not settings.get("model"):
         raise AnswerError("Ollama 回答尚未填写模型名称")
     base = (settings.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
-    payload = {"model": settings["model"], "stream": False,
+    payload = {"model": settings["model"], "stream": on_delta is not None,
                "messages": _messages(question, evidence, previous, plan_note,
                                      include_path)}
+    if on_delta is not None:
+        timeout = float(os.environ.get("SHIYUAN_MODEL_TIMEOUT", "90"))
+        return _stream_ollama(f"{base}/api/chat", payload, timeout, on_delta)
     data = _post_json(f"{base}/api/chat", payload, {})
     try:
         return str(data["message"]["content"]).strip()
@@ -702,6 +808,16 @@ def _extractive_answer(evidence: list[Evidence]) -> str:
             snippet = snippet[:220] + "…"
         lines.append(f"[{index}] {item.label()}：{snippet}")
     return "\n\n".join(lines)
+
+
+_REFUSAL_ANSWER = re.compile(
+    r"^\s*(?:根据现有资料|根据检索到的证据|根据证据)?[，,\s]*"
+    r"(?:无法确定|无法回答|无法从现有资料|没有找到|未找到|没有足够证据|证据不足)")
+
+
+def _looks_like_refusal(text: str) -> bool:
+    """模型虽然返回了正文，但明确表示现有证据不足：标记为拒答。"""
+    return bool(_REFUSAL_ANSWER.search((text or "")[:80]))
 
 
 def _citation_warning(text: str, evidence_count: int) -> str | None:
@@ -731,6 +847,35 @@ _OVERVIEW_PATTERNS = (
     re.compile(r"(文件|资料|文档)(总数|数量|概况)"),
     re.compile(r"(知识库|资料库|库里)(概况|概览|统计)"),
 )
+
+
+_SOURCE_OVERVIEW = re.compile(r"(数据源|资料源|资料来源|授权目录|授权文件夹)")
+_SOURCE_ASK = re.compile(r"(哪些|什么|几个|多少|列表|概况|情况|现在|当前|都有)")
+
+
+def _is_source_overview(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact or len(compact) > 40:
+        return False
+    return bool(_SOURCE_OVERVIEW.search(compact) and _SOURCE_ASK.search(compact))
+
+
+def _source_overview_answer(conn: sqlite3.Connection) -> str:
+    rows = conn.execute(
+        "SELECT s.label, s.root_uri, s.state,"
+        " (SELECT COUNT(*) FROM asset_locations l"
+        "  WHERE l.source_id = s.source_id AND l.availability = 'AVAILABLE') AS available"
+        " FROM sources s ORDER BY s.created_at").fetchall()
+    if not rows:
+        return "当前还没有授权任何数据源。"
+    lines = [f"当前共有 {len(rows)} 个数据源："]
+    for index, row in enumerate(rows, start=1):
+        state = "启用" if row["state"] == "active" else "已暂停"
+        lines.append(
+            f"{index}. {row['label']}（{row['root_uri']}，{state}，"
+            f"可检索 {row['available']} 个文件）")
+    lines.append("这是本地数据源列表，不是某一份文档里的内容。")
+    return "\n".join(lines)
 
 
 def _is_library_overview(text: str) -> bool:
@@ -826,8 +971,9 @@ _FOLDER_INTENT = (
 _PATH_INTENT = re.compile(
     r"哪(?:个)?(?:文件夹|目录|盘)"
     r"|(?:放在|存放|保存在|存在|放到|存到)(?:了)?哪"
-    r"|(?:文件|资料|表格|图片|课件|报告|作业|试卷|单据|记录|数据|课程表|截图|照片|发票|收据|合同)"
+    r"|(?:文件|资料|表格|结果表|汇总表|清单|图片|课件|报告|作业|试卷|单据|记录|数据|课程表|截图|照片|发票|收据|合同)"
     r"[^。？?]{0,4}?(?:在|放|存)(?:了)?哪(?:里|儿)?"
+    r"|在\s*哪(?:里|儿)?\s*[？?]?$"
 )
 
 
@@ -845,6 +991,128 @@ def _is_folder_question(text: str) -> bool:
 def _like_prefix(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return escaped + "%"
+
+
+_VERSION_INTENT = re.compile(r"(版本|终稿|初稿|定稿|修订版|第[一二三四五六七八九十\d]+版)")
+_VERSION_ASK = re.compile(r"(哪些|几个|多少|列出|列表|区别|对比|不同)")
+
+
+def _is_version_question(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    return bool(_VERSION_INTENT.search(compact) and _VERSION_ASK.search(compact))
+
+
+def _path_citations(matches: list[retrieval.PathMatch], limit: int) -> list[dict]:
+    citations = []
+    for index, match in enumerate(matches[:limit], start=1):
+        name = match.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        citations.append({
+            "n": index,
+            "chunk_id": "",
+            "asset_id": match.asset_id,
+            "location_id": match.location_id,
+            "name": name,
+            "path": match.path,
+            "page": None,
+            "sheet": None,
+            "snippet": "",
+            "ocr": False,
+            "semantic": False,
+            "version_id": "",
+            "mtime": None,
+            "bbox": None,
+            "family_id": None,
+            "family_size": 1,
+            "family_title": "",
+            "version_label": "",
+            "sources": [],
+        })
+    return citations
+
+
+def _version_overview(conn: sqlite3.Connection, analysis: dict, *,
+                      source_id: str | None, ext: str | None
+                      ) -> tuple[str, list[retrieval.PathMatch]] | None:
+    """按文件名列出同一主题的版本，不判断哪个更好。"""
+    core = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (analysis.get("core") or "").lower())
+    subject = re.sub(r"版本(?:有哪些|有哪几个|对比|区别|不同)", "", core)
+    subject = re.sub(r"(?:有|哪)?(?:哪些|几个|多少)?(?:个)?版本", "", subject)
+    subject = re.sub(r"(?:终稿|初稿|定稿|修订版)", "", subject).strip()
+    if len(subject) < 2:
+        return None
+    matches = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    selected: list[retrieval.PathMatch] = []
+    seen: set[str] = set()
+    for match in matches.values():
+        name = match.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        compact = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", name.lower())
+        if subject not in compact or not _VERSION_INTENT.search(name):
+            continue
+        if match.path in seen:
+            continue
+        seen.add(match.path)
+        selected.append(match)
+    if not selected:
+        return None
+
+    def version_key(match: retrieval.PathMatch) -> tuple[int, str]:
+        name = match.path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        numbers = [int(value) for value in re.findall(r"\d+", name)]
+        return (numbers[-1] if numbers else 0, name.lower())
+
+    selected.sort(key=version_key)
+    lines = [f"文件名包含「{subject}」的版本共 {len(selected)} 个："]
+    for index, match in enumerate(selected[:20], start=1):
+        lines.append(f"{index}. `{match.path}`")
+    if len(selected) > 20:
+        lines.append(f"其余 {len(selected) - 20} 个未展开。")
+    lines.append("这里只整理文件位置和名称，不判断哪个版本更好。")
+    return "\n".join(lines), selected
+
+
+def _locate_answer(conn: sqlite3.Connection, analysis: dict, *,
+                   source_id: str | None, ext: str | None
+                   ) -> tuple[str, list[retrieval.PathMatch]] | None:
+    """位置问题直接列路径，避免让模型从正文里猜文件名。"""
+    matches = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    candidates = [
+        match for match in matches.values()
+        if match.name_matched or match.specific or match.folder_specific
+    ]
+    if not candidates:
+        return None
+    # 专有名词（MISA、CBPD、课程表）比「脚本/目录」这类通用词更能定位文件。
+    anchors = [
+        concept["term"] for concept in analysis["concepts"]
+        if len(concept["term"]) >= 2
+        and not retrieval.is_generic_term(concept["term"])
+    ]
+
+    def literal_score(match: retrieval.PathMatch) -> int:
+        lowered = match.path.lower()
+        return sum(1 for term in anchors if term.lower() in lowered)
+
+    candidates.sort(
+        key=lambda match: (
+            -literal_score(match),
+            -(int(match.name_matched) * 1000 + int(match.specific) * 200
+              + int(match.folder_specific) * 80 + match.score),
+            match.path,
+        ))
+    selected: list[retrieval.PathMatch] = []
+    seen: set[str] = set()
+    for match in candidates:
+        if match.path in seen:
+            continue
+        seen.add(match.path)
+        selected.append(match)
+        if len(selected) >= 5:
+            break
+    lines = ["找到以下位置："]
+    for match in selected:
+        lines.append(f"- `{match.path}`")
+    lines.append("以上是检索到的原文件路径，未移动或修改文件。")
+    return "\n".join(lines), selected
 
 
 def _best_folder(conn: sqlite3.Connection, analysis: dict, *,
@@ -1041,6 +1309,9 @@ def _context_base(history: list[str]) -> str:
     return history[0]
 
 
+_CHAPTER_REF = re.compile(r"第[一二三四五六七八九十百\d]+[章节部分篇]")
+
+
 def _contextual_query(text: str, history: list[str] | None) -> str:
     """把「那第三章呢」这类追问补上前一轮问题，仅用于检索。"""
     if not history:
@@ -1049,7 +1320,12 @@ def _contextual_query(text: str, history: list[str] | None) -> str:
     if not compact or len(compact) > 16:
         return text
     if _FOLLOWUP.search(compact):
-        return _context_base(history).strip() + " " + text
+        base = _context_base(history).strip()
+        # 「第四章」→「那第三章呢」：替换章节指代，不能把两章混在一起检索。
+        latest = _CHAPTER_REF.search(compact)
+        if latest and _CHAPTER_REF.search(base):
+            return _CHAPTER_REF.sub(latest.group(0), base)
+        return base + " " + text
     # 「结果文件放在哪个目录」「数据是从哪里来的」这类短追问自身没有主题，
     # 需要补上一轮问题；否则「数据」会把数据结构教材全部召回。
     if len(compact) <= 12:
@@ -1121,7 +1397,8 @@ def _library_overview(conn: sqlite3.Connection, *, source_id: str | None,
 def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None,
         ext: str | None = None, top_k: int | None = None,
         history: list[str] | None = None,
-        anchor_sources: list[str] | None = None) -> dict:
+        anchor_sources: list[str] | None = None,
+        on_delta=None) -> dict:
     text = (question or "").strip()
     if not text:
         raise ValueError("问题不能为空")
@@ -1131,11 +1408,73 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
     provider = settings["provider"]
     context_text = _contextual_query(text, history)
     previous = _context_base(history) if history and context_text != text else None
-    # 追问时如果上一轮只涉及一个数据源，就把检索收窄到它，避免跨资料串味。
+    # 追问已经通过 _contextual_query 补全了主题词，不再按上一轮数据源强制过滤：
+    # FTS 在“MATCH + source_id”组合下为了凑满候选会扫描全库，单个追问可达一分钟。
     effective_source = source_id
+    anchor_prefix: str | None = None
     if (previous and not source_id and anchor_sources
             and len(anchor_sources) == 1):
-        effective_source = anchor_sources[0]
+        row = conn.execute(
+            "SELECT root_uri FROM sources WHERE source_id = ?",
+            (anchor_sources[0],)).fetchone()
+        if row is not None and row["root_uri"]:
+            anchor_prefix = row["root_uri"].rstrip("\\/") + "\\"
+
+    if _is_source_overview(text):
+        return {
+            "question": text,
+            "answer": _source_overview_answer(conn),
+            "refused": False,
+            "reason": "source_overview",
+            "provider": "library",
+            "model": None,
+            "citations": [],
+            "evidence_count": 0,
+            "warning": None,
+            "coverage": coverage,
+        }
+
+    if _is_version_question(text):
+        version_analysis = query.analyze(context_text, synonyms=query.synonym_map(conn))
+        overview = _version_overview(
+            conn, version_analysis, source_id=effective_source, ext=ext)
+        if overview:
+            overview_text, version_matches = overview
+            citations = _path_citations(version_matches, 20)
+            return {
+                "question": text,
+                "answer": overview_text,
+                "refused": False,
+                "reason": "version_overview",
+                "provider": "library",
+                "model": None,
+                "citations": citations,
+                "evidence_count": len(citations),
+                "warning": None,
+                "coverage": coverage,
+                "context_used": previous,
+            }
+
+    if _is_path_question(text):
+        path_analysis = query.analyze(context_text, synonyms=query.synonym_map(conn))
+        located = _locate_answer(
+            conn, path_analysis, source_id=effective_source, ext=ext)
+        if located:
+            located_text, located_matches = located
+            citations = _path_citations(located_matches, 5)
+            return {
+                "question": text,
+                "answer": located_text,
+                "refused": False,
+                "reason": "path_location",
+                "provider": "library",
+                "model": None,
+                "citations": citations,
+                "evidence_count": len(citations),
+                "warning": None,
+                "coverage": coverage,
+                "context_used": previous,
+            }
 
     if _is_library_overview(text):
         return {
@@ -1211,7 +1550,8 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
                         limit=budget,
                         focus=_focus_terms(text) if previous else None,
                         path_only=path_question,
-                        plan=plan, stats=plan_stats)
+                        plan=plan, stats=plan_stats,
+                        anchor_prefix=anchor_prefix)
     plan_payload = {**plan.as_dict(), **plan_stats}
     plan_note = _plan_note(plan, plan_stats)
 
@@ -1238,24 +1578,27 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
 
     if provider == "extractive":
         answer = _extractive_answer(evidence)
+        if on_delta is not None:
+            on_delta(answer)
         warning = None
     elif provider == "openai":
         answer = _openai_answer(settings, text, evidence, previous, plan_note,
-                                include_path=path_question)
+                                include_path=path_question, on_delta=on_delta)
         warning = _citation_warning(answer, len(evidence))
     else:
         answer = _ollama_answer(settings, text, evidence, previous, plan_note,
-                                include_path=path_question)
+                                include_path=path_question, on_delta=on_delta)
         warning = _citation_warning(answer, len(evidence))
 
     if not answer:
         raise AnswerError("模型没有返回任何内容")
+    refused = _looks_like_refusal(answer)
     citations = [item.citation(index) for index, item in enumerate(evidence, start=1)]
     return {
         "question": text,
         "answer": answer,
-        "refused": False,
-        "reason": None,
+        "refused": refused,
+        "reason": "insufficient_evidence" if refused else None,
         "provider": provider,
         "model": settings.get("model") or None,
         "citations": citations,

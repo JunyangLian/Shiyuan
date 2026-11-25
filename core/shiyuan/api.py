@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
+import queue
 import secrets
 import sqlite3
 import threading
@@ -14,7 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -103,7 +105,7 @@ app = FastAPI(title="拾源 Knowledge Core", version=__version__, lifespan=lifes
 _EXTERNAL_GET_PATHS = {
     "/api/health", "/api/sources", "/api/search", "/api/stats", "/api/events", "/api/jobs",
 }
-_EXTERNAL_POST_PATHS = {"/api/ask"}
+_EXTERNAL_POST_PATHS = {"/api/ask", "/api/ask/stream"}
 
 
 @app.middleware("http")
@@ -444,6 +446,64 @@ def test_external_client(client_id: str,
         return external.test_client(conn, client_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="外部连接不存在") from exc
+
+
+def _sse(payload: dict) -> str:
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+
+
+@app.post("/api/ask/stream")
+def run_ask_stream(payload: AskPayload,
+                   conn: sqlite3.Connection = Depends(get_conn)) -> StreamingResponse:
+    """流式问答：先回状态，再逐段推送正文，最后给完整结果。"""
+    if payload.session_id and chat.get_session(conn, payload.session_id) is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    def generate():
+        events: queue.Queue = queue.Queue()
+
+        def worker() -> None:
+            worker_conn = None
+            try:
+                worker_conn = db.connect()
+                history = (chat.recent_questions(worker_conn, payload.session_id)
+                           if payload.session_id else [])
+                anchors = (chat.recent_answer_sources(worker_conn, payload.session_id)
+                           if payload.session_id else [])
+                result = answer.ask(
+                    worker_conn, payload.question, source_id=payload.source_id,
+                    ext=payload.ext, top_k=payload.top_k, history=history,
+                    anchor_sources=anchors,
+                    on_delta=lambda text: events.put({"type": "delta", "text": text}))
+                if payload.session_id:
+                    chat.append_exchange(
+                        worker_conn, payload.session_id, payload.question, result)
+                    result["session_id"] = payload.session_id
+                events.put({"type": "done", "result": result})
+            except Exception as exc:  # noqa: BLE001 - 错误要作为事件发给前端
+                events.put({"type": "error", "message": str(exc)[:500]})
+            finally:
+                if worker_conn is not None:
+                    worker_conn.close()
+
+        threading.Thread(target=worker, daemon=True, name="answer-stream").start()
+        yield _sse({"type": "status", "stage": "retrieval",
+                    "message": "正在检索并筛选证据…"})
+        generating = False
+        while True:
+            item = events.get()
+            if item.get("type") == "delta" and not generating:
+                generating = True
+                yield _sse({"type": "status", "stage": "generation",
+                            "message": "正在生成回答…"})
+            yield _sse(item)
+            if item.get("type") in {"done", "error"}:
+                break
+
+    return StreamingResponse(
+        generate(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive"})
 
 
 @app.post("/api/ask")

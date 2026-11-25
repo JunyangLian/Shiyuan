@@ -56,9 +56,16 @@ _DUP_QUERY = re.compile(r"(查重|重复率|相似度|降重|比对|对照|检�
 # 试卷/题库/复习资料是资料库里最大的噪声源之一：除非问题本身在找考试材料，
 # 否则不应压过正文文档（「共线性」被「线性代数试卷」抢走就是典型）。
 _EXAM_NAME = re.compile(
-    r"(试卷|试题|参考答案|评分标准|题库|复习|考集|期末|期中|真题|模拟题|习题集"
-    r"|选择题|问答题|考试题|答案)")
+    r"(试卷|试题|参考答案|评分标准|题库|考集|期末|期中|真题|模拟题|习题集"
+    r"|选择题|问答题|考试题|答案|[A-Da-d]卷)")
 _EXAM_QUERY = re.compile(r"(试卷|试题|答案|题库|复习|期末|期中|真题|考试题|习题|模拟题)")
+# 问“结果/报告/汇总”时，处理报告、汇总表应该排在原始图片和脚本之前。
+_RESULT_NAME = re.compile(r"(报告|汇总|统计|结果|明细|report|summary|result)", re.IGNORECASE)
+_RESULT_QUERY = re.compile(r"(结果|报告|汇总|统计|概况|处理结果|明细|多少|数量)")
+# 问“支持哪些输入格式”时，扫描/读取模块比命令行入口更有回答价值。
+_INPUT_QUERY = re.compile(r"(输入格式|支持格式|支持.{0,4}格式|输入文件|input format|supported)",
+                          re.IGNORECASE)
+_INPUT_NAME = re.compile(r"(scan|reader|loader|ingest|input|format)", re.IGNORECASE)
 
 
 def name_prior(path: str, analysis: dict) -> int:
@@ -76,6 +83,12 @@ def name_prior(path: str, analysis: dict) -> int:
     if (not _EXAM_QUERY.search(analysis.get("normalized") or "")
             and _EXAM_NAME.search(name)):
         score -= 300
+    if (_RESULT_QUERY.search(analysis.get("normalized") or "")
+            and _RESULT_NAME.search(name)):
+        score += 200
+    if (_INPUT_QUERY.search(analysis.get("normalized") or "")
+            and _INPUT_NAME.search(name)):
+        score += 160
     return score
 
 _SELECT = (

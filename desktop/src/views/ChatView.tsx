@@ -370,6 +370,7 @@ export default function ChatView({ active = true }: { active?: boolean }) {
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [pendingElapsed, setPendingElapsed] = useState(0);
+  const [streamStatus, setStreamStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -603,6 +604,7 @@ export default function ChatView({ active = true }: { active?: boolean }) {
         payload: null,
       },
     ]);
+    let assistantId: string | null = null;
     try {
       let sessionId = activeId;
       if (!sessionId) {
@@ -612,23 +614,51 @@ export default function ChatView({ active = true }: { active?: boolean }) {
         setActiveId(sessionId);
         rememberActiveSession(sessionId);
       }
-      const data = await api.ask(text, { sessionId });
-      setMessages((current) => [
-        ...current,
-        {
-          message_id: `local-assistant-${Date.now()}`,
-          role: "assistant",
-          content: data.answer,
-          created_at: new Date().toISOString(),
-          payload: data,
+      assistantId = `local-assistant-${Date.now()}`;
+      const placeholder: ChatMessage = {
+        message_id: assistantId,
+        role: "assistant",
+        content: "",
+        created_at: new Date().toISOString(),
+        payload: null,
+      };
+      setMessages((current) => [...current, placeholder]);
+      setStreamStatus("正在检索并筛选证据…");
+      await api.askStream(text, { sessionId }, {
+        onStatus: (_stage, message) => setStreamStatus(message || null),
+        onDelta: (chunk) => {
+          setMessages((current) =>
+            current.map((message) =>
+              message.message_id === assistantId
+                ? { ...message, content: message.content + chunk }
+                : message,
+            ),
+          );
         },
-      ]);
+        onDone: (data) => {
+          setMessages((current) =>
+            current.map((message) =>
+              message.message_id === assistantId
+                ? { ...message, content: data.answer, payload: data }
+                : message,
+            ),
+          );
+        },
+      });
       const refreshed = await api.chatSessions();
       setSessions(refreshed.items);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      if (assistantId) {
+        setMessages((current) =>
+          current.filter(
+            (message) => !(message.message_id === assistantId && !message.content),
+          ),
+        );
+      }
     } finally {
       setLoading(false);
+      setStreamStatus(null);
     }
   };
 
@@ -998,17 +1028,30 @@ export default function ChatView({ active = true }: { active?: boolean }) {
                 </div>
               ) : message.payload ? (
                 <AnswerCard key={message.message_id} result={message.payload} />
-              ) : null,
+              ) : (
+                <section key={message.message_id} className="chat-answer chat-answer-streaming">
+                  <div className="chat-answer-head">
+                    <img className="assistant-mark" src={logoMark} alt="" />
+                    <span className="assistant-name">拾源</span>
+                    <span className="chip subtle">生成中</span>
+                  </div>
+                  <div className="answer-text">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {message.content || "…"}
+                    </ReactMarkdown>
+                  </div>
+                </section>
+              ),
             )}
             {loading && (
               <div className="chat-pending" role="status" aria-live="polite">
                 <div className="chat-pending-head">
                   <span className="spinner" aria-hidden="true" />
-                  <span>{loadingStage(pendingElapsed)}</span>
+                  <span>{streamStatus ?? loadingStage(pendingElapsed)}</span>
                   <span className="chat-pending-time">{pendingElapsed}s</span>
                 </div>
                 <div className="chat-pending-hint">
-                  正在本地检索证据并生成回答，通常 10–60 秒；复杂问题或模型响应慢时会更久。
+                  正在本地检索证据并生成回答，正文会边生成边显示；复杂问题或模型响应慢时会更久。
                 </div>
               </div>
             )}

@@ -704,6 +704,88 @@ async function readApiToken(): Promise<string> {
   }
 }
 
+export interface AskStreamHandlers {
+  onStatus?: (stage: string, message: string) => void;
+  onDelta?: (text: string) => void;
+  onDone?: (result: AnswerResult) => void;
+}
+
+async function askStreamRequest(
+  question: string,
+  options: { sourceId?: string; ext?: string; topK?: number; sessionId?: string },
+  handlers: AskStreamHandlers,
+  retry = true,
+): Promise<void> {
+  const token = await readApiToken();
+  const response = await fetch(`${API_BASE}/api/ask/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      question,
+      ...(options.sourceId ? { source_id: options.sourceId } : {}),
+      ...(options.ext ? { ext: options.ext } : {}),
+      ...(options.topK ? { top_k: options.topK } : {}),
+      ...(options.sessionId ? { session_id: options.sessionId } : {}),
+    }),
+  });
+  if (response.status === 401 && retry) {
+    apiToken = null;
+    return askStreamRequest(question, options, handlers, false);
+  }
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      if (body?.detail) {
+        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+      }
+    } catch {
+      /* 保留状态码信息 */
+    }
+    throw new Error(detail);
+  }
+  if (!response.body) throw new Error("当前环境不支持流式响应");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finished = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut = buffer.indexOf("\n\n");
+    while (cut >= 0) {
+      const block = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      const line = block.split("\n").find((item) => item.startsWith("data:"));
+      if (line) {
+        let event: { type?: string; stage?: string; message?: string; text?: string; result?: AnswerResult };
+        try {
+          event = JSON.parse(line.slice(5).trim());
+        } catch {
+          cut = buffer.indexOf("\n\n");
+          continue;
+        }
+        if (event.type === "status") {
+          handlers.onStatus?.(event.stage ?? "", event.message ?? "");
+        } else if (event.type === "delta") {
+          handlers.onDelta?.(event.text ?? "");
+        } else if (event.type === "done" && event.result) {
+          finished = true;
+          handlers.onDone?.(event.result);
+        } else if (event.type === "error") {
+          throw new Error(event.message || "生成回答失败");
+        }
+      }
+      cut = buffer.indexOf("\n\n");
+    }
+  }
+  if (!finished) throw new Error("流式连接中断，未收到完整回答");
+}
+
 async function request<T>(path: string, init?: RequestInit, retry = true): Promise<T> {
   const token = await readApiToken();
   const response = await fetch(`${API_BASE}${path}`, {
@@ -757,6 +839,11 @@ export const api = {
     return request<SearchResponse>(`/api/search?${params.toString()}`);
   },
   stats: () => request<OverviewStats>("/api/stats"),
+  askStream: (
+    question: string,
+    options: { sourceId?: string; ext?: string; topK?: number; sessionId?: string },
+    handlers: AskStreamHandlers,
+  ) => askStreamRequest(question, options, handlers),
   ask: (question: string, options: { sourceId?: string; ext?: string; topK?: number; sessionId?: string } = {}) =>
     request<AnswerResult>("/api/ask", {
       method: "POST",

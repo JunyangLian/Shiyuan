@@ -98,7 +98,7 @@ export default function App() {
             <div className="foot-line">
               {online === null ? "连接本地核心…" : online ? "本地核心已就绪" : "本地核心未启动"}
             </div>
-            <div className="foot-sub">v{version || "0.1.3"} · 默认离线</div>
+            <div className="foot-sub">v{version || "0.1.6"} · 默认离线</div>
           </div>
         </div>
       </aside>

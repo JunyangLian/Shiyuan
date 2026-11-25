@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   chatSession: vi.fn(),
   createChatSession: vi.fn(),
   ask: vi.fn(),
+  askStream: vi.fn(),
   renameChatSession: vi.fn(),
   deleteChatSession: vi.fn(),
   answerSettings: vi.fn(),
@@ -201,6 +202,14 @@ beforeEach(() => {
   mocks.updatesOverview.mockResolvedValue(UPDATES);
   mocks.checkUpdates.mockResolvedValue({ started: [] });
   mocks.documentFamilies.mockResolvedValue({ items: [] });
+  mocks.askStream.mockImplementation(async (question, options, handlers) => {
+    handlers.onStatus?.("retrieval", "正在检索本地资料…");
+    const result = await mocks.ask(question, options);
+    if (result) {
+      handlers.onDelta?.(result.answer);
+      handlers.onDone?.(result);
+    }
+  });
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
     callback(0);
     return 1;
@@ -706,6 +715,27 @@ describe("固定对话输入框", () => {
 
     expect(await screen.findByText("样本量是 42。")).toBeTruthy();
     expect(screen.queryByText("正在检索本地资料…")).toBeNull();
+  });
+
+  it("流式回答边生成边显示正文", async () => {
+    mocks.createChatSession.mockResolvedValue({
+      session_id: "s1",
+      title: "新会话",
+      created_at: "2026-11-24T10:00:00+08:00",
+    });
+    mocks.askStream.mockImplementation(async (_question, _options, handlers) => {
+      handlers.onStatus?.("generation", "正在生成回答…");
+      handlers.onDelta?.("第一段");
+      handlers.onDelta?.("第二段");
+    });
+
+    await renderApp();
+    fireEvent.change(await screen.findByPlaceholderText("找点啥？"), {
+      target: { value: "样本量是多少" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "提问" }));
+
+    expect(await screen.findByText("第一段第二段")).toBeTruthy();
   });
 
   it("样式表把 composer 固定在视口底部", () => {

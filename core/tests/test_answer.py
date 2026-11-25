@@ -202,6 +202,36 @@ def test_rerank_orders_candidates_by_model(monkeypatch):
     assert stats["error"] is None
 
 
+def test_stream_sse_forwards_content_deltas(monkeypatch):
+    class FakeResponse:
+        def __init__(self, lines):
+            self.lines = lines
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return iter(self.lines)
+
+    lines = [
+        b'data: {"choices":[{"delta":{"content":"\xe6\xa0\xb7\xe6\x9c\xac"}}]}\n',
+        b"\n",
+        b'data: {"choices":[{"delta":{"content":"\xe9\x87\x8f"}}]}\n',
+        b"data: [DONE]\n",
+    ]
+    monkeypatch.setattr(
+        answer.urllib.request, "urlopen", lambda *args, **kwargs: FakeResponse(lines))
+    chunks: list[str] = []
+
+    content = answer._stream_sse("http://example", {}, {}, 5, chunks.append)
+
+    assert content == "样本量"
+    assert chunks == ["样本", "量"]
+
+
 def test_rerank_uses_fast_reasoning(monkeypatch):
     from types import SimpleNamespace
 
@@ -538,6 +568,55 @@ def test_cloud_answer_validates_citations(conn, indexed, monkeypatch):
     assert result["provider"] == "openai"
     assert "[1]" in result["answer"]
     assert result["warning"] and "[9]" in result["warning"]
+
+
+def test_refusal_phrase_marks_answer_refused(conn, indexed, monkeypatch):
+    answer.update_settings(conn, {
+        "provider": "openai", "model": "gpt-test", "api_key": "sk-test", "allow_cloud": True,
+    })
+    monkeypatch.setattr(
+        answer, "_openai_answer",
+        lambda *args, **kwargs: "根据现有资料无法确定。")
+
+    result = answer.ask(conn, "样本量是多少")
+
+    assert result["refused"] is True
+    assert result["reason"] == "insufficient_evidence"
+
+
+def test_followup_chapter_reference_is_replaced():
+    contextual = answer._contextual_query(
+        "那第三章呢", ["连峻洋毕业论文第四章写了什么"])
+
+    assert "第三章" in contextual
+    assert "第四章" not in contextual
+    assert "连峻洋毕业论文" in contextual
+
+
+def test_version_question_lists_versions(conn, tmp_path):
+    root = tmp_path / "资料"
+    root.mkdir()
+    for name in ("论文终稿（1）.md", "论文终稿（2）.md", "论文初稿.md"):
+        (root / name).write_text("正文", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    result = answer.ask(conn, "论文终稿有哪些版本？")
+
+    assert result["reason"] == "version_overview"
+    assert "论文终稿（1）.md" in result["answer"]
+    assert "论文终稿（2）.md" in result["answer"]
+    assert len(result["citations"]) >= 2
+
+
+def test_source_overview_lists_sources(conn, indexed):
+    result = answer.ask(conn, "现在有哪些数据源？")
+
+    assert result["reason"] == "source_overview"
+    assert result["refused"] is False
+    assert "数据源" in result["answer"]
+    assert result["citations"] == []
 
 
 def test_cloud_answer_requests_fast_reasoning(conn, indexed, monkeypatch):

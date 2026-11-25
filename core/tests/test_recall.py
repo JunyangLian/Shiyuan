@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -328,6 +329,12 @@ def test_vector_cache_compacts_after_mass_delete(conn, tmp_path, monkeypatch):
     assert embeddings._VECTOR_CACHE["count"] == 1
 
 
+def test_result_query_boosts_report_name():
+    analysis = query.analyze("测试客户A的处理结果", synonyms={})
+
+    assert retrieval.name_prior("D:\\资料\\processing_report.md", analysis) >= 200
+
+
 def test_cross_language_synonym_matches_english_filename(conn, tmp_path):
     _source(conn, tmp_path, {
         "All_Perfect_Markers.txt": "marker,chr,pos\n",
@@ -493,6 +500,34 @@ def test_api_query_settings_validation(client):
     assert client.put("/api/settings/query", json={"custom": "bad"}).status_code == 422
     too_long = [["长" * 40, "短"]]
     assert client.put("/api/settings/query", json={"custom": too_long}).status_code == 400
+
+
+def test_api_ask_stream_emits_status_and_done(client, tmp_path):
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "记录.md").write_text("样本量 42 例\n", encoding="utf-8")
+    source_id = client.post("/api/sources", json={"root": str(root)}).json()["source_id"]
+    client.post(f"/api/sources/{source_id}/scan")
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not client.get("/api/sources").json()["items"][0]["scanning"]:
+            break
+        time.sleep(0.05)
+
+    with client.stream("POST", "/api/ask/stream", json={"question": "样本量是多少"}) as response:
+        assert response.status_code == 200
+        body = "".join(response.iter_text())
+
+    events = [
+        json.loads(block[5:].strip())
+        for block in body.split("\n\n")
+        if block.startswith("data: ")
+    ]
+    types = [event["type"] for event in events]
+    assert types[0] == "status"
+    assert "done" in types
+    done = next(event for event in events if event["type"] == "done")["result"]
+    assert done["answer"]
 
 
 def test_index_all_pending_rebuilds_all_chunk_vectors(conn, tmp_path, monkeypatch):

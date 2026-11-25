@@ -160,6 +160,10 @@ SYNONYMS = {
     "标记": ["marker", "markers"],
     "引物设计": ["primer design", "primer"],
     "结果表": ["result table", "result_table", "results table"],
+    "单据助手": ["receipt_sorter", "receipt sorter", "单据整理助手"],
+    "单据整理助手": ["receipt_sorter", "receipt sorter", "单据助手"],
+    "输入格式": ["input format", "file format", "supported extensions",
+                 "supported_extensions", "支持格式", "输入文件"],
 }
 
 MAX_CONCEPTS = 24
