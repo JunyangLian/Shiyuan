@@ -22,7 +22,7 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 前端单元测试 | 17 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `SourceLoom_0.3.0_x64-setup.exe`（约 138MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），打包后核心 MCP 握手约 1.6 秒 |
+| 桌面端安装包 | 完成 | `SourceLoom_0.3.1_x64-setup.exe`（约 138MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），打包后核心 MCP 握手约 1.6 秒 |
 
 ## 二、已实现范围（M1）
 
