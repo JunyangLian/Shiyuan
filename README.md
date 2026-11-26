@@ -6,12 +6,12 @@
 
 **原位知识工作台 —— 你的文件按原来的方式保存，知识库自己生长。**
 
-[![Release](https://img.shields.io/github/v/release/JunyangLian/Shiyuan)](https://github.com/JunyangLian/Shiyuan/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/JunyangLian/Shiyuan/total)](https://github.com/JunyangLian/Shiyuan/releases)
+[![Release](https://img.shields.io/github/v/release/JunyangLian/SourceLoom)](https://github.com/JunyangLian/SourceLoom/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/JunyangLian/SourceLoom/total)](https://github.com/JunyangLian/SourceLoom/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
 ![Version](https://img.shields.io/badge/version-0.2.0-005E9B)
 
-[下载安装包](https://github.com/JunyangLian/Shiyuan/releases/latest) · [产品需求](docs/PRD.md) · [项目知识空间](docs/PROJECTS.md) · [解析说明](docs/INGESTION.md) · [开发断点](docs/BREAKPOINT.md)
+[下载安装包](https://github.com/JunyangLian/SourceLoom/releases/latest) · [产品需求](docs/PRD.md) · [项目知识空间](docs/PROJECTS.md) · [解析说明](docs/INGESTION.md) · [开发断点](docs/BREAKPOINT.md)
 
 </div>
 
@@ -101,7 +101,7 @@
 
 ## 下载与安装
 
-到 [Releases](https://github.com/JunyangLian/Shiyuan/releases/latest) 下载 `SourceLoom_x.y.z_x64-setup.exe`。
+到 [Releases](https://github.com/JunyangLian/SourceLoom/releases/latest) 下载 `SourceLoom_x.y.z_x64-setup.exe`。
 安装包自带 Python 核心与 OCR 模型，无需另装 Python 或数据库。
 
 - 系统：Windows 10 / 11（x64）
