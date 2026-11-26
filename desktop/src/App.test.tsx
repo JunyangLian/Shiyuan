@@ -43,6 +43,16 @@ const mocks = vi.hoisted(() => ({
   documentFamilyMembers: vi.fn(),
   familyMembersByAsset: vi.fn(),
   familyDiff: vi.fn(),
+  projects: vi.fn(),
+  project: vi.fn(),
+  createProject: vi.fn(),
+  updateProject: vi.fn(),
+  deleteProject: vi.fn(),
+  projectAssets: vi.fn(),
+  projectKnowledge: vi.fn(),
+  addProjectSource: vi.fn(),
+  removeProjectSource: vi.fn(),
+  addProjectAssets: vi.fn(),
 }));
 
 vi.mock("./api", () => ({
@@ -151,6 +161,27 @@ const UPDATES = {
   generated_at: "2026-11-22T10:01:00+08:00",
 };
 
+const GLOBAL_PROJECT = {
+  project_id: "prj_global",
+  name: "全局项目",
+  description: "数据页录入的文件夹自动归入全局项目",
+  status: "active",
+  kind: "global",
+  retrieval_policy: "global",
+  privacy_policy: "external_allowed",
+  created_at: "2026-11-22T10:00:00+08:00",
+  updated_at: "2026-11-22T10:00:00+08:00",
+  stats: {
+    assets: 0, primary: 0, linked: 0, excluded: 0, usable: 0, parsed: 0,
+    embedded: 0, failed: 0, pending: 0, sources: 0, last_updated: null,
+  },
+  sources: [],
+  source_count: 0,
+  primary_count: 0,
+  linked_count: 0,
+  excluded_count: 0,
+};
+
 const SOURCE_CARD = {
   source_id: "src_1",
   root_uri: "D:\\资料",
@@ -202,6 +233,12 @@ beforeEach(() => {
   mocks.updatesOverview.mockResolvedValue(UPDATES);
   mocks.checkUpdates.mockResolvedValue({ started: [] });
   mocks.documentFamilies.mockResolvedValue({ items: [] });
+  mocks.projects.mockResolvedValue({ items: [GLOBAL_PROJECT], total: 1 });
+  mocks.project.mockResolvedValue(GLOBAL_PROJECT);
+  mocks.projectAssets.mockResolvedValue({ items: [], total: 0, limit: 100, offset: 0 });
+  mocks.projectKnowledge.mockResolvedValue({
+    summaries: [], entities: [], relations: [], questions: [],
+  });
   mocks.askStream.mockImplementation(async (question, options, handlers) => {
     handlers.onStatus?.("retrieval", "正在检索本地资料…");
     const result = await mocks.ask(question, options);
@@ -241,17 +278,17 @@ describe("页面整合", () => {
     const labels = [...container.querySelectorAll(".nav .nav-label")].map(
       (element) => element.textContent,
     );
-    expect(labels).toEqual(["数据", "对话", "外部调用", "更新"]);
+    expect(labels).toEqual(["项目", "对话", "数据", "更新"]);
   });
 
-  it("外部调用作为第三个独立模块", async () => {
+  it("项目页展示全局项目与项目内外部接口", async () => {
     await renderApp();
-    fireEvent.click(screen.getByRole("button", { name: /外部调用/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^项目/ }));
     await settle();
-
-    expect(await screen.findByRole("heading", { name: "外部调用" })).toBeTruthy();
-    expect(await screen.findByText("还没有外部连接")).toBeTruthy();
-    expect(screen.getByText("Codex")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "项目" })).toBeTruthy();
+    expect((await screen.findAllByText("全局项目")).length).toBeGreaterThan(0);
+    expect(await screen.findByText("外部接口")).toBeTruthy();
+    expect(await screen.findByText(/这里只读展示/)).toBeTruthy();
   });
 
   it("默认进入对话页", async () => {

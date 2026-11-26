@@ -21,8 +21,8 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from . import (__version__, answer, chat, config, db, embeddings, external, families,
-               indexer, ingest, inventory, knowledge, maintenance, ocr, query, scanner,
-               search, secrets_store, store, updates, watcher)
+               indexer, ingest, inventory, knowledge, maintenance, ocr, projects, query,
+               scanner, search, secrets_store, store, updates, watcher)
 from .config import db_path
 
 
@@ -103,7 +103,7 @@ app = FastAPI(title="拾源 Knowledge Core", version=__version__, lifespan=lifes
 
 
 _EXTERNAL_GET_PATHS = {
-    "/api/health", "/api/sources", "/api/search", "/api/stats", "/api/events", "/api/jobs",
+    "/api/health", "/api/sources", "/api/search", "/api/stats",
 }
 _EXTERNAL_POST_PATHS = {"/api/ask", "/api/ask/stream"}
 
@@ -169,6 +169,32 @@ def _watcher(request: Request):
     return getattr(request.app.state, "watcher", None)
 
 
+def _bound_project(request: Request) -> str | None:
+    """外部令牌绑定的项目；本机令牌返回 None（不限制）。"""
+    client = getattr(request.state, "external_client", None)
+    return (client or {}).get("project_id")
+
+
+def _scope_request(request: Request, conn: sqlite3.Connection,
+                   project_id: str | None,
+                   scope: str | None) -> tuple[str | None, str | None]:
+    """外部令牌只能读取绑定项目；不能通过参数切到别的项目或全局。"""
+    bound = _bound_project(request)
+    if not bound:
+        return project_id, scope
+    if project_id and project_id != bound:
+        raise HTTPException(status_code=403, detail="该令牌只能访问绑定的项目")
+    if projects.is_global(conn, bound):
+        return bound, "global"
+    return bound, scope if scope in {"project", "expanded"} else "expanded"
+
+
+def _require_project_access(request: Request, project_id: str) -> None:
+    bound = _bound_project(request)
+    if bound and project_id != bound:
+        raise HTTPException(status_code=403, detail="该令牌只能访问绑定的项目")
+
+
 class SourceCreate(BaseModel):
     root: str = Field(min_length=1)
     label: str | None = None
@@ -181,6 +207,38 @@ class AskPayload(BaseModel):
     ext: str | None = None
     top_k: int | None = Field(default=None, ge=1, le=12)
     session_id: str | None = None
+    project_id: str | None = None
+    scope: str | None = None
+
+
+class ProjectCreatePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str = ""
+    folders: list[str] = Field(default_factory=list)
+    retrieval_policy: str = "project_first"
+    privacy_policy: str = "external_allowed"
+
+
+class ProjectUpdatePayload(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    status: str | None = None
+    retrieval_policy: str | None = None
+    privacy_policy: str | None = None
+
+
+class ProjectSourcePayload(BaseModel):
+    source_id: str | None = None
+    root: str | None = None
+    relation_type: str = "primary"
+    path_prefix: str = ""
+
+
+class ProjectAssetsPayload(BaseModel):
+    asset_ids: list[str] = Field(default_factory=list)
+    paths: list[str] = Field(default_factory=list)
+    membership_type: str = "linked"
+    priority: int = 0
 
 
 class AnswerSettingsPayload(BaseModel):
@@ -216,6 +274,7 @@ class ExternalClientPayload(BaseModel):
     name: str | None = Field(default=None, max_length=40)
     preset: str
     transport: str = "mcp"
+    project_id: str | None = None
 
 
 @app.get("/api/health")
@@ -224,9 +283,16 @@ def health() -> dict:
 
 
 @app.get("/api/sources")
-def list_sources(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+def list_sources(request: Request,
+                 conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    bound = _bound_project(request)
+    allowed_sources = None
+    if bound and not projects.is_global(conn, bound):
+        allowed_sources = set(projects.source_ids(conn, bound))
     items = []
     for row in store.list_sources(conn):
+        if allowed_sources is not None and row["source_id"] not in allowed_sources:
+            continue
         items.append({
             "source_id": row["source_id"],
             "root_uri": row["root_uri"],
@@ -339,15 +405,28 @@ def start_ocr(source_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> d
 
 
 @app.get("/api/search")
-def run_search(q: str = "", limit: int = 50, offset: int = 0,
+def run_search(request: Request, q: str = "", limit: int = 50, offset: int = 0,
                source_id: str | None = None, ext: str | None = None,
+               project_id: str | None = None, scope: str | None = None,
                conn: sqlite3.Connection = Depends(get_conn)) -> dict:
-    return search.search(conn, q, limit=limit, offset=offset, source_id=source_id, ext=ext)
+    project_id, scope = _scope_request(request, conn, project_id, scope)
+    requested = projects.scope_for(conn, project_id, scope)
+    allowed, excluded = projects.asset_filter(conn, project_id, requested)
+    priority = (projects.asset_filter(conn, project_id, "project")[0]
+                if project_id else None)
+    result = search.search(
+        conn, q, limit=limit, offset=offset, source_id=source_id, ext=ext,
+        allowed_assets=allowed, excluded_assets=excluded,
+        priority_assets=priority)
+    result["scope"] = {"requested": requested, "used": requested,
+                       "expanded": False, "project_id": project_id}
+    return result
 
 
 @app.get("/api/stats")
-def run_stats(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
-    return search.stats(conn)
+def run_stats(request: Request,
+              conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    return projects.stats_view(conn, _bound_project(request))
 
 
 @app.get("/api/inventory/dry-run")
@@ -404,9 +483,180 @@ def put_inventory_policies(payload: InventoryPoliciesPayload,
     }
 
 
+# ---------------------------------------------------------------- 项目知识空间
+
+@app.get("/api/projects")
+def list_projects(include_archived: bool = False, external_only: bool = False,
+                  conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    items = projects.list_projects(
+        conn, include_archived=include_archived, external_only=external_only)
+    return {"items": items, "total": len(items)}
+
+
+@app.post("/api/projects", status_code=201)
+def create_project(payload: ProjectCreatePayload, request: Request,
+                   conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        project = projects.create_project(
+            conn, payload.name, description=payload.description,
+            retrieval_policy=payload.retrieval_policy,
+            privacy_policy=payload.privacy_policy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    project_id = project["project_id"]
+    linked: list[dict] = []
+    for folder in payload.folders:
+        try:
+            result = projects.add_source_path(conn, project_id, folder)
+        except ValueError as exc:
+            linked.append({"root": folder, "error": str(exc)})
+            continue
+        linked.append(result)
+        # 复用已授权数据源时不需要重新扫描：现有索引与项目关系直接可用。
+        if result.get("created"):
+            scanner.scan_in_background(result["source_id"])
+        manager = _watcher(request)
+        if manager is not None:
+            manager.schedule(result["source_id"], result["source"]["root_uri"])
+    return {"project": projects.get_project(conn, project_id), "sources": linked}
+
+
+@app.get("/api/projects/{project_id}")
+def get_project(project_id: str,
+                conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    project = projects.get_project(conn, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return project
+
+
+@app.patch("/api/projects/{project_id}")
+def update_project(project_id: str, payload: ProjectUpdatePayload,
+                   conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        project = projects.update_project(
+            conn, project_id, name=payload.name, description=payload.description,
+            status=payload.status, retrieval_policy=payload.retrieval_policy,
+            privacy_policy=payload.privacy_policy)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"project": project}
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str,
+                   conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return projects.delete_project(conn, project_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/sources", status_code=201)
+def add_project_source(project_id: str, payload: ProjectSourcePayload,
+                       request: Request,
+                       conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        if payload.root:
+            result = projects.add_source_path(
+                conn, project_id, payload.root, payload.relation_type)
+        elif payload.source_id:
+            result = projects.add_source(
+                conn, project_id, payload.source_id, payload.relation_type,
+                payload.path_prefix)
+        else:
+            raise HTTPException(status_code=400, detail="需要提供 root 或 source_id")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if result.get("created"):
+        scanner.scan_in_background(result["source_id"])
+    manager = _watcher(request)
+    if manager is not None:
+        source = store.get_source(conn, result["source_id"])
+        if source is not None:
+            manager.schedule(source["source_id"], source["root_uri"])
+    return result
+
+
+@app.delete("/api/projects/{project_id}/sources/{source_id}")
+def remove_project_source(project_id: str, source_id: str,
+                          conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return projects.remove_source(conn, project_id, source_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="项目不存在") from exc
+
+
+@app.get("/api/projects/{project_id}/assets")
+def list_project_assets(project_id: str, membership: str | None = None,
+                        q: str | None = None, limit: int = 100, offset: int = 0,
+                        conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    if projects.get_project(conn, project_id) is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    return projects.list_assets(
+        conn, project_id, membership=membership, query=q,
+        limit=limit, offset=offset)
+
+
+@app.post("/api/projects/{project_id}/assets")
+def add_project_assets(project_id: str, payload: ProjectAssetsPayload,
+                       conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        if payload.paths and not payload.asset_ids:
+            return projects.add_assets_by_paths(
+                conn, project_id, payload.paths, payload.membership_type,
+                payload.priority)
+        return projects.set_membership(
+            conn, project_id, payload.asset_ids, payload.membership_type,
+            payload.priority)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="项目不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/projects/{project_id}/assets/{asset_id}")
+def remove_project_asset(project_id: str, asset_id: str,
+                         conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return projects.remove_asset(conn, project_id, asset_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="项目不存在") from exc
+
+
+@app.get("/api/projects/{project_id}/knowledge")
+def project_knowledge(project_id: str, limit: int = 20,
+                      conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    try:
+        return projects.project_knowledge(
+            conn, project_id, limit=max(1, min(limit, 100)))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="项目不存在") from exc
+
+
+@app.get("/api/assets")
+def list_assets(project_id: str | None = None, unassigned: bool = False,
+                q: str | None = None, limit: int = 100, offset: int = 0,
+                conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    if project_id:
+        if projects.get_project(conn, project_id) is None:
+            raise HTTPException(status_code=404, detail="项目不存在")
+        return projects.list_assets(conn, project_id, query=q,
+                                    limit=limit, offset=offset)
+    return projects.list_global_assets(
+        conn, unassigned=unassigned, query=q, limit=limit, offset=offset)
+
+
 @app.get("/api/external/clients")
-def list_external_clients(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
-    return {"items": external.list_clients(conn)}
+def list_external_clients(project_id: str | None = None,
+                          conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    return {"items": external.list_clients(conn, project_id=project_id)}
 
 
 @app.post("/api/external/clients", status_code=201)
@@ -414,7 +664,8 @@ def create_external_client(payload: ExternalClientPayload,
                            conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     try:
         client = external.create_client(
-            conn, preset=payload.preset, transport=payload.transport, name=payload.name,
+            conn, preset=payload.preset, transport=payload.transport,
+            name=payload.name, project_id=payload.project_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -453,10 +704,13 @@ def _sse(payload: dict) -> str:
 
 
 @app.post("/api/ask/stream")
-def run_ask_stream(payload: AskPayload,
+def run_ask_stream(payload: AskPayload, request: Request,
                    conn: sqlite3.Connection = Depends(get_conn)) -> StreamingResponse:
     """流式问答：先回状态，再逐段推送正文，最后给完整结果。"""
-    if payload.session_id and chat.get_session(conn, payload.session_id) is None:
+    bound = _bound_project(request)
+    session_id = None if bound else payload.session_id
+    project_id, scope = _scope_request(request, conn, payload.project_id, payload.scope)
+    if session_id and chat.get_session(conn, session_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
 
     def generate():
@@ -466,21 +720,22 @@ def run_ask_stream(payload: AskPayload,
             worker_conn = None
             try:
                 worker_conn = db.connect()
-                history = (chat.recent_questions(worker_conn, payload.session_id)
-                           if payload.session_id else [])
-                anchors = (chat.recent_answer_sources(worker_conn, payload.session_id)
-                           if payload.session_id else [])
-                previous_answer = (chat.recent_answer(worker_conn, payload.session_id)
-                                   if payload.session_id else None)
+                history = (chat.recent_questions(worker_conn, session_id)
+                           if session_id else [])
+                anchors = (chat.recent_answer_sources(worker_conn, session_id)
+                           if session_id else [])
+                previous_answer = (chat.recent_answer(worker_conn, session_id)
+                                   if session_id else None)
                 result = answer.ask(
                     worker_conn, payload.question, source_id=payload.source_id,
                     ext=payload.ext, top_k=payload.top_k, history=history,
                     anchor_sources=anchors, previous_answer=previous_answer,
+                    project_id=project_id, scope=scope,
                     on_delta=lambda text: events.put({"type": "delta", "text": text}))
-                if payload.session_id:
+                if session_id:
                     chat.append_exchange(
-                        worker_conn, payload.session_id, payload.question, result)
-                    result["session_id"] = payload.session_id
+                        worker_conn, session_id, payload.question, result)
+                    result["session_id"] = session_id
                 events.put({"type": "done", "result": result})
             except Exception as exc:  # noqa: BLE001 - 错误要作为事件发给前端
                 events.put({"type": "error", "message": str(exc)[:500]})
@@ -509,26 +764,31 @@ def run_ask_stream(payload: AskPayload,
 
 
 @app.post("/api/ask")
-def run_ask(payload: AskPayload, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
-    if payload.session_id and chat.get_session(conn, payload.session_id) is None:
+def run_ask(payload: AskPayload, request: Request,
+            conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    bound = _bound_project(request)
+    session_id = None if bound else payload.session_id
+    project_id, scope = _scope_request(request, conn, payload.project_id, payload.scope)
+    if session_id and chat.get_session(conn, session_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     try:
-        history = chat.recent_questions(conn, payload.session_id) if payload.session_id else []
-        anchor_sources = (chat.recent_answer_sources(conn, payload.session_id)
-                          if payload.session_id else [])
-        previous_answer = (chat.recent_answer(conn, payload.session_id)
-                           if payload.session_id else None)
+        history = chat.recent_questions(conn, session_id) if session_id else []
+        anchor_sources = (chat.recent_answer_sources(conn, session_id)
+                          if session_id else [])
+        previous_answer = (chat.recent_answer(conn, session_id)
+                           if session_id else None)
         result = answer.ask(conn, payload.question, source_id=payload.source_id,
                             ext=payload.ext, top_k=payload.top_k, history=history,
                             anchor_sources=anchor_sources,
-                            previous_answer=previous_answer)
+                            previous_answer=previous_answer,
+                            project_id=project_id, scope=scope)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except answer.AnswerError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    if payload.session_id:
-        chat.append_exchange(conn, payload.session_id, payload.question, result)
-        result["session_id"] = payload.session_id
+    if session_id:
+        chat.append_exchange(conn, session_id, payload.question, result)
+        result["session_id"] = session_id
     return result
 
 

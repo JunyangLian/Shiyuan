@@ -38,7 +38,13 @@ function statusChip(client: ExternalClient): { className: string; label: string 
   return { className: "chip subtle", label: "未测试" };
 }
 
-export default function ExternalView() {
+export default function ExternalView({
+  projectId,
+  projectName,
+}: {
+  projectId: string;
+  projectName: string;
+}) {
   const [clients, setClients] = useState<ExternalClient[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -52,7 +58,7 @@ export default function ExternalView() {
 
   const load = useCallback(async () => {
     try {
-      const data = await api.externalClients();
+      const data = await api.externalClients(projectId);
       setClients(data.items);
       setError(null);
     } catch (err) {
@@ -60,9 +66,13 @@ export default function ExternalView() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [projectId]);
 
   useEffect(() => {
+    setLoading(true);
+    setClients([]);
+    setExpandedId(null);
+    setConfigs({});
     void load();
     const timer = window.setInterval(load, 6000);
     return () => window.clearInterval(timer);
@@ -87,7 +97,9 @@ export default function ExternalView() {
     setError(null);
     setNote(null);
     try {
-      const result = await api.createExternalClient({ preset, transport });
+      const result = await api.createExternalClient({
+        preset, transport, projectId,
+      });
       setClients((current) => [result.client, ...current]);
       setExpandedId(result.client.client_id);
       await loadConfig(result.client.client_id);
@@ -161,17 +173,16 @@ export default function ExternalView() {
   };
 
   return (
-    <div className="view external-view">
-      <header className="view-head">
+    <section className="panel project-external">
+      <div className="panel-head">
         <div>
-          <p className="eyebrow">Agent 接入</p>
-          <h1>外部调用</h1>
-          <p className="sub">
-            把拾源知识库以只读方式连接给本机 Agent。每个连接使用独立令牌，可单独测试和撤销。
+          <h3>外部接口</h3>
+          <p className="muted small-text">
+            该接口只能读取「{projectName}」项目的数据。每个连接使用独立只读令牌，可单独测试和撤销。
           </p>
         </div>
         <span className="chip ok">只读访问</span>
-      </header>
+      </div>
 
       {error && <div className="alert error">{error}</div>}
       {note && <div className="notice">{note}</div>}
@@ -218,7 +229,7 @@ export default function ExternalView() {
         ))}
       </div>
 
-      <section className="panel inventory-panel">
+      <div className="inventory-panel project-external-list">
         <div className="inventory-panel-head">
           <h3>已添加的连接</h3>
           <span className="muted small-text">{clients.length} 个 · 令牌只保存在本机</span>
@@ -321,12 +332,12 @@ export default function ExternalView() {
             })}
           </div>
         )}
-      </section>
+      </div>
 
       <div className="notice">
-        MCP 与 HTTP 都只读取已建库内容：不会扫描目录、不会修改原文件。
+        MCP 与 HTTP 都只读取「{projectName}」项目内已建库内容：不会扫描目录、不会修改原文件。
         新文件仍需先在「数据」模块里完成扫描与策略建库。
       </div>
-    </div>
+    </section>
   );
 }

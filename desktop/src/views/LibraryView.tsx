@@ -73,7 +73,10 @@ export default function LibraryView() {
         <div>
           <p className="eyebrow">授权与盘点</p>
           <h1>数据</h1>
-          <p className="sub">授权目录与盘点策略集中在这里；同步覆盖与索引状态在「更新」里查看。</p>
+          <p className="sub">
+            授权目录与盘点策略集中在这里；新增文件夹会自动归入「全局项目」，可在项目页拉取到子项目。
+            同步覆盖与索引状态在「更新」里查看。
+          </p>
         </div>
       </header>
 

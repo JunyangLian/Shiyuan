@@ -1,20 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import logoMark from "./assets/shiyuan-mark.svg";
+import logoMark from "./assets/sourceloom-mark.png";
 import ChatView from "./views/ChatView";
 import LibraryView from "./views/LibraryView";
-import ExternalView from "./views/ExternalView";
 import HealthView from "./views/HealthView";
+import ProjectsView from "./views/ProjectsView";
 import Icon, { type IconName } from "./Icon";
 
-type View = "chat" | "library" | "external" | "health";
+type View = "chat" | "projects" | "library" | "health";
 
 const SIDEBAR_COLLAPSED_KEY = "shiyuan.sidebar.collapsed";
 
 const NAV: { key: View; label: string; hint: string; icon: IconName }[] = [
-  { key: "library", label: "数据", hint: "授权 · 同步", icon: "library" },
+  { key: "projects", label: "项目", hint: "知识空间 · 外部接口", icon: "library" },
   { key: "chat", label: "对话", hint: "知识库问答", icon: "chat" },
-  { key: "external", label: "外部调用", hint: "Agent · 只读", icon: "external" },
+  { key: "library", label: "数据", hint: "授权 · 同步", icon: "library" },
   { key: "health", label: "更新", hint: "索引 · 覆盖", icon: "updates" },
 ];
 
@@ -60,10 +60,10 @@ export default function App() {
     <div className={`app${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
         <div className="brand">
-          <img className="brand-mark" src={logoMark} alt="拾源" title="拾源" />
+          <img className="brand-mark" src={logoMark} alt="拾源 SourceLoom" title="拾源 SourceLoom" />
           <div className="brand-text">
             <div className="brand-name">拾源</div>
-            <div className="brand-sub">原位知识工作台</div>
+            <div className="brand-sub">SourceLoom</div>
           </div>
           <button
             className="sidebar-toggle"
@@ -106,13 +106,13 @@ export default function App() {
       <main className="main" ref={mainRef}>
         {view === "chat" ? (
           <ChatView />
+        ) : view === "projects" ? (
+          <div className="page">
+            <ProjectsView />
+          </div>
         ) : view === "library" ? (
           <div className="page">
             <LibraryView />
-          </div>
-        ) : view === "external" ? (
-          <div className="page">
-            <ExternalView />
           </div>
         ) : (
           <div className="page">

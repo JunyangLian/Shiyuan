@@ -1,7 +1,7 @@
 [package]
 name = "shiyuan"
-version = "0.1.7"
-description = "拾源：原位知识工作台"
+version = "0.2.0"
+description = "拾源（SourceLoom）：原位知识工作台"
 edition = "2021"
 
 [lib]
@@ -9,6 +9,12 @@ name = "shiyuan_lib"
 # 只做 Windows 桌面端，因此不产出 staticlib/cdylib（那是 Tauri 移动端的要求）；
 # MinGW 的 ld 在 cdylib 导出符号序号超过 65535 时会报 "export ordinal too large"。
 crate-type = ["rlib"]
+
+# 包名保留 shiyuan（数据目录、MCP 与侧车路径都依赖它），
+# 只把用户可见的主程序名改成品牌英文名。
+[[bin]]
+name = "SourceLoom"
+path = "src/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -7,9 +7,12 @@ index_jobs（异步任务表）仍未建：当前解析在扫描线程内同步�
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 from .config import db_path
+
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -54,6 +57,51 @@ CREATE TABLE IF NOT EXISTS asset_locations (
 CREATE INDEX IF NOT EXISTS idx_locations_asset ON asset_locations(asset_id);
 CREATE INDEX IF NOT EXISTS idx_locations_native ON asset_locations(source_id, native_file_id);
 CREATE INDEX IF NOT EXISTS idx_locations_avail ON asset_locations(source_id, availability);
+
+-- 项目：逻辑知识空间，不是物理文件夹；文件始终留在原位置。
+-- 同一资产可被多个项目引用，项目关系不复制资产、不重复解析、不重复生成向量。
+CREATE TABLE IF NOT EXISTS projects (
+    project_id       TEXT PRIMARY KEY,
+    name             TEXT NOT NULL,
+    description      TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'active',          -- active / archived
+    kind             TEXT NOT NULL DEFAULT 'standard',        -- global / standard
+    retrieval_policy TEXT NOT NULL DEFAULT 'project_first',    -- project_first / expanded / global
+    privacy_policy   TEXT NOT NULL DEFAULT 'external_allowed', -- external_allowed / local_only
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+-- 全局项目有且只有一个：数据页录入的文件夹自动属于它，子项目按需拉取。
+-- 唯一索引在补列之后创建，旧库才能先 ADD COLUMN kind 再建索引。
+
+CREATE TABLE IF NOT EXISTS project_sources (
+    project_id       TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    source_id        TEXT NOT NULL REFERENCES sources(source_id) ON DELETE CASCADE,
+    relation_type    TEXT NOT NULL DEFAULT 'primary',          -- primary / linked
+    retrieval_policy TEXT NOT NULL DEFAULT 'inherit',
+    path_prefix      TEXT NOT NULL DEFAULT '',                 -- 数据源内子目录（rel_path 前缀）
+    created_at       TEXT NOT NULL,
+    PRIMARY KEY (project_id, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_sources_source
+    ON project_sources(source_id);
+
+CREATE TABLE IF NOT EXISTS project_assets (
+    project_id      TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    asset_id        TEXT NOT NULL REFERENCES assets(asset_id) ON DELETE CASCADE,
+    membership_type TEXT NOT NULL DEFAULT 'primary',           -- primary / linked / excluded
+    priority        INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'active',
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (project_id, asset_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_assets_asset
+    ON project_assets(asset_id);
+CREATE INDEX IF NOT EXISTS idx_project_assets_type
+    ON project_assets(project_id, membership_type);
 
 CREATE TABLE IF NOT EXISTS content_versions (
     version_id  TEXT PRIMARY KEY,
@@ -128,6 +176,8 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_artifact ON chunks(artifact_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_version ON chunks(version_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_asset ON chunks(asset_id);
+-- 项目统计需要「某资产的 chunk + 是否有向量」，复合索引避免回表读正文。
+CREATE INDEX IF NOT EXISTS idx_chunks_asset_chunk ON chunks(asset_id, chunk_id);
 
 -- 中文没有词边界，trigram 让"结果表"这类子串可以直接命中（查询需 ≥3 字符，
 -- 更短的查询在 search.py 里退化为 LIKE 扫描）。
@@ -164,6 +214,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_source ON index_jobs(source_id);
 -- 可选语义检索：按 chunk 保存向量，模型名参与匹配；换模型需要重建。
 CREATE TABLE IF NOT EXISTS chunk_embeddings (
     chunk_id   TEXT PRIMARY KEY,
+    asset_id   TEXT,
     model      TEXT NOT NULL,
     dim        INTEGER NOT NULL,
     vector     BLOB NOT NULL,
@@ -259,6 +310,7 @@ CREATE TABLE IF NOT EXISTS external_clients (
     transport    TEXT NOT NULL,            -- mcp / http
     token        TEXT NOT NULL,
     state        TEXT NOT NULL DEFAULT 'active',
+    project_id   TEXT,                     -- 绑定的项目；为空按全局项目处理
     created_at   TEXT NOT NULL,
     last_test_at TEXT,
     last_status  TEXT,                     -- ok / failed
@@ -361,6 +413,16 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_vectors_model
 """
 
 
+# v2/v3 新增列的索引必须在 _ensure_columns 之后创建，旧库才能先补列再建索引。
+POST_MIGRATION_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_global
+    ON projects(kind) WHERE kind = 'global';
+CREATE INDEX IF NOT EXISTS idx_embeddings_asset ON chunk_embeddings(asset_id);
+CREATE INDEX IF NOT EXISTS idx_external_clients_project
+    ON external_clients(project_id);
+"""
+
+
 def connect(path: Path | str | None = None) -> sqlite3.Connection:
     target = Path(path) if path is not None else db_path()
     # FastAPI 的同步依赖可能在线程池的不同线程里初始化与收尾，连接不能沿用
@@ -392,6 +454,10 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
             "image_count": "INTEGER NOT NULL DEFAULT 0",
         },
         "chunks": {"bbox": "TEXT"},
+        "project_sources": {"path_prefix": "TEXT NOT NULL DEFAULT ''"},
+        "projects": {"kind": "TEXT NOT NULL DEFAULT 'standard'"},
+        "external_clients": {"project_id": "TEXT"},
+        "chunk_embeddings": {"asset_id": "TEXT"},
     }
     for table, columns in additions.items():
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -400,7 +466,99 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
+def _schema_version(conn: sqlite3.Connection) -> int:
+    """读取数据库结构版本；没有记录但有 sources 表视为 v1。"""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'app_settings'"
+    ).fetchone()
+    if exists is None:
+        return 0
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = 'schema_version'").fetchone()
+    if row is None:
+        return 1
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        return 1
+
+
+def _database_file(conn: sqlite3.Connection) -> Path | None:
+    for row in conn.execute("PRAGMA database_list"):
+        if row["name"] == "main" and row["file"]:
+            return Path(row["file"])
+    return None
+
+
+def _backfill_embedding_assets(conn: sqlite3.Connection) -> None:
+    """v3：把向量行关联到资产，项目统计与范围过滤不再回表读向量。"""
+    pending = conn.execute(
+        "SELECT 1 FROM chunk_embeddings WHERE asset_id IS NULL LIMIT 1").fetchone()
+    if pending is None:
+        return
+    conn.execute(
+        "UPDATE chunk_embeddings SET asset_id = ("
+        " SELECT c.asset_id FROM chunks c WHERE c.chunk_id = chunk_embeddings.chunk_id)"
+        " WHERE asset_id IS NULL")
+
+
+def _ensure_global_project(conn: sqlite3.Connection) -> None:
+    """确保全局项目存在，并把历史外部连接归入全局项目。
+
+    全局项目是虚拟的：数据页录入的文件夹天然属于它，不写 project_sources，
+    也不复制 project_assets；子项目按需通过 source_id 拉取。
+    """
+    from .projects import GLOBAL_PROJECT_DESCRIPTION, GLOBAL_PROJECT_ID, GLOBAL_PROJECT_NAME
+
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    conn.execute(
+        "INSERT OR IGNORE INTO projects"
+        " (project_id, name, description, status, kind, retrieval_policy,"
+        "  privacy_policy, created_at, updated_at)"
+        " VALUES (?, ?, ?, 'active', 'global', 'global', 'external_allowed', ?, ?)",
+        (GLOBAL_PROJECT_ID, GLOBAL_PROJECT_NAME, GLOBAL_PROJECT_DESCRIPTION, now, now),
+    )
+    conn.execute(
+        "UPDATE projects SET kind = 'global', status = 'active',"
+        " retrieval_policy = 'global' WHERE project_id = ?",
+        (GLOBAL_PROJECT_ID,),
+    )
+    conn.execute(
+        "UPDATE external_clients SET project_id = ?"
+        " WHERE project_id IS NULL OR project_id = ''",
+        (GLOBAL_PROJECT_ID,),
+    )
+
+
+def _backup_database(conn: sqlite3.Connection) -> str | None:
+    """结构升级前做一次在线备份，文件名带时间戳，不和正式库混用。"""
+    target = _database_file(conn)
+    if target is None or not target.exists():
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = target.with_name(f"{target.stem}.bak-{stamp}{target.suffix}")
+    dest = sqlite3.connect(str(backup))
+    try:
+        conn.backup(dest)
+    finally:
+        dest.close()
+    return str(backup)
+
+
 def init_db(conn: sqlite3.Connection) -> None:
+    version = _schema_version(conn)
+    if 0 < version < SCHEMA_VERSION:
+        # 迁移失败不能破坏原库：先备份，再执行只增不删的建表与补列。
+        _backup_database(conn)
     conn.executescript(SCHEMA)
     _ensure_columns(conn)
+    conn.executescript(POST_MIGRATION_INDEXES)
+    if version < 3:
+        _backfill_embedding_assets(conn)
+    _ensure_global_project(conn)
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES ('schema_version', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(SCHEMA_VERSION),),
+    )
     conn.commit()

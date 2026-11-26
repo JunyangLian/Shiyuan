@@ -23,7 +23,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from . import config, db, secrets_store, store
+from . import config, db, projects, secrets_store, store
 
 TOKEN_PREFIX = "syext_"
 PRESETS: dict[str, dict[str, Any]] = {
@@ -71,8 +71,11 @@ def _reveal(value: str) -> str:
         return ""
 
 
-def _client_dict(row: sqlite3.Row) -> dict:
+def _client_dict(row: sqlite3.Row, project: sqlite3.Row | None = None) -> dict:
     preset = PRESETS.get(row["preset"], {})
+    project_id = row["project_id"] or projects.GLOBAL_PROJECT_ID
+    if project is None:
+        project = None
     return {
         "client_id": row["client_id"],
         "name": row["name"],
@@ -82,6 +85,9 @@ def _client_dict(row: sqlite3.Row) -> dict:
         "transport": row["transport"],
         "transport_label": TRANSPORT_LABEL.get(row["transport"], row["transport"]),
         "state": row["state"],
+        "project_id": project_id,
+        "project_name": project["name"] if project is not None else "",
+        "project_kind": project["kind"] if project is not None else "",
         "created_at": row["created_at"],
         "last_test_at": row["last_test_at"],
         "last_status": row["last_status"],
@@ -91,31 +97,67 @@ def _client_dict(row: sqlite3.Row) -> dict:
     }
 
 
+def _project_row(conn: sqlite3.Connection, project_id: str | None) -> sqlite3.Row | None:
+    target = (project_id or "").strip() or projects.GLOBAL_PROJECT_ID
+    return conn.execute(
+        "SELECT * FROM projects WHERE project_id = ?", (target,)).fetchone()
+
+
+def _require_project(conn: sqlite3.Connection, project_id: str | None) -> sqlite3.Row:
+    row = _project_row(conn, project_id)
+    if row is None or row["status"] != "active":
+        raise ValueError("项目不存在或已归档")
+    return row
+
+
 def get_client(conn: sqlite3.Connection, client_id: str) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM external_clients WHERE client_id = ?", (client_id,)
     ).fetchone()
 
 
-def list_clients(conn: sqlite3.Connection) -> list[dict]:
+def list_clients(conn: sqlite3.Connection, project_id: str | None = None) -> list[dict]:
+    clauses = []
+    params: list = []
+    if project_id:
+        clauses.append("COALESCE(NULLIF(c.project_id, ''), ?) = ?")
+        params.extend([projects.GLOBAL_PROJECT_ID, project_id])
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     rows = conn.execute(
-        "SELECT * FROM external_clients ORDER BY created_at DESC, rowid DESC"
+        "SELECT c.*, p.name AS project_name, p.kind AS project_kind"
+        " FROM external_clients c"
+        " LEFT JOIN projects p ON p.project_id ="
+        "   COALESCE(NULLIF(c.project_id, ''), ?)"
+        f"{where} ORDER BY c.created_at DESC, c.rowid DESC",
+        [projects.GLOBAL_PROJECT_ID, *params],
     ).fetchall()
-    return [_client_dict(row) for row in rows]
+    items = []
+    for row in rows:
+        items.append(_client_dict(row, {
+            "name": row["project_name"] or projects.GLOBAL_PROJECT_NAME,
+            "kind": row["project_kind"] or "global",
+        }))
+    return items
 
 
 def create_client(conn: sqlite3.Connection, *, preset: str, transport: str = "mcp",
-                  name: str | None = None) -> dict:
+                  name: str | None = None, project_id: str | None = None) -> dict:
     preset = (preset or "").strip()
     if preset not in PRESETS:
         raise ValueError("未知的 Agent 品牌")
     transport = (transport or "mcp").strip().lower()
     if transport not in PRESETS[preset]["transports"]:
         raise ValueError("该品牌不支持这种连接方式")
+    project = _require_project(conn, project_id)
+    if project["privacy_policy"] != "external_allowed":
+        raise ValueError("该项目仅允许本地使用，不能创建外部接口")
 
     base = (name or "").strip()[:40] or str(PRESETS[preset]["label"])
     existing = {
-        row["name"] for row in conn.execute("SELECT name FROM external_clients").fetchall()
+        row["name"] for row in conn.execute(
+            "SELECT name FROM external_clients WHERE"
+            " COALESCE(NULLIF(project_id, ''), ?) = ?",
+            (projects.GLOBAL_PROJECT_ID, project["project_id"])).fetchall()
     }
     candidate = base
     suffix = 2
@@ -127,14 +169,16 @@ def create_client(conn: sqlite3.Connection, *, preset: str, transport: str = "mc
     token = TOKEN_PREFIX + secrets.token_urlsafe(24)
     conn.execute(
         "INSERT INTO external_clients"
-        " (client_id, name, preset, transport, token, state, created_at, call_count)"
-        " VALUES (?, ?, ?, ?, ?, 'active', ?, 0)",
-        (client_id, candidate, preset, transport, _protect(token), store.now_iso()),
+        " (client_id, name, preset, transport, token, state, project_id,"
+        "  created_at, call_count)"
+        " VALUES (?, ?, ?, ?, ?, 'active', ?, ?, 0)",
+        (client_id, candidate, preset, transport, _protect(token),
+         project["project_id"], store.now_iso()),
     )
     conn.commit()
     row = get_client(conn, client_id)
     assert row is not None
-    return _client_dict(row)
+    return _client_dict(row, project)
 
 
 def delete_client(conn: sqlite3.Connection, client_id: str) -> dict:
@@ -179,7 +223,7 @@ def authenticate(token: str) -> dict | None:
         if row is None:
             return None
         record_usage(conn, row["client_id"])
-        return _client_dict(row)
+        return _client_dict(row, _project_row(conn, row["project_id"]))
     finally:
         conn.close()
 
@@ -189,11 +233,15 @@ def client_config(conn: sqlite3.Connection, client_id: str) -> dict:
     if row is None:
         raise KeyError(client_id)
     token = _reveal(row["token"])
+    project = _project_row(conn, row["project_id"])
+    project_name = project["name"] if project is not None else projects.GLOBAL_PROJECT_NAME
     payload: dict[str, Any] = {
         "client_id": client_id,
         "name": row["name"],
         "preset": row["preset"],
         "transport": row["transport"],
+        "project_id": project["project_id"] if project is not None else projects.GLOBAL_PROJECT_ID,
+        "project_name": project_name,
         "mcp": None,
         "http": None,
         "notes": [],
@@ -211,6 +259,7 @@ def client_config(conn: sqlite3.Connection, client_id: str) -> dict:
             "snippet": json.dumps(snippet, ensure_ascii=True, indent=2),
         }
         payload["notes"] = [
+            f"该接口只能读取「{project_name}」项目的数据。",
             "把这段 mcpServers 配置放进对应 Agent 的 MCP 设置中即可。",
             "MCP 为只读访问：可以检索、读取正文与统计，不会扫描或修改原文件。",
             "删除该连接后，令牌立即失效。",
@@ -223,6 +272,7 @@ def client_config(conn: sqlite3.Connection, client_id: str) -> dict:
             "endpoints": HTTP_ENDPOINTS,
         }
         payload["notes"] = [
+            f"该接口只能读取「{project_name}」项目的数据。",
             "在 Agent 的 HTTP 工具配置中填入 Base URL 与 Authorization 请求头。",
             "该令牌只允许只读检索、问答与统计接口，不能修改数据源或设置。",
             "删除该连接后，令牌立即失效。",

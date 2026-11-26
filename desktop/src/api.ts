@@ -263,6 +263,9 @@ export interface ExternalClient {
   transport: ExternalTransport;
   transport_label: string;
   state: string;
+  project_id: string;
+  project_name: string;
+  project_kind: "global" | "standard" | "";
   created_at: string;
   last_test_at: string | null;
   last_status: "ok" | "failed" | null;
@@ -276,6 +279,8 @@ export interface ExternalClientConfig {
   name: string;
   preset: ExternalPreset;
   transport: ExternalTransport;
+  project_id: string;
+  project_name: string;
   mcp: {
     command: string;
     args: string[];
@@ -496,6 +501,7 @@ export interface AnswerResult {
   warning: string | null;
   session_id?: string | null;
   plan?: RetrievalPlan | null;
+  scope?: RetrievalScopeInfo | null;
   coverage: {
     content_indexed: number;
     content_pending: number;
@@ -505,6 +511,75 @@ export interface AnswerResult {
     ocr_indexed: number;
     ocr_pending: number;
   };
+}
+
+export type RetrievalScope = "project" | "expanded" | "global";
+
+export interface RetrievalScopeInfo {
+  requested: RetrievalScope;
+  used: RetrievalScope;
+  expanded: boolean;
+  project_id: string | null;
+}
+
+export interface ProjectStats {
+  assets: number;
+  primary: number;
+  linked: number;
+  excluded: number;
+  usable: number;
+  parsed: number;
+  embedded: number;
+  failed: number;
+  pending: number;
+  sources: number;
+  last_updated: string | null;
+}
+
+export interface ProjectSource {
+  source_id: string;
+  relation_type: "primary" | "linked";
+  path_prefix: string;
+  label: string;
+  root_uri: string;
+  state: string;
+  health: string;
+  last_scan_at: string | null;
+  available: number;
+}
+
+export interface Project {
+  project_id: string;
+  name: string;
+  description: string;
+  status: "active" | "archived";
+  kind: "global" | "standard";
+  retrieval_policy: "project_first" | "expanded" | "global";
+  privacy_policy: "external_allowed" | "local_only";
+  created_at: string;
+  updated_at: string;
+  stats?: ProjectStats;
+  sources?: ProjectSource[];
+  source_count?: number;
+  primary_count?: number;
+  linked_count?: number;
+  excluded_count?: number;
+}
+
+export interface ProjectAsset {
+  asset_id: string;
+  location_id: string;
+  name: string;
+  path: string;
+  rel_path?: string;
+  ext: string;
+  size: number;
+  membership_type: "primary" | "linked" | "excluded";
+  priority?: number;
+  source_label?: string;
+  parse_state?: string | null;
+  parse_message?: string | null;
+  projects?: string[];
 }
 
 export interface ChatSession {
@@ -715,7 +790,8 @@ export interface AskStreamHandlers {
 
 async function askStreamRequest(
   question: string,
-  options: { sourceId?: string; ext?: string; topK?: number; sessionId?: string },
+  options: { sourceId?: string; ext?: string; topK?: number; sessionId?: string;
+    projectId?: string; scope?: RetrievalScope },
   handlers: AskStreamHandlers,
   retry = true,
 ): Promise<void> {
@@ -732,6 +808,8 @@ async function askStreamRequest(
       ...(options.ext ? { ext: options.ext } : {}),
       ...(options.topK ? { top_k: options.topK } : {}),
       ...(options.sessionId ? { session_id: options.sessionId } : {}),
+      ...(options.projectId ? { project_id: options.projectId } : {}),
+      ...(options.scope ? { scope: options.scope } : {}),
     }),
   });
   if (response.status === 401 && retry) {
@@ -835,19 +913,119 @@ export const api = {
   setState: (id: string, state: "active" | "paused") =>
     request<{ state: string }>(`/api/sources/${id}/state?state=${state}`, { method: "POST" }),
   removeSource: (id: string) => request<{ assets_cleared: number }>(`/api/sources/${id}`, { method: "DELETE" }),
-  search: (query: string, options: { limit?: number; sourceId?: string; ext?: string } = {}) => {
+  search: (query: string, options: { limit?: number; sourceId?: string; ext?: string;
+    projectId?: string; scope?: RetrievalScope } = {}) => {
     const params = new URLSearchParams({ q: query, limit: String(options.limit ?? 50) });
     if (options.sourceId) params.set("source_id", options.sourceId);
     if (options.ext) params.set("ext", options.ext);
+    if (options.projectId) params.set("project_id", options.projectId);
+    if (options.scope) params.set("scope", options.scope);
     return request<SearchResponse>(`/api/search?${params.toString()}`);
   },
   stats: () => request<OverviewStats>("/api/stats"),
+  projects: (options: { includeArchived?: boolean; externalOnly?: boolean } = {}) => {
+    const params = new URLSearchParams();
+    if (options.includeArchived) params.set("include_archived", "true");
+    if (options.externalOnly) params.set("external_only", "true");
+    return request<{ items: Project[]; total: number }>(`/api/projects?${params.toString()}`);
+  },
+  createProject: (payload: {
+    name: string;
+    description?: string;
+    folders?: string[];
+    retrieval_policy?: string;
+    privacy_policy?: string;
+  }) =>
+    request<{ project: Project; sources: { source_id?: string; root?: string; error?: string; assets_linked?: number }[] }>(
+      "/api/projects",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  project: (id: string) => request<Project>(`/api/projects/${id}`),
+  updateProject: (id: string, payload: Partial<{
+    name: string;
+    description: string;
+    status: string;
+    retrieval_policy: string;
+    privacy_policy: string;
+  }>) =>
+    request<{ project: Project }>(`/api/projects/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  deleteProject: (id: string) =>
+    request<{ deleted: boolean }>(`/api/projects/${id}`, { method: "DELETE" }),
+  addProjectSource: (id: string, payload: {
+    root?: string;
+    source_id?: string;
+    relation_type?: string;
+    path_prefix?: string;
+  }) =>
+    request<{ source_id: string; assets_linked: number }>(`/api/projects/${id}/sources`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  removeProjectSource: (id: string, sourceId: string) =>
+    request<{ removed: boolean; assets_removed: number }>(
+      `/api/projects/${id}/sources/${sourceId}`,
+      { method: "DELETE" },
+    ),
+  projectAssets: (id: string, options: {
+    membership?: string;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  } = {}) => {
+    const params = new URLSearchParams({
+      limit: String(options.limit ?? 100),
+      offset: String(options.offset ?? 0),
+    });
+    if (options.membership) params.set("membership", options.membership);
+    if (options.q) params.set("q", options.q);
+    return request<{ items: ProjectAsset[]; total: number; limit: number; offset: number }>(
+      `/api/projects/${id}/assets?${params.toString()}`,
+    );
+  },
+  addProjectAssets: (id: string, payload: {
+    asset_ids?: string[];
+    paths?: string[];
+    membership_type?: string;
+    priority?: number;
+  }) =>
+    request<{ updated: number; missing?: string[] }>(`/api/projects/${id}/assets`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  removeProjectAsset: (id: string, assetId: string) =>
+    request<{ removed: boolean; action?: string }>(
+      `/api/projects/${id}/assets/${assetId}`,
+      { method: "DELETE" },
+    ),
+  projectKnowledge: (id: string) =>
+    request<{
+      summaries: { title: string; summary: string; path?: string | null }[];
+      entities: { name: string; type: string; description: string; path?: string | null }[];
+      relations: { subject: string; predicate: string; object: string; path?: string | null }[];
+      questions: { question: string; answer: string; path?: string | null }[];
+    }>(`/api/projects/${id}/knowledge`),
+  assets: (options: { unassigned?: boolean; q?: string; limit?: number; offset?: number } = {}) => {
+    const params = new URLSearchParams({
+      limit: String(options.limit ?? 100),
+      offset: String(options.offset ?? 0),
+    });
+    if (options.unassigned) params.set("unassigned", "true");
+    if (options.q) params.set("q", options.q);
+    return request<{ items: ProjectAsset[]; total: number; limit: number; offset: number }>(
+      `/api/assets?${params.toString()}`,
+    );
+  },
   askStream: (
     question: string,
-    options: { sourceId?: string; ext?: string; topK?: number; sessionId?: string },
+    options: { sourceId?: string; ext?: string; topK?: number; sessionId?: string;
+      projectId?: string; scope?: RetrievalScope },
     handlers: AskStreamHandlers,
   ) => askStreamRequest(question, options, handlers),
-  ask: (question: string, options: { sourceId?: string; ext?: string; topK?: number; sessionId?: string } = {}) =>
+  ask: (question: string, options: { sourceId?: string; ext?: string; topK?: number;
+    sessionId?: string; projectId?: string; scope?: RetrievalScope } = {}) =>
     request<AnswerResult>("/api/ask", {
       method: "POST",
       body: JSON.stringify({
@@ -856,6 +1034,8 @@ export const api = {
         ...(options.ext ? { ext: options.ext } : {}),
         ...(options.topK ? { top_k: options.topK } : {}),
         ...(options.sessionId ? { session_id: options.sessionId } : {}),
+        ...(options.projectId ? { project_id: options.projectId } : {}),
+        ...(options.scope ? { scope: options.scope } : {}),
       }),
     }),
   chatSessions: () => request<{ items: ChatSession[] }>("/api/chat/sessions"),
@@ -972,15 +1152,24 @@ export const api = {
       `/api/sources/${sourceId}/parse-results?${params.toString()}`,
     );
   },
-  externalClients: () => request<{ items: ExternalClient[] }>("/api/external/clients"),
+  externalClients: (projectId?: string) =>
+    request<{ items: ExternalClient[] }>(
+      `/api/external/clients${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`,
+    ),
   createExternalClient: (payload: {
     name?: string;
     preset: ExternalPreset;
     transport?: ExternalTransport;
+    projectId?: string;
   }) =>
     request<{ client: ExternalClient }>("/api/external/clients", {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        name: payload.name,
+        preset: payload.preset,
+        transport: payload.transport,
+        project_id: payload.projectId,
+      }),
     }),
   deleteExternalClient: (id: string) =>
     request<{ client_id: string; deleted: boolean }>(`/api/external/clients/${id}`, {

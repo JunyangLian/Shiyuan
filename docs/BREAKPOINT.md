@@ -15,14 +15,14 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 242 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 260 passed | `cd core && python -m pytest -q` |
 | 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
 | 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
 | 前端单元测试 | 17 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `Shiyuan_0.1.7_x64-setup.exe`（约 138MiB，onedir 核心随包分发，含多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），静默安装后 `/api/health` 无令牌 401、带令牌 200 |
+| 桌面端安装包 | 完成 | `SourceLoom_0.2.0_x64-setup.exe`（约 138MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），打包后核心 MCP 握手约 1.6 秒 |
 
 ## 二、已实现范围（M1）
 
@@ -453,6 +453,62 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 - 测试：后端 242、前端 17；问答评测主集 27/28、第三集 10/10（唯一失分为 Table S1 的
   `Contig` 细节，模型偶发不提）。
 
+## 三点十一、本轮（v0.2.0）项目知识空间与范围检索
+
+- 数据模型：新增 `projects` / `project_sources` / `project_assets`；`project_sources.path_prefix`
+  支持只关联数据源内子目录。`SCHEMA_VERSION = 2`，升级前自动在线备份，
+  只增表 / 补列，不删除旧表；真实库迁移 18.5 秒，计数一致、外键 0 违规、`quick_check` ok。
+- 资产与索引复用：项目只建关系，不复制资产、不重复解析 / 切块 / 向量 / 摘要。
+  同一论文加入 10 个项目后 `assets` / `chunks` / `chunk_embeddings` 均不变（自动化测试 + 真实库验证）。
+- 扫描联动：`scanner` 完成位置更新后调用 `projects.sync_source_assets`，按前缀补主资料 /
+  关联资料，保留已有排除；新增文件夹若已在授权数据源内则直接复用，不再重扫。
+- 检索范围：Project / Expanded / Global；`answer` 以确定性条件逐级扩展
+  （Project 证据 < 2 时扩到 Expanded，再扩 Global），只有真正补到证据才更新 `used`。
+  路径召回、正文召回、语义召回都在项目范围内进行；语义查询先过滤再取 Top-K，
+  并复用 int8 向量缓存做内存掩码，避免小项目漏召回。
+- 修复：`find_chunks` 内部路径召回此前未带项目过滤，可能把项目外同名文件带入证据；
+  空项目 / 全部排除时直接返回，不再空跑 FTS 与向量扫描。
+- 性能：真实库 13,012 资产 / 382,678 chunk，三档检索中位约 2.1 秒；空项目 0ms；
+  项目统计 2.5s → 0.61s（`chunks(asset_id, chunk_id)` 复合索引 + 改写统计 SQL）。
+- API / UI：项目 CRUD、文件夹、资料分类、知识浏览、范围检索；桌面端新增「项目」页，
+  对话页可选择项目与范围并显示实际使用范围；全局资料库与未归属文件保留。
+- MCP：新增 `list_projects`、`get_project`、`search_assets`、`get_evidence`、
+  `get_document_family`、`get_related_documents`、`compare_versions`、`get_source_status`；
+  `project_id` 只允许 `external_allowed` 项目，`local_only` 对外部 Agent 不可见；MCP 保持只读。
+- 测试：后端 260（新增项目模块 12 项，覆盖复用、子目录、多项目、三种范围、排除、
+  语义范围、路径泄漏、关联资料、迁移幂等、数据源删除、API 全链路；另含全局项目、
+  令牌绑定与版本新旧）；前端 17。
+- 外部接口有用性（v3 补强）：
+  - 版本新旧：`families._version_rank` 按数字段比较（0.13 > 0.9），
+    `终稿 > 修订版 > 初稿`，无标签才退回 mtime；家族成员按版本新旧排序，
+    返回 `is_latest_version` / `family_latest_version_label` / `family_latest_mtime`。
+  - 检索：项目范围用 `VALUES` CTE 下推到 FTS 与路径召回（1564 资产约 20ms），
+    修复“项目内英文稿件被全局中文笔记挤出候选”的召回问题；实测
+    “BUSCO 完整度”前三条均为 v0.13，稿件正文可读到 98.4 / 96.4。
+  - “最新版本”问句会补齐各大家族最新版本；指定版本 / 历史问句按版本分开，
+    不再只留一个代表。点名旧版本时会把该版本成员补回候选（即使词面召回被挤占），
+    并保留 `is_latest_version=false` 与 `family_latest_version_label`。
+  - 无版本标签的家族只是重复副本：`is_latest_version` 返回 `null`，
+    `list_document_families` 不再把它们列成“多版本文档”；`weak=true` 的结果
+    只是弱线索，MCP instructions 已要求不得当作答案。
+  - 新增 MCP `list_document_families`：列出多版本文档、最新版本与全部版本标签；
+    `get_document_family` 标题修正、成员最新在前；`compare_versions` 可直接给出
+    v0.12 → v0.13 的共享 / 新增 / 删除 / 修改摘要。
+  - 评测发现：`manuscript_EN_v0.2~v0.7` 与 `CBPD_clean_v0.8~v0.13` 会被识别成两个家族，
+    当前不自动合并；`list_document_families` 会同时列出，需按最新版本与时间判断。
+- 全局项目与外部接口（v3）：
+  - `projects.kind` 新增 `global`，固定 `prj_global`，不可删除 / 归档 / 排除；
+    数据页新增文件夹天然属于全局项目，不写成员表。
+  - 子项目详情新增「从全局项目拉取」，只建 `project_sources` 关系，复用现有扫描与索引。
+  - `external_clients.project_id` 绑定项目；MCP 启动时解析令牌并注入 `MCPServer`，
+    `list_projects` / 检索 / 证据 / 正文 / 家族 / 版本对比全部按绑定项目过滤；
+    普通项目固定 `expanded`，不能通过 `project_id` 或 `scope=global` 越权。
+  - HTTP 外部令牌同样按项目限权；`/api/events`、`/api/jobs` 不再向外部令牌开放。
+  - 桌面端「外部调用」页合并进项目详情，导航由 5 项减为 4 项。
+  - `chunk_embeddings.asset_id` 回填并加索引，项目统计从 0.61s 降到 25ms；
+    全局项目统计约 0.69s。
+  - 真实库 v2 → v3 迁移 52 秒，数据量不变，外键 0 违规。
+
 ## 四、禁止操作
 
 - 不要在扫描中删除或重命名用户的原始文件；本项目对用户文件只读。
@@ -462,9 +518,11 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 
 ## 五、下一步（建议顺序）
 
-1. 检索可靠性：补充 100–200 道真实用户问句与目标文件标注，再依据基线决定 ANN、Reranker
+1. 项目层：Privacy Gateway（数据分类、字段脱敏、统一出站检查）、项目统计增量计数表、
+   项目归档 / 模板与批量成员调整。
+2. 检索可靠性：补充 100–200 道真实用户问句与目标文件标注，再依据基线决定 ANN、Reranker
    或本地小模型；当前合成基线已满分，不能据此判断真实语料。
-2. OCR 效果提升：手写识别、表格结构与版面还原、真实扫描件基准；按耗时/预算调度引擎。
-3. 对话增强：更早轮次的记忆、引用跳转与对话导出。
-4. 预算与任务：按耗时/字符数计量、任务取消与优先级、低质量文本的二次解析器。
-5. 打包优化：按需下载 OCR 组件、安装体积与冷启动进一步压缩。
+3. OCR 效果提升：手写识别、表格结构与版面还原、真实扫描件基准；按耗时/预算调度引擎。
+4. 对话增强：更早轮次的记忆、引用跳转与对话导出。
+5. 预算与任务：按耗时/字符数计量、任务取消与优先级、低质量文本的二次解析器。
+6. 打包优化：按需下载 OCR 组件、安装体积与冷启动进一步压缩。

@@ -10,11 +10,13 @@ import type {
   Citation,
   DocumentFamilyMember,
   EmbeddingSettings,
+  Project,
   QuerySettings,
+  RetrievalScope,
 } from "../api";
 import { openFile } from "../tauri";
 import Icon from "../Icon";
-import logoMark from "../assets/shiyuan-mark.svg";
+import logoMark from "../assets/sourceloom-mark.png";
 
 const PROVIDER_LABEL: Record<string, string> = {
   extractive: "本地摘录",
@@ -45,6 +47,14 @@ const EMPTY_DRAFT: Draft = {
 
 const ACTIVE_CHAT_KEY = "shiyuan.chat.active";
 const SESSIONS_COLLAPSED_KEY = "shiyuan.chat.sessions.collapsed";
+const PROJECT_KEY = "shiyuan.chat.project";
+const SCOPE_KEY = "shiyuan.chat.scope";
+
+const SCOPE_TEXT: Record<string, string> = {
+  project: "项目主资料",
+  expanded: "项目 + 关联资料",
+  global: "全局资料",
+};
 
 function rememberActiveSession(sessionId: string | null) {
   if (sessionId) {
@@ -297,6 +307,12 @@ function AnswerCard({ result }: { result: AnswerResult }) {
         待解析 {result.coverage.content_pending} · 无文本层 {result.coverage.content_empty} ·
         仅登记 {result.coverage.content_metadata_only}
       </div>
+      {result.scope && (
+        <div className="answer-scope">
+          检索范围：{SCOPE_TEXT[result.scope.used] ?? result.scope.used}
+          {result.scope.expanded ? "（证据不足，已自动扩展）" : ""}
+        </div>
+      )}
 
       {openFamily && (
         <div
@@ -389,11 +405,41 @@ export default function ChatView({ active = true }: { active?: boolean }) {
     window.localStorage.setItem(SESSIONS_COLLAPSED_KEY, sessionsCollapsed ? "1" : "0");
   }, [sessionsCollapsed]);
 
+  useEffect(() => {
+    if (!active) return;
+    api.projects()
+      .then((data) => setProjectOptions(data.items))
+      .catch(() => setProjectOptions([]));
+  }, [active]);
+
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<AnswerSettings | null>(null);
   const [draft, setDraft] = useState<Draft>(EMPTY_DRAFT);
+  const [projectOptions, setProjectOptions] = useState<Project[]>([]);
+  const [projectId, setProjectId] = useState(
+    () => window.localStorage.getItem(PROJECT_KEY) ?? "",
+  );
+  const activeProject = projectOptions.find((project) => project.project_id === projectId);
+  const globalSelected = activeProject?.kind === "global";
+  const [scope, setScope] = useState<RetrievalScope>(() => {
+    const stored = window.localStorage.getItem(SCOPE_KEY);
+    return stored === "expanded" || stored === "global" ? stored : "project";
+  });
   const [saving, setSaving] = useState(false);
   const [saveNote, setSaveNote] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (globalSelected && scope !== "global") setScope("global");
+  }, [globalSelected, scope]);
+
+  useEffect(() => {
+    if (projectId) window.localStorage.setItem(PROJECT_KEY, projectId);
+    else window.localStorage.removeItem(PROJECT_KEY);
+  }, [projectId]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SCOPE_KEY, scope);
+  }, [scope]);
 
   const [embedding, setEmbedding] = useState<EmbeddingSettings | null>(null);
   const [embedDraft, setEmbedDraft] = useState({
@@ -625,7 +671,10 @@ export default function ChatView({ active = true }: { active?: boolean }) {
       };
       setMessages((current) => [...current, placeholder]);
       setStreamStatus("正在检索并筛选证据…");
-      await api.askStream(text, { sessionId }, {
+      await api.askStream(text, {
+        sessionId,
+        ...(projectId ? { projectId, scope } : {}),
+      }, {
         onStatus: (_stage, message) => setStreamStatus(message || null),
         onDelta: (chunk) => {
           setMessages((current) =>
@@ -1061,6 +1110,37 @@ export default function ChatView({ active = true }: { active?: boolean }) {
 
           <div className="chat-composer">
             {error && <div className="alert error">{error}</div>}
+
+            <div className="composer-scope">
+              <label>
+                项目
+                <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+                  <option value="">不限定项目（全局）</option>
+                  {projectOptions.map((project) => (
+                    <option key={project.project_id} value={project.project_id}>
+                      {project.kind === "global" ? `${project.name}（全部资料）` : project.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                范围
+                <select
+                  value={scope}
+                  disabled={!projectId || globalSelected}
+                  onChange={(event) => setScope(event.target.value as RetrievalScope)}
+                >
+                  <option value="project">项目主资料</option>
+                  <option value="expanded">项目 + 关联</option>
+                  <option value="global">全局</option>
+                </select>
+              </label>
+              {projectId && (
+                <span className="muted small-text">
+                  {globalSelected ? "全局项目固定检索全部资料" : "证据不足时会自动扩大检索范围"}
+                </span>
+              )}
+            </div>
 
             <div className="composer-box">
               <textarea

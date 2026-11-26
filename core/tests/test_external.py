@@ -8,7 +8,7 @@ import sys
 import pytest
 from fastapi.testclient import TestClient
 
-from shiyuan import db, external
+from shiyuan import db, external, indexer, projects, scanner, store
 from shiyuan.mcp_server import DEFAULT_PROTOCOL, SERVER_NAME
 
 
@@ -145,6 +145,7 @@ def test_http_token_is_read_only_and_revocable(secured_client):
         headers=main,
     )
     assert created.status_code == 201
+    assert created.json()["client"]["project_id"] == projects.GLOBAL_PROJECT_ID
     client_id = created.json()["client"]["client_id"]
 
     config = secured_client.get(
@@ -167,6 +168,61 @@ def test_http_token_is_read_only_and_revocable(secured_client):
         f"/api/external/clients/{client_id}", headers=main
     ).status_code == 200
     assert secured_client.get("/api/health", headers=headers).status_code == 401
+
+
+def test_http_token_cannot_escape_bound_project(secured_client, tmp_path):
+    main = {"Authorization": "Bearer main-token"}
+    conn = db.connect(tmp_path / "home" / "shiyuan.db")
+    try:
+        for name, text in (("甲库", "甲库专用 样本量 42"), ("乙库", "乙库专用 样本量 99")):
+            root = tmp_path / name
+            root.mkdir()
+            (root / "记录.md").write_text(text, encoding="utf-8")
+            source = store.add_source(conn, root)
+            scanner.scan_source(conn, source["source_id"])
+            indexer.index_pending(conn, source["source_id"])
+    finally:
+        conn.close()
+
+    project = secured_client.post(
+        "/api/projects",
+        json={"name": "甲项目", "folders": [str(tmp_path / "甲库")]},
+        headers=main,
+    ).json()["project"]
+    pid = project["project_id"]
+    created = secured_client.post(
+        "/api/external/clients",
+        json={"preset": "custom", "transport": "http", "project_id": pid},
+        headers=main,
+    ).json()["client"]
+    assert created["project_id"] == pid
+    config = secured_client.get(
+        f"/api/external/clients/{created['client_id']}/config", headers=main
+    ).json()
+    headers = {"Authorization": config["http"]["authorization"]}
+
+    payload = secured_client.get(
+        "/api/search", params={"q": "专用"}, headers=headers).json()
+    assert payload["scope"]["project_id"] == pid
+    assert payload["scope"]["used"] == "expanded"
+    assert payload["items"] and all("甲库" in item["path"] for item in payload["items"])
+
+    escaped = secured_client.get(
+        "/api/search",
+        params={"q": "专用", "project_id": projects.GLOBAL_PROJECT_ID},
+        headers=headers,
+    )
+    assert escaped.status_code == 403
+    wider = secured_client.get(
+        "/api/search", params={"q": "专用", "scope": "global"}, headers=headers).json()
+    assert wider["scope"]["used"] == "expanded"
+    assert all("乙库" not in item["path"] for item in wider["items"])
+
+    sources = secured_client.get("/api/sources", headers=headers).json()["items"]
+    assert [item["label"] for item in sources] == ["甲库"]
+    stats = secured_client.get("/api/stats", headers=headers).json()
+    assert stats["scope"]["project_id"] == pid
+    assert stats["files"]["available"] == 1
 
 
 def test_external_endpoints_validate_presets(secured_client):

@@ -108,6 +108,40 @@ _JOINS_NO_FTS = (
     " JOIN sources s ON s.source_id = l.source_id"
 )
 
+# 项目范围直接下推到 FTS：先限定资产再召回，避免项目内文档被全局候选挤出。
+# 用 VALUES CTE 而不是临时表，MCP 的 query_only 连接也能用。
+_SCOPE_CTE_MAX = 20000
+
+
+def _scope_sql(allowed_assets: set[str] | None,
+               excluded_assets: set[str] | None) -> tuple[str, list[str], str]:
+    """返回 (WITH 前缀, 参数, WHERE 片段)；无法用 SQL 表达时返回空串走内存过滤。"""
+    if allowed_assets is not None:
+        if not allowed_assets:
+            return "", [], "0"
+        ids = list(allowed_assets)
+        if excluded_assets:
+            ids = [asset_id for asset_id in ids if asset_id not in excluded_assets]
+        if not ids:
+            return "", [], "0"
+        if len(ids) > _SCOPE_CTE_MAX:
+            return "", [], ""
+        marks = ",".join("(?)" for _ in ids)
+        return (
+            f"WITH scope_assets(asset_id) AS (VALUES {marks}) ",
+            ids,
+            "{alias}.asset_id IN (SELECT asset_id FROM scope_assets)",
+        )
+    if excluded_assets:
+        ids = list(excluded_assets)
+        marks = ",".join("(?)" for _ in ids)
+        return (
+            f"WITH scope_excluded(asset_id) AS (VALUES {marks}) ",
+            ids,
+            "{alias}.asset_id NOT IN (SELECT asset_id FROM scope_excluded)",
+        )
+    return "", [], ""
+
 
 @dataclass
 class ChunkHit:
@@ -278,8 +312,12 @@ def _path_score(path: str, analysis: dict) -> tuple[int, int, int, bool, str | N
 
 def path_matches(conn: sqlite3.Connection, analysis: dict, *,
                  source_id: str | None = None, ext: str | None = None,
-                 limit: int = PATH_MATCH_LIMIT) -> dict[str, PathMatch]:
+                 limit: int = PATH_MATCH_LIMIT,
+                 allowed_assets: set[str] | None = None,
+                 excluded_assets: set[str] | None = None) -> dict[str, PathMatch]:
     """按完整路径召回：文件夹名 + 文件名 + 正文之外的位置信息。"""
+    if allowed_assets is not None and not allowed_assets:
+        return {}
     variants = [variant for variant in analysis["variants"] if len(variant) >= 2][:48]
     if not variants:
         return {}
@@ -302,15 +340,24 @@ def path_matches(conn: sqlite3.Connection, analysis: dict, *,
         "(" + " OR ".join("instr(lower(l.path), ?) > 0" for _ in terms) + ")"
     )
     params.extend(terms)
+    scope_prefix, scope_params, scope_clause = _scope_sql(
+        allowed_assets, excluded_assets)
+    if scope_clause:
+        clauses.append(scope_clause.format(alias="l"))
     rows = conn.execute(
-        "SELECT l.location_id, l.asset_id, l.path, s.root_uri FROM asset_locations l"
+        f"{scope_prefix}SELECT l.location_id, l.asset_id, l.path, s.root_uri"
+        " FROM asset_locations l"
         " JOIN sources s ON s.source_id = l.source_id"
         " WHERE " + " AND ".join(clauses) + " LIMIT ?",
-        [*params, max(1, min(limit, PATH_MATCH_LIMIT))],
+        [*scope_params, *params, max(1, min(limit, PATH_MATCH_LIMIT))],
     ).fetchall()
 
     matches: dict[str, PathMatch] = {}
     for row in rows:
+        if allowed_assets is not None and row["asset_id"] not in allowed_assets:
+            continue
+        if excluded_assets and row["asset_id"] in excluded_assets:
+            continue
         root = row["root_uri"] or ""
         relative = _relative_path(row["path"], root)
         (score, concepts, matched_variants, name_matched,
@@ -366,14 +413,21 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
                 source_id: str | None = None, ext: str | None = None,
                 limit: int = CANDIDATE_LIMIT,
                 focus: list[str] | None = None,
-                path_only: bool = False) -> list[ChunkHit]:
+                path_only: bool = False,
+                allowed_assets: set[str] | None = None,
+                excluded_assets: set[str] | None = None,
+                path_index: dict[str, PathMatch] | None = None) -> list[ChunkHit]:
     analysis = analysis or query.analyze(text)
     variants: list[str] = analysis["variants"]
-    if not variants:
+    if not variants or (allowed_assets is not None and not allowed_assets):
         return []
 
     where = ["s.state = 'active'", "l.availability = 'AVAILABLE'"]
     params: list[object] = []
+    scope_prefix, scope_params, scope_clause = _scope_sql(
+        allowed_assets, excluded_assets)
+    if scope_clause:
+        where.append(scope_clause.format(alias="c"))
     if source_id:
         where.append("l.source_id = ?")
         params.append(source_id)
@@ -387,10 +441,11 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
     if fts_units:
         match = " OR ".join('"' + unit.replace('"', '""') + '"' for unit in fts_units)
         sql = (
-            f"{_SELECT} FROM chunk_fts{_JOINS} WHERE chunk_fts MATCH ? AND "
+            f"{scope_prefix}{_SELECT} FROM chunk_fts{_JOINS}"
+            " WHERE chunk_fts MATCH ? AND "
             + " AND ".join(where) + f" LIMIT {limit}"
         )
-        rows = conn.execute(sql, [match, *params]).fetchall()
+        rows = conn.execute(sql, [*scope_params, match, *params]).fetchall()
     if short_units:
         # FTS5 trigram 只索引 ≥3 字符的子串；两字词（如“物种”）需要 LIKE 兜底，
         # 否则同时含长短变体的问题会漏掉短词。
@@ -401,10 +456,10 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             order = (" ORDER BY (instr(lower(l.path), 'readme') > 0"
                      " OR instr(lower(l.path), 'quickstart') > 0) DESC")
         sql = (
-            f"{_SELECT}{_JOINS_NO_FTS} WHERE "
+            f"{scope_prefix}{_SELECT}{_JOINS_NO_FTS} WHERE "
             + " AND ".join(where + [f"({clauses})"]) + f"{order} LIMIT {limit}"
         )
-        extra = conn.execute(sql, [*params, *short_units]).fetchall()
+        extra = conn.execute(sql, [*scope_params, *params, *short_units]).fetchall()
         if not fts_units:
             rows = extra
         else:
@@ -430,10 +485,21 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
 
             rows = [row for row in rows if row_ok(row["text"])]
 
+    if allowed_assets is not None or excluded_assets:
+        # 项目范围过滤放在候选召回之后：避免把 asset 集合塞进 FTS 的 WHERE，
+        # 那会让 SQLite 为凑满 LIMIT 扫描全库（实测单个追问可达一分钟）。
+        rows = [
+            row for row in rows
+            if (allowed_assets is None or row["asset_id"] in allowed_assets)
+            and (not excluded_assets or row["asset_id"] not in excluded_assets)
+        ]
+
     threshold = query.minimum_concepts(analysis)
     raw_required = 1 if len(analysis["concepts"]) <= 2 else 2
     maximal = query.maximal_terms(analysis)
-    path_index = path_matches(conn, analysis, source_id=source_id, ext=ext)
+    path_index = path_index if path_index is not None else path_matches(
+        conn, analysis, source_id=source_id, ext=ext,
+        allowed_assets=allowed_assets, excluded_assets=excluded_assets)
 
     hits: list[ChunkHit] = []
     for row in rows:
@@ -491,6 +557,10 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
     for match in extra_matches:
         if added >= PATH_ONLY_LIMIT:
             break
+        if allowed_assets is not None and match.asset_id not in allowed_assets:
+            continue
+        if excluded_assets and match.asset_id in excluded_assets:
+            continue
         if path_only and not (match.specific or match.folder_specific):
             continue
         if match.concepts < threshold and not (

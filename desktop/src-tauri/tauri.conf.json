@@ -1,7 +1,8 @@
 {
   "$schema": "../../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Shiyuan",
-  "version": "0.1.7",
+  "productName": "SourceLoom",
+  "mainBinaryName": "SourceLoom",
+  "version": "0.2.0",
   "identifier": "app.shiyuan.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "拾源",
+        "title": "拾源 SourceLoom",
         "width": 1180,
         "height": 780,
         "minWidth": 960,

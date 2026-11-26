@@ -21,10 +21,12 @@ import sys
 import time
 import traceback
 from datetime import datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from . import __version__, config, db, embeddings, external, search, store
+from . import (__version__, config, db, embeddings, external, families, projects,
+               search, store)
 
 SERVER_NAME = "shiyuan-mcp"
 DEFAULT_PROTOCOL = "2025-06-18"
@@ -134,8 +136,35 @@ def _stage_of(signature: str | None) -> str:
 class MCPServer:
     """把知识库能力映射成 MCP 的 tools 与 resources。"""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, project_id: str | None = None) -> None:
         self.conn = conn
+        # 外部令牌绑定到项目后，所有读取都必须限制在该项目范围内。
+        self.bound_project_id = project_id or None
+        self.bound_global = (
+            projects.is_global(conn, self.bound_project_id)
+            if self.bound_project_id else False
+        )
+
+    def _bound_scope(self, project_id: str | None,
+                     scope: str | None) -> tuple[str | None, str | None]:
+        if not self.bound_project_id:
+            return project_id, scope
+        if project_id and project_id != self.bound_project_id:
+            raise ToolError("该接口只能访问绑定的项目")
+        if self.bound_global:
+            return self.bound_project_id, "global"
+        chosen = scope if scope in {"project", "expanded"} else "expanded"
+        return self.bound_project_id, chosen
+
+    def _visible_assets(self, scope: str = "expanded") -> set[str] | None:
+        if not self.bound_project_id:
+            return None
+        return projects.asset_filter(self.conn, self.bound_project_id, scope)[0]
+
+    def _ensure_visible(self, asset_id: str) -> None:
+        allowed = self._visible_assets()
+        if allowed is not None and asset_id not in allowed:
+            raise ToolError("该资产不在当前接口的分享范围内")
 
     # ---------------------------------------------------------------- JSON-RPC
     def handle(self, message: Any) -> dict | None:
@@ -184,6 +213,19 @@ class MCPServer:
                 "Read-only access to the local Shiyuan knowledge base. "
                 "For ordinary content questions, use search_knowledge first, then "
                 "get_document_text with the returned location_id for full context. "
+                "Projects are logical knowledge spaces: call list_projects, then pass "
+                "project_id and scope (project / expanded / global) to search_knowledge. "
+                "For version questions (which version is current, latest, historical, "
+                "or what changed), call list_document_families first, then "
+                "get_document_family for the version list and compare_versions for a diff. "
+                "Search items carry version_label, is_latest_version and "
+                "family_latest_version_label: never present an older version as current. "
+                "is_latest_version is null when the file has no version label (plain "
+                "duplicates), so do not describe such files as the latest version. "
+                "Items with weak=true are below the evidence threshold: mention them only "
+                "as weak leads, never as the answer. Items whose match is 'name' only "
+                "matched the file name or path; for factual questions prefer items with a "
+                "snippet and read them with get_document_text. "
                 "For corpus-level questions (what files exist, how many files, coverage), "
                 "call knowledge_stats and list_sources instead: search_knowledge returns "
                 "only a limited top-k sample, and its item count is not the corpus total. "
@@ -295,6 +337,154 @@ class MCPServer:
                 "inputSchema": {"type": "object", "properties": {}},
                 "annotations": readonly,
             },
+            {
+                "name": "list_projects",
+                "title": "List knowledge projects",
+                "description": (
+                    "List project knowledge spaces available to external agents. "
+                    "Projects marked local-only are omitted."
+                ),
+                "inputSchema": {"type": "object", "properties": {}},
+                "annotations": readonly,
+            },
+            {
+                "name": "get_project",
+                "title": "Get project details",
+                "description": "Return one project with members, sources and index stats.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string", "description": "Project id."},
+                    },
+                    "required": ["project_id"],
+                },
+                "annotations": readonly,
+            },
+            {
+                "name": "search_assets",
+                "title": "Search project assets",
+                "description": (
+                    "Search file names and paths with project scope. Returns asset "
+                    "locations and parse state; use search_knowledge for text evidence."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "project_id": {"type": "string"},
+                        "scope": {"type": "string",
+                                  "enum": ["project", "expanded", "global"]},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": MAX_LIMIT,
+                                  "default": DEFAULT_LIMIT},
+                    },
+                    "required": ["query"],
+                },
+                "annotations": readonly,
+            },
+            {
+                "name": "get_evidence",
+                "title": "Get original evidence",
+                "description": (
+                    "Return the original indexed chunk(s) for a chunk_id or a "
+                    "location_id, with page, sheet, path and parse stage."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "chunk_id": {"type": "string"},
+                        "location_id": {"type": "string"},
+                        "page": {"type": "integer", "minimum": 1},
+                        "sheet": {"type": "string"},
+                        "max_chars": {"type": "integer", "minimum": 100,
+                                      "maximum": MAX_MAX_CHARS, "default": 4000},
+                    },
+                    "anyOf": [{"required": ["chunk_id"]}, {"required": ["location_id"]}],
+                },
+                "annotations": readonly,
+            },
+            {
+                "name": "get_document_family",
+                "title": "Get document family",
+                "description": (
+                    "List all versions that belong to the same document family as "
+                    "the given asset. Versions are not ranked or recommended."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"asset_id": {"type": "string"}},
+                    "required": ["asset_id"],
+                },
+                "annotations": readonly,
+            },
+            {
+                "name": "compare_versions",
+                "title": "Compare two versions",
+                "description": (
+                    "Compare two assets in the same document family: shared, left-only, "
+                    "right-only and modified content groups."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "family_id": {"type": "string"},
+                        "left_asset_id": {"type": "string"},
+                        "right_asset_id": {"type": "string"},
+                    },
+                    "required": ["family_id", "left_asset_id", "right_asset_id"],
+                },
+                "annotations": readonly,
+            },
+            {
+                "name": "get_related_documents",
+                "title": "Get related documents",
+                "description": (
+                    "Find documents related to one asset: other versions in the same "
+                    "document family, and other assets in the same project."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "asset_id": {"type": "string"},
+                        "location_id": {"type": "string"},
+                        "path": {"type": "string"},
+                        "project_id": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1,
+                                  "maximum": 100, "default": 20},
+                    },
+                },
+                "annotations": readonly,
+            },
+            {
+                "name": "list_document_families",
+                "title": "List document families",
+                "description": (
+                    "List multi-version document families in the shared project, with "
+                    "the latest version first. Use this to answer 'which version is "
+                    "current' before reading a specific document."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1,
+                                  "maximum": 50, "default": 10},
+                    },
+                },
+                "annotations": readonly,
+            },
+            {
+                "name": "get_source_status",
+                "title": "Get source status",
+                "description": (
+                    "Return authorized folders with scan health, availability and "
+                    "file counts. Optionally filter by source_id."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"source_id": {"type": "string"}},
+                },
+                "annotations": readonly,
+            },
         ]
 
     def _call_tool(self, params: dict) -> dict:
@@ -312,6 +502,24 @@ class MCPServer:
                 payload = self._list_sources()
             elif name == "knowledge_stats":
                 payload = self._stats()
+            elif name == "list_projects":
+                payload = self._list_projects()
+            elif name == "get_project":
+                payload = self._get_project(arguments)
+            elif name == "search_assets":
+                payload = self._search(arguments)
+            elif name == "get_evidence":
+                payload = self._get_evidence(arguments)
+            elif name == "get_document_family":
+                payload = self._document_family(arguments)
+            elif name == "compare_versions":
+                payload = self._compare_versions(arguments)
+            elif name == "get_related_documents":
+                payload = self._related_documents(arguments)
+            elif name == "list_document_families":
+                payload = self._list_document_families(arguments)
+            elif name == "get_source_status":
+                payload = self._source_status(arguments)
             else:
                 return _tool_error(f"未知工具：{name}")
         except ToolError as exc:
@@ -330,10 +538,32 @@ class MCPServer:
         offset = _integer(args, "offset", 0, 0, 1000)
         ext = _string(args, "ext", required=False)
         source_id = _string(args, "source_id", required=False)
+        project_id = _string(args, "project_id", required=False)
+        scope = _string(args, "scope", required=False)
+        project_id, scope = self._bound_scope(project_id, scope)
+        allowed = excluded = priority = None
+        used_scope = "global"
+        if project_id:
+            self._project(project_id, require_external=True)
+            used_scope = projects.scope_for(self.conn, project_id, scope)
+            allowed, excluded = projects.asset_filter(
+                self.conn, project_id, used_scope)
+            priority = projects.asset_filter(
+                self.conn, project_id, "project")[0]
         result = search.search(
             self.conn, query, limit=limit, offset=offset,
             source_id=source_id, ext=ext,
+            allowed_assets=allowed, excluded_assets=excluded,
+            priority_assets=priority,
         )
+        memberships: dict[str, str] = {}
+        if project_id:
+            memberships = {
+                row["asset_id"]: row["membership_type"]
+                for row in self.conn.execute(
+                    "SELECT asset_id, membership_type FROM project_assets"
+                    " WHERE project_id = ?", (project_id,))
+            }
         items = [
             {
                 "location_id": item["location_id"],
@@ -358,6 +588,12 @@ class MCPServer:
                 "family_title": item.get("family_title"),
                 "version_label": item.get("version_label"),
                 "family_versions": item.get("family_versions"),
+                "is_latest_version": item.get("is_latest_version"),
+                "family_latest_asset_id": item.get("family_latest_asset_id"),
+                "family_latest_version_label": item.get("family_latest_version_label"),
+                "family_latest_mtime": item.get("family_latest_mtime"),
+                "weak": item.get("weak"),
+                "project_membership": memberships.get(item["asset_id"]),
             }
             for item in result["items"]
         ]
@@ -369,6 +605,7 @@ class MCPServer:
             "rewritten": result.get("rewritten"),
             "vector_used": result.get("vector_used", False),
             "vector_error": result.get("vector_error"),
+            "scope": {"project_id": project_id, "used": used_scope},
             "items": items,
         }
 
@@ -399,6 +636,7 @@ class MCPServer:
             raise ToolError(f"文件当前不可检索：{row['availability']}")
         if row["source_state"] != "active":
             raise ToolError("所属数据源已暂停，恢复后才能读取")
+        self._ensure_visible(row["asset_id"])
         return row
 
     def _document_text(self, args: dict) -> dict:
@@ -569,8 +807,13 @@ class MCPServer:
         return l1 or [chunk for chunk in chunks if chunk["stage"] == "L2"]
 
     def _list_sources(self) -> dict:
+        allowed_sources = None
+        if self.bound_project_id and not self.bound_global:
+            allowed_sources = set(projects.source_ids(self.conn, self.bound_project_id))
         items = []
         for row in store.list_sources(self.conn):
+            if allowed_sources is not None and row["source_id"] not in allowed_sources:
+                continue
             stats = store.source_stats(self.conn, row["source_id"])
             items.append(
                 {
@@ -590,7 +833,329 @@ class MCPServer:
         return {"total": len(items), "items": items}
 
     def _stats(self) -> dict:
-        return search.stats(self.conn)
+        return projects.stats_view(self.conn, self.bound_project_id)
+
+    # ---------------------------------------------------------------- projects
+    def _project(self, project_id: str, *, require_external: bool = True):
+        row = self.conn.execute(
+            "SELECT * FROM projects WHERE project_id = ? AND status = 'active'",
+            (project_id,),
+        ).fetchone()
+        if row is None:
+            raise ToolError("项目不存在或已归档")
+        if require_external and row["privacy_policy"] != "external_allowed":
+            raise ToolError("该项目仅允许本地使用，不能通过 MCP 读取")
+        return row
+
+    def _list_projects(self) -> dict:
+        if self.bound_project_id:
+            self._project(self.bound_project_id, require_external=True)
+            data = projects.get_project(self.conn, self.bound_project_id)
+            if data is None:
+                return {"total": 0, "items": []}
+            data.pop("privacy_policy", None)
+            return {"total": 1, "items": [data]}
+        items = projects.list_projects(self.conn, external_only=True)
+        return {"total": len(items), "items": items}
+
+    def _get_project(self, args: dict) -> dict:
+        requested = _string(args, "project_id", required=False)
+        if not requested and not self.bound_project_id:
+            raise ToolError("请提供 project_id")
+        project_id, _ = self._bound_scope(requested, None)
+        self._project(project_id or "")
+        data = projects.get_project(self.conn, project_id or "")
+        if data is None:
+            raise ToolError("项目不存在")
+        data.pop("privacy_policy", None)
+        return data
+
+    def _get_evidence(self, args: dict) -> dict:
+        chunk_id = _string(args, "chunk_id", required=False)
+        location_id = _string(args, "location_id", required=False)
+        max_chars = _integer(args, "max_chars", 4000, 100, MAX_MAX_CHARS)
+        conditions: list[str] = []
+        params: list = []
+        if chunk_id:
+            conditions.append("c.chunk_id = ?")
+            params.append(chunk_id)
+        elif location_id:
+            location = self.conn.execute(
+                "SELECT asset_id FROM asset_locations WHERE location_id = ?",
+                (location_id,),
+            ).fetchone()
+            if location is None:
+                raise ToolError("未找到该文件")
+            version = self.conn.execute(
+                "SELECT version_id FROM content_versions WHERE asset_id = ?"
+                " AND is_current = 1 ORDER BY observed_at DESC LIMIT 1",
+                (location["asset_id"],),
+            ).fetchone()
+            if version is None:
+                raise ToolError("该文件还没有内容版本，请先在桌面端扫描")
+            conditions.append("c.version_id = ?")
+            params.append(version["version_id"])
+            page = args.get("page")
+            if page is not None:
+                try:
+                    page = int(page)
+                except (TypeError, ValueError) as exc:
+                    raise ToolError("参数 page 必须是整数") from exc
+                conditions.append("c.page = ?")
+                params.append(page)
+            sheet = _string(args, "sheet", required=False)
+            if sheet:
+                conditions.append("c.sheet = ?")
+                params.append(sheet)
+        else:
+            raise ToolError("请提供 chunk_id 或 location_id")
+
+        sql = (
+            "SELECT c.chunk_id, c.text, c.page, c.sheet, c.asset_id, c.version_id,"
+            " l.location_id, l.path, a.parser_signature"
+            " FROM chunks c"
+            " LEFT JOIN parse_artifacts a ON a.artifact_id = c.artifact_id"
+            " JOIN asset_locations l ON l.asset_id = c.asset_id"
+            " JOIN sources s ON s.source_id = l.source_id"
+            " WHERE " + " AND ".join(conditions)
+            + " AND l.availability = 'AVAILABLE' AND s.state = 'active'"
+            " ORDER BY (c.page IS NULL), c.page, c.ordinal LIMIT 8"
+        )
+        rows = self.conn.execute(sql, params).fetchall()
+
+        project_id = _string(args, "project_id", required=False)
+        scope = _string(args, "scope", required=False)
+        project_id, scope = self._bound_scope(project_id, scope)
+        if project_id:
+            self._project(project_id, require_external=True)
+            allowed, excluded = projects.asset_filter(
+                self.conn, project_id,
+                projects.scope_for(self.conn, project_id, scope))
+            rows = [
+                row for row in rows
+                if (allowed is None or row["asset_id"] in allowed)
+                and row["asset_id"] not in excluded
+            ]
+        items = []
+        used = 0
+        for row in rows:
+            text = row["text"] or ""
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            if len(text) > remaining:
+                text = text[:remaining]
+            used += len(text)
+            items.append({
+                "chunk_id": row["chunk_id"],
+                "asset_id": row["asset_id"],
+                "location_id": row["location_id"],
+                "path": row["path"],
+                "page": row["page"],
+                "sheet": row["sheet"],
+                "stage": _stage_of(row["parser_signature"]),
+                "text": text,
+            })
+        return {"total": len(items), "truncated": used >= max_chars, "items": items}
+
+    def _document_family(self, args: dict) -> dict:
+        asset_id = _string(args, "asset_id")
+        self._ensure_visible(asset_id)
+        info = families.family_map(self.conn).get(asset_id)
+        if info is None:
+            return {"asset_id": asset_id, "family_id": None, "members": []}
+        visible = self._visible_assets()
+        members = [
+            member for member in families.family_members(self.conn, info["family_id"])
+            if visible is None or member["asset_id"] in visible
+        ]
+        latest_ns = info.get("family_latest_mtime_ns") or 0
+        return {
+            "asset_id": asset_id,
+            "family_id": info["family_id"],
+            "title": info.get("family_title"),
+            "size": len(members),
+            "latest_asset_id": info.get("family_latest_asset_id"),
+            "latest_version_label": info.get("family_latest_version_label"),
+            "latest_mtime": (
+                datetime.fromtimestamp(latest_ns / 1e9).astimezone()
+                .isoformat(timespec="seconds") if latest_ns else None
+            ),
+            "members": members,
+        }
+
+    def _compare_versions(self, args: dict) -> dict:
+        family_id = _string(args, "family_id")
+        left = _string(args, "left_asset_id")
+        right = _string(args, "right_asset_id")
+        self._ensure_visible(left)
+        self._ensure_visible(right)
+        try:
+            return families.diff_versions(self.conn, family_id, left, right)
+        except Exception as exc:  # noqa: BLE001 - 参数错误原样返回
+            raise ToolError(f"无法比较版本：{exc}") from exc
+
+    def _related_documents(self, args: dict) -> dict:
+        asset_id = _string(args, "asset_id", required=False)
+        location_id = _string(args, "location_id", required=False)
+        path = _string(args, "path", required=False)
+        project_id = _string(args, "project_id", required=False)
+        limit = _integer(args, "limit", 20, 1, 100)
+        if not asset_id and not location_id and not path:
+            raise ToolError("需要 asset_id、location_id 或 path")
+        project_id, _ = self._bound_scope(project_id, "expanded")
+        allowed: set[str] | None = None
+        excluded: set[str] = set()
+        if project_id:
+            self._project(project_id, require_external=True)
+            allowed, excluded = projects.asset_filter(
+                self.conn, project_id, "expanded")
+        if not asset_id:
+            row = self._resolve_location(
+                {"location_id": location_id, "path": path})
+            asset_id = row["asset_id"]
+        if self.conn.execute(
+                "SELECT 1 FROM assets WHERE asset_id = ?", (asset_id,)).fetchone() is None:
+            raise ToolError("资产不存在")
+        if allowed is not None and (asset_id not in allowed or asset_id in excluded):
+            raise ToolError("该资产不在当前项目范围内")
+
+        def visible(candidate: str) -> bool:
+            return ((allowed is None or candidate in allowed)
+                    and candidate not in excluded)
+
+        items: list[dict] = []
+        seen = {asset_id}
+        info = families.family_map(self.conn).get(asset_id)
+        if info:
+            for member in families.family_members(self.conn, info["family_id"]):
+                if member["asset_id"] in seen or not visible(member["asset_id"]):
+                    continue
+                seen.add(member["asset_id"])
+                items.append({**member, "reason": "same_family",
+                              "family_id": info["family_id"],
+                              "family_title": info["family_title"]})
+        if project_id:
+            rows = self.conn.execute(
+                "SELECT pa.asset_id, pa.membership_type, pa.priority,"
+                " l.location_id, l.path, l.rel_path"
+                " FROM project_assets pa"
+                " LEFT JOIN asset_locations l ON l.asset_id = pa.asset_id"
+                "  AND l.location_id = (SELECT l2.location_id FROM asset_locations l2"
+                "   WHERE l2.asset_id = pa.asset_id AND l2.availability = 'AVAILABLE'"
+                "   ORDER BY l2.path LIMIT 1)"
+                " WHERE pa.project_id = ? AND pa.asset_id != ? AND pa.status = 'active'"
+                " AND pa.membership_type IN ('primary', 'linked')"
+                " ORDER BY pa.priority DESC, l.path LIMIT ?",
+                (project_id, asset_id, limit),
+            ).fetchall()
+            for row in rows:
+                if row["asset_id"] in seen or not visible(row["asset_id"]):
+                    continue
+                seen.add(row["asset_id"])
+                items.append({
+                    "asset_id": row["asset_id"],
+                    "location_id": row["location_id"],
+                    "path": row["path"],
+                    "name": Path(row["path"]).name if row["path"] else None,
+                    "rel_path": row["rel_path"],
+                    "version_label": "",
+                    "reason": "same_project",
+                    "membership_type": row["membership_type"],
+                    "priority": row["priority"],
+                })
+        return {
+            "asset_id": asset_id,
+            "family": info,
+            "related": items[:limit],
+            "total": len(items),
+        }
+
+    def _list_document_families(self, args: dict) -> dict:
+        """列出可访问的多版本文档家族，最新版本排在最前。"""
+        query = (_string(args, "query", required=False) or "").strip().lower()
+        limit = _integer(args, "limit", 10, 1, 50)
+        visible = self._visible_assets("expanded")
+        info_map = families.family_map(self.conn)
+        by_family: dict[str, list[str]] = {}
+        for asset_id, info in info_map.items():
+            if visible is not None and asset_id not in visible:
+                continue
+            by_family.setdefault(info["family_id"], []).append(asset_id)
+        items: list[dict] = []
+        matched: list[dict] = []
+        for family_id, asset_ids in by_family.items():
+            members = [
+                member for member in families.family_members(self.conn, family_id)
+                if visible is None or member["asset_id"] in visible
+            ]
+            if len(members) < 2:
+                continue
+            if not any((member["version_label"] or "").strip() for member in members):
+                # 没有任何版本标记的只是重复副本，不属于“多版本文档”。
+                continue
+            title = (info_map.get(asset_ids[0]) or {}).get("family_title") or ""
+            latest = next(
+                (member for member in members if member["is_latest"]), members[0]
+            )
+            versions: dict[str, dict] = {}
+            for member in members:
+                label = member["version_label"] or "未标注"
+                bucket = versions.setdefault(label, {
+                    "label": label, "count": 0, "latest_mtime_ns": 0,
+                    "sample_path": member["path"],
+                })
+                bucket["count"] += 1
+                bucket["latest_mtime_ns"] = max(
+                    bucket["latest_mtime_ns"], member["mtime_ns"] or 0)
+            latest_ns = latest["mtime_ns"] or 0
+            item = {
+                "family_id": family_id,
+                "title": title,
+                "size": len(members),
+                "latest_asset_id": latest["asset_id"],
+                "latest_version_label": latest["version_label"],
+                "latest_mtime": (
+                    datetime.fromtimestamp(latest_ns / 1e9).astimezone()
+                    .isoformat(timespec="seconds") if latest_ns else None
+                ),
+                "latest_mtime_ns": latest_ns,
+                "latest_path": latest["path"],
+                "versions": [
+                    {
+                        "label": bucket["label"],
+                        "count": bucket["count"],
+                        "latest_mtime": (
+                            datetime.fromtimestamp(
+                                bucket["latest_mtime_ns"] / 1e9).astimezone()
+                            .isoformat(timespec="seconds")
+                            if bucket["latest_mtime_ns"] else None
+                        ),
+                        "sample_path": bucket["sample_path"],
+                    }
+                    for bucket in sorted(
+                        versions.values(),
+                        key=lambda bucket: -bucket["latest_mtime_ns"])
+                ],
+            }
+            items.append(item)
+            if query:
+                # 只看家族标题与相对路径，避免数据源根目录名把所有文件都算命中。
+                haystack = " ".join(
+                    [title, *((member.get("rel_path") or "") for member in members)]
+                ).lower()
+                if query in haystack:
+                    matched.append(item)
+        selected = matched if query and matched else items
+        selected.sort(key=lambda item: (-item["size"], -item["latest_mtime_ns"]))
+        return {"total": len(selected), "items": selected[:limit]}
+
+    def _source_status(self, args: dict) -> dict:
+        source_id = _string(args, "source_id", required=False)
+        items = self._list_sources()["items"]
+        if source_id:
+            items = [item for item in items if item["source_id"] == source_id]
+        return {"total": len(items), "items": items}
 
     # ---------------------------------------------------------------- resources
     def _resources(self) -> list[dict]:
@@ -638,9 +1203,10 @@ def serve(
     writer: BinaryIO | None = None,
     *,
     once: bool = False,
+    bound_project_id: str | None = None,
 ) -> None:
     """按行读写 JSON-RPC；stdout 只允许协议消息。"""
-    server = MCPServer(conn)
+    server = MCPServer(conn, project_id=bound_project_id)
     reader = reader or _binary_stream("stdin", 0, "rb")
     writer = writer or _binary_stream("stdout", 1, "wb")
     for raw in reader:
@@ -685,8 +1251,8 @@ def config_snippet(token: str | None = None) -> dict:
     return {"mcpServers": {"shiyuan": server}}
 
 
-def _verify_token(path: Path, token: str) -> str | None:
-    """校验外部连接令牌；返回 client_id，非法令牌直接终止进程。"""
+def _verify_token(path: Path, token: str) -> sqlite3.Row:
+    """校验外部连接令牌；返回绑定项目等连接信息，非法令牌直接终止进程。"""
     conn = db.connect(path)
     try:
         db.init_db(conn)
@@ -699,7 +1265,7 @@ def _verify_token(path: Path, token: str) -> str | None:
                 os.write(2, line.encode("utf-8"))
             raise SystemExit(2)
         external.record_usage(conn, row["client_id"])
-        return row["client_id"]
+        return row
     finally:
         conn.close()
 
@@ -730,15 +1296,17 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     path = Path(args.db) if args.db else db.db_path()
+    bound_project_id = None
     if token:
-        _verify_token(path, token)
+        client = _verify_token(path, token)
+        bound_project_id = client["project_id"] or projects.GLOBAL_PROJECT_ID
     conn = db.connect(path)
     try:
         db.init_db(conn)
         conn.execute("PRAGMA query_only = ON")
         # 后台预热向量矩阵与本地模型，避免 Agent 的第一次检索等冷启动。
         embeddings.warm_cache_async()
-        serve(conn, once=args.once)
+        serve(conn, once=args.once, bound_project_id=bound_project_id)
     finally:
         conn.close()
 

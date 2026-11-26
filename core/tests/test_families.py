@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from shiyuan import db, families, indexer, retrieval, scanner, search, store
+from shiyuan.mcp_server import MCPServer
 
 
 @pytest.fixture()
@@ -38,6 +40,35 @@ def _seed_versions(conn, tmp_path):
     scanner.scan_source(conn, source["source_id"])
     indexer.index_pending(conn, source["source_id"])
     return root, source["source_id"]
+
+
+def test_latest_version_prefers_final_over_newer_backup(conn, tmp_path):
+    _seed_versions(conn, tmp_path)
+    families.rebuild(conn)
+
+    final = conn.execute(
+        "SELECT asset_id FROM asset_locations WHERE path LIKE '%论文终稿.md'"
+    ).fetchone()["asset_id"]
+    mapping = families.family_map(conn)
+    assert mapping[final]["is_latest_version"] is True
+    assert mapping[final]["family_latest_version_label"] == "终稿"
+
+    members = families.family_members(conn, mapping[final]["family_id"])
+    assert members[0]["name"] == "论文终稿.md"
+    assert members[0]["is_latest"] is True
+
+    server = MCPServer(conn)
+    response = server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "list_document_families",
+                   "arguments": {"query": "论文"}},
+    })
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["total"] >= 1
+    item = payload["items"][0]
+    assert item["latest_version_label"] == "终稿"
+    assert item["latest_path"].endswith("论文终稿.md")
+    assert {"初稿", "终稿"} <= {version["label"] for version in item["versions"]}
 
 
 def test_builds_family_without_recommendation(conn, tmp_path):
@@ -242,3 +273,58 @@ def test_family_id_is_stable_across_rebuilds(conn, tmp_path):
     second = [row[0] for row in conn.execute("SELECT family_id FROM document_families")]
 
     assert first == second
+
+
+def test_explicit_version_query_returns_that_version(conn, tmp_path):
+    """点名旧版本时，即使词面候选被大量同名内容挤占，也要返回该版本并标记历史。"""
+    root = tmp_path / "版本对比"
+    root.mkdir()
+    (root / "manuscript_v0.2.md").write_text(
+        "旧版本正文，实验部分改写前的记录。", encoding="utf-8")
+    (root / "manuscript_v0.3.md").write_text(
+        "新版本正文，实验部分已经补充。", encoding="utf-8")
+    for index in range(20):
+        (root / f"busco_note_{index}.md").write_text(
+            "BUSCO 完整度 98.4%，单拷贝 96.4%。\n" * 80, encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    families.rebuild(conn)
+
+    result = search.search(conn, "v0.2 的 BUSCO 完整度", limit=5)
+    first = result["items"][0]
+    assert first["name"] == "manuscript_v0.2.md"
+    assert first["version_label"] == "0.2"
+    assert first["is_latest_version"] is False
+    assert first["family_latest_version_label"] == "0.3"
+
+
+def test_unlabeled_duplicate_family_has_unknown_latest(conn, tmp_path):
+    """只有重复副本、没有版本标记的家族不能声称存在“最新版本”。"""
+    root = tmp_path / "重复"
+    root.mkdir()
+    body = "同一份实验记录的两次导出，内容完全一致。" * 40
+    (root / "alpha_notes.md").write_text(body, encoding="utf-8")
+    (root / "beta_notes.md").write_text(body, encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    families.rebuild(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM document_families").fetchone()[0] == 1
+    mapping = families.family_map(conn)
+    assert len(mapping) == 2
+    assert all(info["is_latest_version"] is None for info in mapping.values())
+    assert all(info["family_latest_version_label"] is None for info in mapping.values())
+
+    family = conn.execute("SELECT family_id FROM document_families").fetchone()
+    members = families.family_members(conn, family["family_id"])
+    assert all(member["is_latest"] is None for member in members)
+
+    server = MCPServer(conn)
+    response = server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "list_document_families", "arguments": {}},
+    })
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["total"] == 0

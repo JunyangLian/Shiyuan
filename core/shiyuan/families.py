@@ -468,6 +468,81 @@ def content_groups(conn: sqlite3.Connection, family_id: str,
     return result
 
 
+_TEXT_EXTS = {"md", "txt", "docx", "doc", "rtf", "html", "htm"}
+
+
+def _family_records(conn: sqlite3.Connection, family_id: str | None = None) -> list[dict]:
+    sql = (
+        "SELECT m.asset_id, m.family_id, m.version_label, f.title,"
+        " l.location_id, l.path, l.rel_path, l.ext, l.mtime_ns"
+        " FROM document_family_members m"
+        " JOIN document_families f ON f.family_id = m.family_id"
+        " LEFT JOIN asset_locations l ON l.asset_id = m.asset_id"
+        "  AND l.location_id = (SELECT l2.location_id FROM asset_locations l2"
+        "   WHERE l2.asset_id = m.asset_id AND l2.availability = 'AVAILABLE'"
+        "   ORDER BY l2.path LIMIT 1)"
+    )
+    params: list = []
+    if family_id:
+        sql += " WHERE m.family_id = ?"
+        params.append(family_id)
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def _version_rank(label: str | None) -> tuple[int, ...]:
+    """版本新旧：数字版本 > 终稿/定稿 > 修订版 > 初稿；无标签时只按时间。"""
+    text = (label or "").strip().lower()
+    if not text:
+        return (0,)
+    numeric = re.fullmatch(r"v?(\d+(?:\.\d+)*)", text)
+    if numeric:
+        # 0.13 必须大于 0.9：按数字段比较，不能转成浮点数。
+        return (2, *(int(part) for part in numeric.group(1).split(".")))
+    if any(token in text for token in ("终稿", "定稿", "final")):
+        return (1, 3)
+    if any(token in text for token in ("修改", "修订", "revision", "revised")):
+        return (1, 2)
+    if any(token in text for token in ("初稿", "draft")):
+        return (1, 1)
+    return (1, 0)
+
+
+def _latest_versions(records: list[dict]) -> dict[str, dict]:
+    """找出每个家族的最新版本；同一版本优先选可读文本格式。"""
+    latest: dict[str, dict] = {}
+    for record in records:
+        current = latest.get(record["family_id"])
+        key = (_version_rank(record["version_label"]), record["mtime_ns"] or 0)
+        current_key = (
+            (_version_rank(current["version_label"]), current["mtime_ns"] or 0)
+            if current is not None else None
+        )
+        if current_key is None or key > current_key:
+            latest[record["family_id"]] = record
+    resolved: dict[str, dict] = {}
+    for family_id, record in latest.items():
+        label = (record["version_label"] or "").strip()
+        if label:
+            candidates = [
+                item for item in records
+                if item["family_id"] == family_id
+                and (item["version_label"] or "").strip() == label
+            ]
+        else:
+            candidates = [record]
+        preferred = sorted(candidates, key=lambda item: (
+            0 if (item["ext"] or "").lower() in _TEXT_EXTS else 1,
+            0 if item["path"] else 1,
+            item["path"] or "",
+        ))[0]
+        resolved[family_id] = {
+            "asset_id": preferred["asset_id"],
+            "version_label": label,
+            "mtime_ns": record["mtime_ns"] or 0,
+        }
+    return resolved
+
+
 def family_map(conn: sqlite3.Connection) -> dict[str, dict]:
     sizes = {
         row["family_id"]: row["n"]
@@ -475,44 +550,73 @@ def family_map(conn: sqlite3.Connection) -> dict[str, dict]:
             "SELECT family_id, COUNT(*) AS n FROM document_family_members GROUP BY family_id"
         )
     }
-    rows = conn.execute(
-        "SELECT m.asset_id, m.family_id, m.version_label, f.title"
-        " FROM document_family_members m"
-        " JOIN document_families f ON f.family_id = m.family_id"
-    )
-    return {
-        row["asset_id"]: {
-            "family_id": row["family_id"],
-            "family_size": sizes.get(row["family_id"], 1),
-            "version_label": row["version_label"],
-            "family_title": row["title"],
+    records = _family_records(conn)
+    latest = _latest_versions(records)
+    mapping: dict[str, dict] = {}
+    for record in records:
+        info = latest.get(record["family_id"]) or {}
+        label = (record["version_label"] or "").strip()
+        latest_label = info.get("version_label", "")
+        # 没有版本标签的家族只是重复副本，不存在“最新版本”这一说；
+        # 返回 None（未知），避免把普通副本标成 current 让外部 Agent 误判。
+        is_latest = (
+            (record["asset_id"] == info.get("asset_id")
+             or (bool(label) and label == latest_label))
+            if label else None
+        )
+        mapping[record["asset_id"]] = {
+            "family_id": record["family_id"],
+            "family_size": sizes.get(record["family_id"], 1),
+            "version_label": record["version_label"],
+            "family_title": record["title"],
+            "is_latest_version": is_latest,
+            "family_latest_asset_id": info.get("asset_id"),
+            "family_latest_version_label": latest_label or None,
+            "family_latest_mtime_ns": info.get("mtime_ns") or 0,
         }
-        for row in rows
-    }
+    return mapping
 
 
 def family_members(conn: sqlite3.Connection, family_id: str) -> list[dict]:
-    rows = conn.execute(
-        "SELECT m.asset_id, m.version_label, l.location_id, l.path, l.rel_path"
-        " FROM document_family_members m"
-        " LEFT JOIN asset_locations l ON l.asset_id = m.asset_id AND l.location_id = ("
-        "  SELECT l2.location_id FROM asset_locations l2"
-        "  WHERE l2.asset_id = m.asset_id AND l2.availability = 'AVAILABLE'"
-        "  ORDER BY l2.path LIMIT 1)"
-        " WHERE m.family_id = ? ORDER BY l.path",
-        (family_id,),
-    ).fetchall()
-    return [
-        {
-            "asset_id": row["asset_id"],
-            "location_id": row["location_id"],
-            "path": row["path"],
-            "name": Path(row["path"]).name if row["path"] else None,
-            "rel_path": row["rel_path"],
-            "version_label": row["version_label"] or "",
-        }
-        for row in rows
-    ]
+    records = _family_records(conn, family_id)
+    latest = _latest_versions(records).get(family_id) or {}
+    latest_label = latest.get("version_label") or ""
+    groups: dict[str, list[dict]] = {}
+    for record in records:
+        label = (record["version_label"] or "").strip()
+        groups.setdefault(label or f"asset:{record['asset_id']}", []).append(record)
+    members: list[dict] = []
+    # 先按版本新旧分组（最新版本在前），同版本内优先可读文本格式。
+    for _, group in sorted(
+            groups.items(),
+            key=lambda item: (
+                _version_rank(item[1][0]["version_label"]),
+                max((record["mtime_ns"] or 0) for record in item[1]),
+            ),
+            reverse=True):
+        group.sort(key=lambda record: (
+            0 if (record["ext"] or "").lower() in _TEXT_EXTS else 1,
+            0 if record["path"] else 1,
+            record["path"] or "",
+        ))
+        for record in group:
+            label = (record["version_label"] or "").strip()
+            members.append({
+                "asset_id": record["asset_id"],
+                "location_id": record["location_id"],
+                "path": record["path"],
+                "name": Path(record["path"]).name if record["path"] else None,
+                "rel_path": record["rel_path"],
+                "version_label": record["version_label"] or "",
+                "ext": record["ext"] or "",
+                "mtime_ns": record["mtime_ns"] or 0,
+                "is_latest": (
+                    (record["asset_id"] == latest.get("asset_id")
+                     or (bool(label) and label == latest_label))
+                    if label else None
+                ),
+            })
+    return members
 
 
 DIFF_PAIR_LIMIT = 400

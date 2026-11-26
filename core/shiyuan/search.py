@@ -30,6 +30,16 @@ _CODE_QUERY = re.compile(
     r"(脚本|代码|程序|函数|源码|命令行|code|script|function|notebook|ipynb)",
     re.IGNORECASE,
 )
+_LATEST_QUERY = re.compile(
+    r"(最新|当前版本|最新版|目前版本|latest|current version)", re.IGNORECASE)
+_VERSION_HISTORY_QUERY = re.compile(
+    r"(历史|旧版|以前|之前|早期|旧稿|哪些版本|各版本|版本历史|对比|差异|改了什么|变化)",
+    re.IGNORECASE)
+_VERSION_MENTION = re.compile(r"(?:v|版本\s*)(\d+(?:\.\d+)?)", re.IGNORECASE)
+_VERSION_MENTION_SUFFIX = re.compile(r"(\d+(?:\.\d+)?)\s*版本", re.IGNORECASE)
+# 成稿 / 净稿 / 终稿通常比工作笔记更适合作为事实依据。
+_AUTHORITY_PATH = re.compile(
+    r"(净稿|定稿|终稿|clean|manuscript|final)", re.IGNORECASE)
 
 
 def _is_lookup(text: str) -> bool:
@@ -74,12 +84,17 @@ def _snippet(text: str, tokens: list[str]) -> str:
 
 
 def _content_hits(conn: sqlite3.Connection, text: str, analysis: dict, *,
-                  source_id: str | None, ext: str | None) -> dict[str, dict]:
+                  source_id: str | None, ext: str | None,
+                  allowed_assets: set[str] | None = None,
+                  excluded_assets: set[str] | None = None,
+                  path_index: dict | None = None) -> dict[str, dict]:
     hits: dict[str, dict] = {}
     maximal = query.maximal_terms(analysis)
     total = max(1, len(maximal))
-    for hit in retrieval.find_chunks(conn, text, analysis=analysis,
-                                     source_id=source_id, ext=ext):
+    for hit in retrieval.find_chunks(
+            conn, text, analysis=analysis, source_id=source_id, ext=ext,
+            allowed_assets=allowed_assets, excluded_assets=excluded_assets,
+            path_index=path_index):
         if hit.location_id in hits:
             continue
         hits[hit.location_id] = {
@@ -124,11 +139,20 @@ def _to_item(row: sqlite3.Row, *, match: str, content: dict | None,
         "matched_folder": matched_folder,
     }
     if family:
+        latest_ns = family.get("family_latest_mtime_ns") or 0
         item.update({
             "family_id": family["family_id"],
             "family_size": family["family_size"],
             "family_title": family["family_title"],
             "version_label": family["version_label"],
+            # 没有版本标签的重复副本返回 None（未知），不能当作“最新版本”。
+            "is_latest_version": family.get("is_latest_version"),
+            "family_latest_asset_id": family.get("family_latest_asset_id"),
+            "family_latest_version_label": family.get("family_latest_version_label"),
+            "family_latest_mtime": (
+                datetime.fromtimestamp(latest_ns / 1e9).astimezone()
+                .isoformat(timespec="seconds") if latest_ns else None
+            ),
         })
     return item
 
@@ -151,11 +175,19 @@ def _fetch_locations(conn: sqlite3.Connection, location_ids: list[str]) -> dict[
 
 
 def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0,
-           source_id: str | None = None, ext: str | None = None) -> dict:
+           source_id: str | None = None, ext: str | None = None,
+           allowed_assets: set[str] | None = None,
+           excluded_assets: set[str] | None = None,
+           priority_assets: set[str] | None = None) -> dict:
     text = (q or "").strip()
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     if not text:
+        return {"query": text, "total": 0, "strong": 0, "items": [], "index_level": "L1",
+                "content_hits": 0, "truncated": False, "rewritten": None,
+                "vector_used": False, "vector_model": None, "vector_error": None}
+    if allowed_assets is not None and not allowed_assets:
+        # 空项目/全部排除：不必再跑 FTS 与向量召回。
         return {"query": text, "total": 0, "strong": 0, "items": [], "index_level": "L1",
                 "content_hits": 0, "truncated": False, "rewritten": None,
                 "vector_used": False, "vector_model": None, "vector_error": None}
@@ -164,12 +196,26 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
     maximal = query.maximal_terms(analysis)
     # 编号/文件名式查询靠精确词面，语义只会引入近义噪声。
     lookup = _is_lookup(text)
+    latest_intent = bool(_LATEST_QUERY.search(text))
+    version_mentions = [
+        match.group(1) for match in _VERSION_MENTION.finditer(text)
+    ] + [
+        match.group(1) for match in _VERSION_MENTION_SUFFIX.finditer(text)
+    ]
+    historical_intent = bool(_VERSION_HISTORY_QUERY.search(text))
+    # 默认优先成稿的最新版本；明确问历史 / 指定版本时不这么做。
+    prefer_latest = latest_intent or not (historical_intent or version_mentions)
     rewritten = analysis["core"] if analysis["core"] and analysis["core"] != text.lower() else None
     # 路径（文件夹名 + 文件名）和正文使用同一套查询概念，避免只搜正文漏掉目录信息。
-    path_index = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    path_index = retrieval.path_matches(
+        conn, analysis, source_id=source_id, ext=ext,
+        allowed_assets=allowed_assets, excluded_assets=excluded_assets)
     name_rows = _fetch_locations(conn, list(path_index))
 
-    content_hits = _content_hits(conn, text, analysis, source_id=source_id, ext=ext)
+    content_hits = _content_hits(conn, text, analysis, source_id=source_id, ext=ext,
+                                 allowed_assets=allowed_assets,
+                                 excluded_assets=excluded_assets,
+                                 path_index=path_index)
 
     vector_hits: dict[str, dict] = {}
     vector_used = False
@@ -181,10 +227,16 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
             # 向量模型对自然语言整句更敏感；去掉疑问词后的关键词串反而会丢语境。
             hits = embeddings.semantic_chunks(
                 conn, text, source_id=source_id, ext=ext,
-                top_k=max(10, embed_settings["top_k"] * 4))
+                top_k=max(10, embed_settings["top_k"] * 4),
+                allowed_assets=allowed_assets,
+                excluded_assets=excluded_assets)
             vector_used = True
             vector_model = embed_settings["model"]
             for hit in hits:
+                if allowed_assets is not None and hit["asset_id"] not in allowed_assets:
+                    continue
+                if excluded_assets and hit["asset_id"] in excluded_assets:
+                    continue
                 current = vector_hits.get(hit["location_id"])
                 if current and current["z"] >= hit.get("z", 0.0):
                     continue
@@ -206,6 +258,20 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
                  if location_id not in name_rows]
     name_rows.update(_fetch_locations(conn, extra_ids))
 
+    if allowed_assets is not None or excluded_assets:
+        name_rows = {
+            location_id: row for location_id, row in name_rows.items()
+            if (allowed_assets is None or row["asset_id"] in allowed_assets)
+            and (not excluded_assets or row["asset_id"] not in excluded_assets)
+        }
+        path_index = {location_id: match for location_id, match in path_index.items()
+                      if location_id in name_rows}
+        content_hits = {location_id: value for location_id, value
+                        in content_hits.items() if location_id in name_rows}
+        vector_hits = {location_id: value for location_id, value
+                       in vector_hits.items() if location_id in name_rows}
+
+    family_info = families.family_map(conn)
     scored = []
     for location_id, row in name_rows.items():
         path_match = path_index.get(location_id)
@@ -242,6 +308,30 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
             core = _compact(analysis["core"])
             if core and core in _compact(name):
                 score += 400
+        if priority_assets and row["asset_id"] in priority_assets:
+            # 项目主资料在「扩展检索」里优先于关联资料与全局资料。
+            score += 120
+        family = family_info.get(row["asset_id"])
+        if family:
+            if family.get("family_size", 1) > 1:
+                # 同一份知识有多个版本时，成稿比零散工作笔记更可能是答案来源。
+                score += 25
+                label = (family.get("version_label") or "").strip()
+                if version_mentions and any(
+                        label == mention or label.endswith("." + mention)
+                        for mention in version_mentions):
+                    score += 300
+            if prefer_latest and family.get("is_latest_version"):
+                score += 150
+                if family.get("family_size", 1) >= 5:
+                    # 版本数量多的家族通常是持续维护的主文档。
+                    score += 100
+                if family.get("family_size", 1) >= 20:
+                    score += 80
+                if latest_intent:
+                    score += 80
+        if _AUTHORITY_PATH.search(row["path"] or ""):
+            score += 55
         merged = content
         if semantic:
             merged = dict(content or semantic)
@@ -249,8 +339,81 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
         match = "both" if (content and name_matched) else "content" if content \
             else "semantic" if semantic else "name"
         scored.append((score, row, match, merged))
+    def _inject(targets: dict[str, dict]) -> None:
+        """把漏召回的目标资产补进候选，已作为路径候选出现的则提分。"""
+        index_by_asset: dict[str, list[int]] = {}
+        for index, entry in enumerate(scored):
+            index_by_asset.setdefault(entry[1]["asset_id"], []).append(index)
+        for asset_id, info in targets.items():
+            bonus = 700 + 10 * min(int(info.get("family_size", 1)), 30)
+            for index in index_by_asset.get(asset_id, []):
+                score, row, match, content = scored[index]
+                if score < bonus:
+                    scored[index] = (bonus, row, match, content)
+        missing = [asset_id for asset_id in targets if asset_id not in index_by_asset]
+        if not missing:
+            return
+        marks = ",".join("?" for _ in missing)
+        location_ids = [
+            row["location_id"] for row in conn.execute(
+                f"SELECT MIN(location_id) AS location_id FROM asset_locations"
+                f" WHERE asset_id IN ({marks}) AND availability = 'AVAILABLE'"
+                " GROUP BY asset_id", missing)
+        ]
+        ext_filter = ext.lower().lstrip(".") if ext else None
+        for row in _fetch_locations(conn, location_ids).values():
+            if source_id and row["source_id"] != source_id:
+                continue
+            if ext_filter and (row["ext"] or "").lower() != ext_filter:
+                continue
+            info = targets.get(row["asset_id"]) or {}
+            bonus = 700 + 10 * min(int(info.get("family_size", 1)), 30)
+            scored.append((bonus, row, "name", None))
+
+    if latest_intent and not version_mentions and family_info:
+        # “最新版本是哪个”往往没有具体词面命中；直接补上各大家族的最新版本。
+        latest_by_asset: dict[str, dict] = {}
+        for asset_id, info in family_info.items():
+            if allowed_assets is not None and asset_id not in allowed_assets:
+                continue
+            if excluded_assets and asset_id in excluded_assets:
+                continue
+            latest_id = info.get("family_latest_asset_id")
+            if not latest_id or latest_id in latest_by_asset:
+                continue
+            # 没有版本标签的重复副本不算“最新版本”，不能补进结果。
+            if info.get("family_size", 1) < 2 or not info.get("family_latest_version_label"):
+                continue
+            latest_by_asset[latest_id] = info
+        ranked = sorted(
+            latest_by_asset.items(),
+            key=lambda item: (
+                -item[1].get("family_size", 1),
+                -(item[1].get("family_latest_mtime_ns") or 0),
+            ),
+        )[:5]
+        _inject(dict(ranked))
+
+    if version_mentions and family_info:
+        # 明确点名版本时，词面候选容易被大量同名工作笔记挤出；
+        # 直接补上该版本成员，并保留 is_latest_version=false 的历史标记。
+        wanted = {
+            mention.strip().lower().lstrip("v") for mention in version_mentions
+        }
+        targets: dict[str, dict] = {}
+        for asset_id, info in family_info.items():
+            if allowed_assets is not None and asset_id not in allowed_assets:
+                continue
+            if excluded_assets and asset_id in excluded_assets:
+                continue
+            label = (info.get("version_label") or "").strip().lower()
+            if not label or info.get("family_size", 1) < 2:
+                continue
+            if any(label == mention or label.endswith("." + mention)
+                   for mention in wanted):
+                targets[asset_id] = info
+        _inject(targets)
     scored.sort(key=lambda item: (-item[0], -item[1]["mtime_ns"]))
-    family_info = families.family_map(conn)
     if family_info:
         grouped: dict[str, list[tuple]] = {}
         passthrough: list[tuple] = []
@@ -259,12 +422,28 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
             if info is None:
                 passthrough.append(entry)
             else:
-                grouped.setdefault(info["family_id"], []).append(entry)
+                # 问“v0.12 到 v0.13 改了什么”时按版本分开，不能只留一个代表。
+                label = (info.get("version_label") or "").strip()
+                key = f"{info['family_id']}::{label}" if version_mentions else info["family_id"]
+                grouped.setdefault(key, []).append(entry)
         aggregated = list(passthrough)
-        for family_id, entries in grouped.items():
+        for entries in grouped.values():
             entries.sort(key=lambda item: (-item[0], -item[1]["mtime_ns"]))
-            # 代表项只是本次匹配度最高的一条，不代表“推荐版本”。
-            aggregated.append((*entries[0], family_id))
+            representative = entries[0]
+            if prefer_latest:
+                latest = [
+                    entry for entry in entries
+                    if (family_info.get(entry[1]["asset_id"]) or {}).get(
+                        "is_latest_version")
+                ]
+                # 最新版本分数接近时优先展示；明确问“最新”时无条件优先。
+                if latest and (latest_intent or latest[0][0] >= representative[0] * 0.6):
+                    representative = latest[0]
+            # 代表项优先最新版本；家族全部版本仍可在 family_versions 里展开。
+            family_id = (
+                family_info.get(representative[1]["asset_id"]) or {}
+            ).get("family_id")
+            aggregated.append((*representative, family_id))
         scored = sorted(
             aggregated, key=lambda item: (-item[0], -item[1]["mtime_ns"]))
     # 与最高分差距过大的结果只是“沾边”，单独标记，前端/外部调用可以折叠。

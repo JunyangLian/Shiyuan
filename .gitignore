@@ -16,11 +16,16 @@ venv/
 # 本地临时目录（测试、构建、解包都放这里）
 .tmp/
 
+# 编辑器 / Agent 本地配置
+.trae/
+
 # pyinstaller 产物
 build/
 core/build/
 *.dist/
 *.spec
+# 手写的打包配置需要入库，否则新克隆仓库无法构建 sidecar
+!core/shiyuan-core.spec
 
 # Tauri sidecar 产物（由 core/dist 复制而来，不入库）
 desktop/src-tauri/binaries/

@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from . import db, embeddings, indexer, ingest, inventory, store
+from . import db, embeddings, indexer, ingest, inventory, projects, store
 
 MAX_HASH_BYTES = 32 * 1024 * 1024
 
@@ -433,6 +433,11 @@ def scan_source(conn: sqlite3.Connection, source_id: str) -> dict:
     ops, seen = _plan_ops(records, existing, counters, errors)
     _apply_ops(conn, source_id, ops)
     counters["errors"] = len(errors)
+    # 新发现的资产自动进入引用该数据源的项目，不复制资产、不重复解析。
+    try:
+        projects.sync_source_assets(conn, source_id)
+    except Exception:  # noqa: BLE001 - 项目联动失败不应让扫描整体失败
+        pass
 
     counters["missing"] = store.mark_missing(
         conn, [row["location_id"] for row in existing if row["location_id"] not in seen]
@@ -494,6 +499,10 @@ def sync_paths(conn: sqlite3.Connection, source_id: str, paths: Iterable[str]) -
     existing = store.list_locations(conn, source_id)
     ops, _ = _plan_ops(records, existing, counters, errors)
     _apply_ops(conn, source_id, ops)
+    try:
+        projects.sync_source_assets(conn, source_id)
+    except Exception:  # noqa: BLE001 - 项目联动失败不应让增量同步失败
+        pass
     counters["seen"] = len(records)
     counters["errors"] = len(errors)
     conn.execute("UPDATE sources SET health = 'ok', last_scan_at = ? WHERE source_id = ?",

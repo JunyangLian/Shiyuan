@@ -19,8 +19,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import (embeddings, families, indexer, knowledge, planner, query, rerank,
-               retrieval, secrets_store, store)
+from . import (embeddings, families, indexer, knowledge, planner, projects, query,
+               rerank, retrieval, secrets_store, store)
 
 SETTINGS_KEY = "answer"
 PROVIDERS = {"extractive", "openai", "ollama"}
@@ -285,9 +285,15 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
              path_only: bool = False,
              plan: planner.Plan | None = None,
              stats: dict | None = None,
-             anchor_prefix: str | None = None) -> list[Evidence]:
+             anchor_prefix: str | None = None,
+             allowed_assets: set[str] | None = None,
+             excluded_assets: set[str] | None = None,
+             priority_assets: set[str] | None = None) -> list[Evidence]:
     analysis = query.analyze(question, synonyms=query.synonym_map(conn))
     if not analysis["variants"]:
+        return []
+    if allowed_assets is not None and not allowed_assets:
+        # 空项目/全部排除：没有可检索的资料，直接返回空证据。
         return []
     per_asset_limit = plan.mode.per_asset if plan else 1
     per_family_limit = plan.mode.per_family if plan else 2
@@ -343,10 +349,16 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
 
     candidates = retrieval.find_chunks(conn, question, analysis=analysis,
                                        source_id=source_id, ext=ext, focus=focus,
-                                       path_only=path_only)
+                                       path_only=path_only,
+                                       allowed_assets=allowed_assets,
+                                       excluded_assets=excluded_assets)
     if anchor_prefix:
         # 追问限定上一轮数据源时在内存里过滤，避免 SQLite 为“MATCH + source”扫描全库。
         candidates = [hit for hit in candidates if hit.path.startswith(anchor_prefix)]
+    if priority_assets:
+        # 扩展检索里项目主资料优先，但不打乱同一优先级内的检索顺序。
+        candidates = sorted(
+            candidates, key=lambda hit: 0 if hit.asset_id in priority_assets else 1)
     original_candidates = candidates
     candidate_total = len(candidates)
     # 候选明显多于预算时，先让已授权的生成模型按「能否直接回答」筛选并排序；
@@ -404,13 +416,25 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
         try:
             semantic_hits = embeddings.semantic_chunks(
                 conn, question, source_id=source_id, ext=ext,
-                top_k=max(10, embed_settings["top_k"] * 3))
+                top_k=max(10, embed_settings["top_k"] * 3),
+                allowed_assets=allowed_assets,
+                excluded_assets=excluded_assets)
         except embeddings.EmbeddingError:
             semantic_hits = []
         semantic_hits = families.dedupe_semantic_hits(conn, semantic_hits)
         if anchor_prefix:
             semantic_hits = [hit for hit in semantic_hits
                              if hit["path"].startswith(anchor_prefix)]
+        if allowed_assets is not None or excluded_assets:
+            semantic_hits = [
+                hit for hit in semantic_hits
+                if (allowed_assets is None or hit.get("asset_id") in allowed_assets)
+                and (not excluded_assets or hit.get("asset_id") not in excluded_assets)
+            ]
+        if priority_assets:
+            semantic_hits = sorted(
+                semantic_hits,
+                key=lambda hit: 0 if hit.get("asset_id") in priority_assets else 1)
         for hit in semantic_hits:
             if len(evidence) >= limit:
                 break
@@ -1079,7 +1103,9 @@ def _path_citations(matches: list[retrieval.PathMatch], limit: int) -> list[dict
 
 
 def _version_overview(conn: sqlite3.Connection, analysis: dict, *,
-                      source_id: str | None, ext: str | None
+                      source_id: str | None, ext: str | None,
+                      allowed_assets: set[str] | None = None,
+                      excluded_assets: set[str] | None = None
                       ) -> tuple[str, list[retrieval.PathMatch]] | None:
     """按文件名列出同一主题的版本，不判断哪个更好。"""
     core = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", (analysis.get("core") or "").lower())
@@ -1088,7 +1114,9 @@ def _version_overview(conn: sqlite3.Connection, analysis: dict, *,
     subject = re.sub(r"(?:终稿|初稿|定稿|修订版)", "", subject).strip()
     if len(subject) < 2:
         return None
-    matches = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    matches = retrieval.path_matches(
+        conn, analysis, source_id=source_id, ext=ext,
+        allowed_assets=allowed_assets, excluded_assets=excluded_assets)
     selected: list[retrieval.PathMatch] = []
     seen: set[str] = set()
     for match in matches.values():
@@ -1119,10 +1147,14 @@ def _version_overview(conn: sqlite3.Connection, analysis: dict, *,
 
 
 def _locate_answer(conn: sqlite3.Connection, analysis: dict, *,
-                   source_id: str | None, ext: str | None
+                   source_id: str | None, ext: str | None,
+                   allowed_assets: set[str] | None = None,
+                   excluded_assets: set[str] | None = None
                    ) -> tuple[str, list[retrieval.PathMatch]] | None:
     """位置问题直接列路径，避免让模型从正文里猜文件名。"""
-    matches = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    matches = retrieval.path_matches(
+        conn, analysis, source_id=source_id, ext=ext,
+        allowed_assets=allowed_assets, excluded_assets=excluded_assets)
     candidates = [
         match for match in matches.values()
         if match.name_matched or match.specific or match.folder_specific
@@ -1164,8 +1196,12 @@ def _locate_answer(conn: sqlite3.Connection, analysis: dict, *,
 
 
 def _best_folder(conn: sqlite3.Connection, analysis: dict, *,
-                 source_id: str | None, ext: str | None) -> retrieval.PathMatch | None:
-    matches = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+                 source_id: str | None, ext: str | None,
+                 allowed_assets: set[str] | None = None,
+                 excluded_assets: set[str] | None = None) -> retrieval.PathMatch | None:
+    matches = retrieval.path_matches(
+        conn, analysis, source_id=source_id, ext=ext,
+        allowed_assets=allowed_assets, excluded_assets=excluded_assets)
     core = re.sub(r"\s+", "", (analysis.get("core") or "")).lower()
     best: retrieval.PathMatch | None = None
     best_key: tuple[int, int, int, int] | None = None
@@ -1277,10 +1313,14 @@ def _sheet_names(conn: sqlite3.Connection, asset_id: str) -> list[str]:
 
 
 def _stats_answer(conn: sqlite3.Connection, question: str, *,
-                  source_id: str | None, ext: str | None) -> dict | None:
+                  source_id: str | None, ext: str | None,
+                  allowed_assets: set[str] | None = None,
+                  excluded_assets: set[str] | None = None) -> dict | None:
     """表格统计问句：给出命中的表格与工作表，明确说明不做汇总。"""
     analysis = query.analyze(question, synonyms=query.synonym_map(conn))
-    matches = retrieval.path_matches(conn, analysis, source_id=source_id, ext=ext)
+    matches = retrieval.path_matches(
+        conn, analysis, source_id=source_id, ext=ext,
+        allowed_assets=allowed_assets, excluded_assets=excluded_assets)
     tables: list[retrieval.PathMatch] = []
     seen: set[str] = set()
     for match in sorted(matches.values(), key=lambda item: -item.score):
@@ -1620,12 +1660,30 @@ def _library_overview(conn: sqlite3.Connection, *, source_id: str | None,
     return "\n".join(lines)
 
 
-def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None,
-        ext: str | None = None, top_k: int | None = None,
-        history: list[str] | None = None,
-        anchor_sources: list[str] | None = None,
-        previous_answer: str | None = None,
-        on_delta=None) -> dict:
+def _merge_evidence(left: list[Evidence], right: list[Evidence],
+                    limit: int) -> list[Evidence]:
+    """分级扩展时保留已有（更靠近项目）的证据，再补新范围内的证据。"""
+    merged = list(left)
+    seen = {item.chunk_id for item in merged}
+    for item in right:
+        if item.chunk_id in seen:
+            continue
+        merged.append(item)
+        seen.add(item.chunk_id)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def _ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None,
+         ext: str | None = None, top_k: int | None = None,
+         history: list[str] | None = None,
+         anchor_sources: list[str] | None = None,
+         previous_answer: str | None = None,
+         project_id: str | None = None,
+         scope: str | None = None,
+         scope_info: dict | None = None,
+         on_delta=None) -> dict:
     text = (question or "").strip()
     if not text:
         raise ValueError("问题不能为空")
@@ -1644,6 +1702,16 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
     # 追问已经通过 _contextual_query 补全了主题词，不再按上一轮数据源强制过滤：
     # FTS 在“MATCH + source_id”组合下为了凑满候选会扫描全库，单个追问可达一分钟。
     effective_source = source_id
+
+    # 项目检索范围：project（主资料）→ expanded（主资料 + 关联）→ global。
+    # 本地快答分支先用当前范围过滤；证据不足时由下面的检索循环逐级扩大。
+    requested_scope = projects.scope_for(conn, project_id, scope)
+    if scope_info is not None:
+        scope_info.update({"requested": requested_scope, "used": requested_scope,
+                           "expanded": False, "project_id": project_id})
+    active_allowed, active_excluded = projects.asset_filter(
+        conn, project_id, requested_scope)
+    primary_allowed, _ = projects.asset_filter(conn, project_id, "project")
 
     if previous_answer:
         reference = _resolve_reference(text, previous_answer)
@@ -1708,7 +1776,8 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
     if _is_version_question(text):
         version_analysis = query.analyze(context_text, synonyms=query.synonym_map(conn))
         overview = _version_overview(
-            conn, version_analysis, source_id=effective_source, ext=ext)
+            conn, version_analysis, source_id=effective_source, ext=ext,
+            allowed_assets=active_allowed, excluded_assets=active_excluded)
         if overview:
             overview_text, version_matches = overview
             citations = _path_citations(version_matches, 20)
@@ -1729,7 +1798,8 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
     if _is_path_question(text):
         path_analysis = query.analyze(context_text, synonyms=query.synonym_map(conn))
         located = _locate_answer(
-            conn, path_analysis, source_id=effective_source, ext=ext)
+            conn, path_analysis, source_id=effective_source, ext=ext,
+            allowed_assets=active_allowed, excluded_assets=active_excluded)
         if located:
             located_text, located_matches = located
             citations = _path_citations(located_matches, 5)
@@ -1778,7 +1848,9 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
 
     if _is_folder_question(text):
         analysis = query.analyze(context_text, synonyms=query.synonym_map(conn))
-        folder_match = _best_folder(conn, analysis, source_id=effective_source, ext=ext)
+        folder_match = _best_folder(
+            conn, analysis, source_id=effective_source, ext=ext,
+            allowed_assets=active_allowed, excluded_assets=active_excluded)
         if folder_match is not None:
             overview = _folder_overview(conn, folder_match)
             if overview:
@@ -1797,7 +1869,9 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
                 }
 
     if _is_stat_question(text):
-        stats_hint = _stats_answer(conn, context_text, source_id=effective_source, ext=ext)
+        stats_hint = _stats_answer(
+            conn, context_text, source_id=effective_source, ext=ext,
+            allowed_assets=active_allowed, excluded_assets=active_excluded)
         if stats_hint is not None:
             return {
                 "question": text,
@@ -1814,15 +1888,40 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
             }
 
     plan = planner.make(context_text)
-    plan_stats: dict = {}
     budget = limit if top_k else plan.mode.budget
     path_question = _is_path_question(text)
-    evidence = retrieve(conn, context_text, source_id=effective_source, ext=ext,
-                        limit=budget,
-                        focus=_focus_terms(text) if previous else None,
-                        path_only=path_question,
-                        plan=plan, stats=plan_stats,
-                        anchor_prefix=anchor_prefix)
+    scope_chain = ({"project": ["project", "expanded", "global"],
+                    "expanded": ["expanded", "global"],
+                    "global": ["global"]}[requested_scope]
+                   if project_id else ["global"])
+    evidence: list[Evidence] = []
+    plan_stats: dict = {}
+    used_scope = "global" if not project_id else requested_scope
+    for candidate_scope in scope_chain:
+        allowed, excluded = projects.asset_filter(conn, project_id, candidate_scope)
+        attempt_stats: dict = {}
+        attempt = retrieve(
+            conn, context_text, source_id=effective_source, ext=ext,
+            limit=budget,
+            focus=_focus_terms(text) if previous else None,
+            path_only=path_question,
+            plan=plan, stats=attempt_stats,
+            anchor_prefix=anchor_prefix,
+            allowed_assets=allowed, excluded_assets=excluded,
+            priority_assets=(primary_allowed if candidate_scope == "expanded" else None))
+        plan_stats = attempt_stats
+        merged = _merge_evidence(evidence, attempt, budget)
+        # 只有真正补到新证据时才把 used 记为更外层的范围；
+        # 外层没有新增内容时仍显示为项目范围，避免误导用户。
+        if len(merged) > len(evidence) or not evidence:
+            used_scope = candidate_scope
+        evidence = merged
+        minimum = 2 if candidate_scope == "project" else 1
+        if len(evidence) >= minimum:
+            break
+    if scope_info is not None:
+        scope_info.update({"used": used_scope,
+                           "expanded": used_scope != requested_scope})
     plan_payload = {**plan.as_dict(), **plan_stats}
     plan_note = _plan_note(plan, plan_stats)
 
@@ -1882,3 +1981,23 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
         "context_used": previous,
         "plan": plan_payload,
     }
+
+
+def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None,
+        ext: str | None = None, top_k: int | None = None,
+        history: list[str] | None = None,
+        anchor_sources: list[str] | None = None,
+        previous_answer: str | None = None,
+        project_id: str | None = None,
+        scope: str | None = None,
+        on_delta=None) -> dict:
+    """问答入口：附加本次实际使用的检索范围（项目 / 扩展 / 全局）。"""
+    scope_info: dict = {}
+    result = _ask(
+        conn, question, source_id=source_id, ext=ext, top_k=top_k,
+        history=history, anchor_sources=anchor_sources,
+        previous_answer=previous_answer, project_id=project_id, scope=scope,
+        scope_info=scope_info, on_delta=on_delta)
+    if scope_info:
+        result["scope"] = scope_info
+    return result

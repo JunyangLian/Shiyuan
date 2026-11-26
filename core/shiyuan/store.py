@@ -282,12 +282,14 @@ def remove_source(conn: sqlite3.Connection, source_id: str) -> dict[str, int]:
         )
     ]
     with conn:
+        conn.execute("DELETE FROM project_sources WHERE source_id = ?", (source_id,))
         conn.execute("DELETE FROM asset_locations WHERE source_id = ?", (source_id,))
         for asset_id in asset_ids:
             remaining = conn.execute(
                 "SELECT COUNT(*) FROM asset_locations WHERE asset_id = ?", (asset_id,)
             ).fetchone()[0]
             if remaining == 0:
+                conn.execute("DELETE FROM project_assets WHERE asset_id = ?", (asset_id,))
                 _purge_content_cache(conn, asset_id)
                 conn.execute("DELETE FROM content_versions WHERE asset_id = ?", (asset_id,))
                 conn.execute("DELETE FROM assets WHERE asset_id = ?", (asset_id,))

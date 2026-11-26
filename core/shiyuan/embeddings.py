@@ -88,15 +88,19 @@ def load_settings(conn: sqlite3.Connection) -> dict:
 # ---------------------------------------------------------------- 错误可见
 
 def _set_last_error(conn: sqlite3.Connection, message: str | None) -> None:
-    if message:
-        conn.execute(
-            "INSERT INTO app_settings (key, value) VALUES (?, ?)"
-            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (ERROR_KEY, str(message)[:500]),
-        )
-    else:
-        conn.execute("DELETE FROM app_settings WHERE key = ?", (ERROR_KEY,))
-    conn.commit()
+    # MCP 以 query_only 打开数据库，记录错误失败不能影响检索本身。
+    try:
+        if message:
+            conn.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (ERROR_KEY, str(message)[:500]),
+            )
+        else:
+            conn.execute("DELETE FROM app_settings WHERE key = ?", (ERROR_KEY,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 def public_settings(conn: sqlite3.Connection) -> dict:
@@ -244,7 +248,7 @@ def _cosine(left, right) -> float:
 
 def _pending_sql(model: str, source_id: str | None) -> tuple[str, list]:
     sql = [
-        "SELECT c.chunk_id, c.text FROM chunks c",
+        "SELECT c.chunk_id, c.asset_id, c.text FROM chunks c",
         "JOIN content_versions v ON v.version_id = c.version_id",
         "JOIN asset_locations l ON l.asset_id = c.asset_id",
         "JOIN sources s ON s.source_id = l.source_id",
@@ -331,12 +335,14 @@ def index_pending(conn: sqlite3.Connection, source_id: str | None = None,
         _set_last_error(conn, None)
         for row, vector in zip(embeddable, vectors):
             conn.execute(
-                "INSERT INTO chunk_embeddings (chunk_id, model, dim, vector, updated_at)"
-                " VALUES (?, ?, ?, ?, ?)"
-                " ON CONFLICT(chunk_id) DO UPDATE SET model = excluded.model,"
-                " dim = excluded.dim, vector = excluded.vector, updated_at = excluded.updated_at",
-                (row["chunk_id"], settings["model"], len(vector), _pack(vector),
-                 store.now_iso()),
+                "INSERT INTO chunk_embeddings"
+                " (chunk_id, asset_id, model, dim, vector, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(chunk_id) DO UPDATE SET asset_id = excluded.asset_id,"
+                " model = excluded.model, dim = excluded.dim, vector = excluded.vector,"
+                " updated_at = excluded.updated_at",
+                (row["chunk_id"], row["asset_id"], settings["model"], len(vector),
+                 _pack(vector), store.now_iso()),
             )
         conn.commit()
         processed += len(embeddable)
@@ -437,8 +443,8 @@ Z_MIN_POPULATION = 200  # 向量太少时分布不稳定，退回相似度判断
 
 def _new_cache(model: str | None = None, dim: int = 0) -> dict:
     return {
-        "model": model, "dim": dim, "ids": [], "matrix": None, "scales": None,
-        "norms": None, "rows": 0, "count": 0, "max_rowid": 0,
+        "model": model, "dim": dim, "ids": [], "asset_ids": [], "matrix": None,
+        "scales": None, "norms": None, "rows": 0, "count": 0, "max_rowid": 0,
     }
 
 
@@ -526,6 +532,7 @@ def _append_rows(numpy, cache: dict, rows: list[sqlite3.Row]) -> int | None:
         cache["scales"][index] = quantized[1]
         cache["norms"][index] = quantized[2]
         cache["ids"].append(row["chunk_id"])
+        cache["asset_ids"].append(row["asset_id"])
         index += 1
     cache["rows"] = index
     return last_rowid
@@ -549,8 +556,10 @@ def _build_cache(conn: sqlite3.Connection, model: str) -> dict | None:
     cache["dim"] = int(dim_row["dim"])
     _ensure_capacity(numpy, cache, max(1, key[1]))
     for row in conn.execute(
-            "SELECT rowid, chunk_id, dim, vector FROM chunk_embeddings"
-            " WHERE model = ? ORDER BY rowid", (model,)):
+            "SELECT e.rowid AS rowid, e.chunk_id AS chunk_id, e.asset_id AS asset_id,"
+            " e.dim AS dim, e.vector AS vector"
+            " FROM chunk_embeddings e"
+            " WHERE e.model = ? ORDER BY e.rowid", (model,)):
         if int(row["dim"]) != cache["dim"]:
             continue
         values = numpy.frombuffer(row["vector"], dtype=numpy.float32)
@@ -566,6 +575,7 @@ def _build_cache(conn: sqlite3.Connection, model: str) -> dict | None:
         cache["scales"][index] = quantized[1]
         cache["norms"][index] = quantized[2]
         cache["ids"].append(row["chunk_id"])
+        cache["asset_ids"].append(row["asset_id"])
         cache["rows"] = index + 1
         cache["max_rowid"] = max(cache["max_rowid"], int(row["rowid"]))
     return cache
@@ -637,8 +647,10 @@ def _refresh_cache(conn: sqlite3.Connection, model: str) -> dict:
             _start_rebuild(model, _connection_path(conn))
             return cache
         rows = conn.execute(
-            "SELECT rowid, chunk_id, dim, vector FROM chunk_embeddings"
-            " WHERE model = ? AND rowid > ? ORDER BY rowid",
+            "SELECT e.rowid AS rowid, e.chunk_id AS chunk_id, e.asset_id AS asset_id,"
+            " e.dim AS dim, e.vector AS vector"
+            " FROM chunk_embeddings e"
+            " WHERE e.model = ? AND e.rowid > ? ORDER BY e.rowid",
             (model, cache["max_rowid"])).fetchall()
         last = _append_rows(_numpy_module(), cache, rows)
         if last is None:
@@ -675,8 +687,13 @@ def _score_gate(numpy, similarities):
 
 
 def _cached_scores(conn: sqlite3.Connection, model: str, query_vector: list[float],
-                   top_k: int):
-    """返回 [(similarity, z, chunk_id)]；numpy 不可用时返回 None 走原 SQL 扫描。"""
+                   top_k: int, allowed_assets: set[str] | None = None,
+                   excluded_assets: set[str] | None = None):
+    """返回 [(similarity, z, chunk_id)]；numpy 不可用时返回 None 走原 SQL 扫描。
+
+    项目范围在内存矩阵上做掩码后再算 z 分数：既不重读数据库，也保证小项目
+    有自己的候选分布，不会被全局高相似片段挤掉。
+    """
     numpy = _numpy_module()
     if numpy is None:
         return None
@@ -703,17 +720,47 @@ def _cached_scores(conn: sqlite3.Connection, model: str, query_vector: list[floa
         scores *= (query_scale / query_norm)
         scores /= cache["norms"][:rows]
         scores *= cache["scales"][:rows]
-        z_values = _score_gate(numpy, scores)
-        candidates = numpy.flatnonzero(z_values > -numpy.inf)
-        if not candidates.size:
+
+        scoped = allowed_assets is not None or bool(excluded_assets)
+        if not scoped:
+            z_values = _score_gate(numpy, scores)
+            candidates = numpy.flatnonzero(z_values > -numpy.inf)
+            if not candidates.size:
+                return []
+            take = min(len(candidates), max(1, int(top_k)))
+            if take < len(candidates):
+                picked = numpy.argpartition(-z_values[candidates], take - 1)[:take]
+                candidates = candidates[picked]
+            order = candidates[numpy.argsort(-z_values[candidates])]
+            return [(float(scores[index]), float(z_values[index]), cache["ids"][index])
+                    for index in order]
+
+        assets = cache["asset_ids"][:rows]
+        blocked = excluded_assets or set()
+        if allowed_assets is None:
+            visible = numpy.asarray(
+                [asset not in blocked for asset in assets], dtype=bool)
+        else:
+            visible = numpy.asarray(
+                [asset in allowed_assets and asset not in blocked
+                 for asset in assets], dtype=bool)
+        if not visible.any():
             return []
+        indexes = numpy.flatnonzero(visible)
+        z_values = _score_gate(numpy, scores[indexes])
+        keep = z_values > -numpy.inf
+        if not keep.any():
+            return []
+        candidates = indexes[keep]
+        z_values = z_values[keep]
         take = min(len(candidates), max(1, int(top_k)))
         if take < len(candidates):
-            picked = numpy.argpartition(-z_values[candidates], take - 1)[:take]
+            picked = numpy.argpartition(-z_values, take - 1)[:take]
             candidates = candidates[picked]
-        order = candidates[numpy.argsort(-z_values[candidates])]
-        return [(float(scores[index]), float(z_values[index]), cache["ids"][index])
-                for index in order]
+            z_values = z_values[picked]
+        order = numpy.argsort(-z_values)
+        return [(float(scores[candidates[index]]), float(z_values[index]),
+                 cache["ids"][candidates[index]]) for index in order]
 
 
 def warm_cache_async() -> None:
@@ -742,10 +789,47 @@ def warm_cache_async() -> None:
     threading.Thread(target=worker, daemon=True, name="embedding-warm").start()
 
 
+_SCOPE_ALLOWED = "_shiyuan_scope_allowed"
+_SCOPE_EXCLUDED = "_shiyuan_scope_excluded"
+
+
+def _scope_clauses(conn: sqlite3.Connection, allowed_assets: set[str] | None,
+                   excluded_assets: set[str] | None) -> list[str]:
+    """把项目范围放进 SQL：先过滤再算相似度，避免全局 Top-K 挤掉项目内命中的片段。
+
+    资产集合可能很大，用临时表传入，避免拼接超长 IN 列表。
+    """
+    clauses: list[str] = []
+    if allowed_assets is not None:
+        conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_SCOPE_ALLOWED}"
+                     " (asset_id TEXT PRIMARY KEY)")
+        conn.execute(f"DELETE FROM {_SCOPE_ALLOWED}")
+        conn.executemany(f"INSERT OR IGNORE INTO {_SCOPE_ALLOWED} (asset_id) VALUES (?)",
+                         [(asset_id,) for asset_id in allowed_assets])
+        clauses.append(f"AND e.asset_id IN (SELECT asset_id FROM {_SCOPE_ALLOWED})")
+    if excluded_assets:
+        conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {_SCOPE_EXCLUDED}"
+                     " (asset_id TEXT PRIMARY KEY)")
+        conn.execute(f"DELETE FROM {_SCOPE_EXCLUDED}")
+        conn.executemany(f"INSERT OR IGNORE INTO {_SCOPE_EXCLUDED} (asset_id) VALUES (?)",
+                         [(asset_id,) for asset_id in excluded_assets])
+        clauses.append(f"AND e.asset_id NOT IN (SELECT asset_id FROM {_SCOPE_EXCLUDED})")
+    return clauses
+
+
+def _drop_scope_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(f"DROP TABLE IF EXISTS {_SCOPE_ALLOWED}")
+    conn.execute(f"DROP TABLE IF EXISTS {_SCOPE_EXCLUDED}")
+
+
 def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | None = None,
-                    ext: str | None = None, top_k: int = 30) -> list[dict]:
+                    ext: str | None = None, top_k: int = 30,
+                    allowed_assets: set[str] | None = None,
+                    excluded_assets: set[str] | None = None) -> list[dict]:
     settings = load_settings(conn)
     if not enabled(settings):
+        return []
+    if allowed_assets is not None and not allowed_assets:
         return []
     try:
         query_vector = _query_vector(settings, text)
@@ -772,9 +856,12 @@ def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | Non
         sql.append("AND l.ext = ?")
         params.append(ext.lower().lstrip("."))
 
+    scoped = allowed_assets is not None or bool(excluded_assets)
     scored: list[tuple[float, float, str]] | None = None
     if source_id is None and ext is None:
-        cached = _cached_scores(conn, settings["model"], query_vector, top_k * 2)
+        cached = _cached_scores(
+            conn, settings["model"], query_vector, top_k * 2,
+            allowed_assets, excluded_assets)
         if cached is not None:
             # 缓存里可能含已失效片段，回表时会过滤，所以多取一倍候选。
             scored = cached
@@ -783,24 +870,29 @@ def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | Non
         similarities: list[float] = []
         chunk_ids: list[str] = []
         numpy = _numpy_module()
-        if numpy is not None:
-            query = numpy.asarray(query_vector, dtype=numpy.float32)
-            query_norm = float(numpy.linalg.norm(query))
-            if query_norm <= 0:
-                return []
-            for row in conn.execute(" ".join(sql), params):
-                vector = numpy.frombuffer(row["vector"], dtype=numpy.float32)
-                if vector.size != query.size:
-                    continue
-                norm = float(numpy.linalg.norm(vector))
-                if norm <= 0:
-                    continue
-                similarities.append(float(numpy.dot(query, vector)) / (query_norm * norm))
-                chunk_ids.append(row["chunk_id"])
-        else:
-            for row in conn.execute(" ".join(sql), params):
-                similarities.append(_cosine(query_vector, _unpack(row["vector"])))
-                chunk_ids.append(row["chunk_id"])
+        sql.extend(_scope_clauses(conn, allowed_assets, excluded_assets))
+        try:
+            if numpy is not None:
+                query = numpy.asarray(query_vector, dtype=numpy.float32)
+                query_norm = float(numpy.linalg.norm(query))
+                if query_norm <= 0:
+                    return []
+                for row in conn.execute(" ".join(sql), params):
+                    vector = numpy.frombuffer(row["vector"], dtype=numpy.float32)
+                    if vector.size != query.size:
+                        continue
+                    norm = float(numpy.linalg.norm(vector))
+                    if norm <= 0:
+                        continue
+                    similarities.append(float(numpy.dot(query, vector)) / (query_norm * norm))
+                    chunk_ids.append(row["chunk_id"])
+            else:
+                for row in conn.execute(" ".join(sql), params):
+                    similarities.append(_cosine(query_vector, _unpack(row["vector"])))
+                    chunk_ids.append(row["chunk_id"])
+        finally:
+            if scoped:
+                _drop_scope_tables(conn)
         if not similarities:
             return []
         if numpy is not None:

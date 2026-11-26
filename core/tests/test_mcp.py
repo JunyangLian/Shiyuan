@@ -90,7 +90,10 @@ def test_tools_list_exposes_readonly_tools(server):
     response = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
     tools = {tool["name"]: tool for tool in response["result"]["tools"]}
     assert set(tools) == {
-        "search_knowledge", "get_document_text", "list_sources", "knowledge_stats"
+        "search_knowledge", "get_document_text", "list_sources", "knowledge_stats",
+        "list_projects", "get_project", "search_assets", "get_evidence",
+        "get_document_family", "list_document_families", "compare_versions",
+        "get_related_documents", "get_source_status",
     }
     assert tools["search_knowledge"]["annotations"]["readOnlyHint"] is True
     assert "query" in tools["search_knowledge"]["inputSchema"]["required"]
