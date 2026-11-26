@@ -110,6 +110,20 @@ def recent_questions(conn: sqlite3.Connection, session_id: str,
     return [row["content"] for row in rows if (row["content"] or "").strip()]
 
 
+def recent_answer(conn: sqlite3.Connection, session_id: str) -> str | None:
+    """上一轮助手的回答正文；用于解析「版本2」「第二个」这类指代。"""
+    row = conn.execute(
+        "SELECT content FROM chat_messages"
+        " WHERE session_id = ? AND role = 'assistant'"
+        " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    text = (row["content"] or "").strip()
+    return text or None
+
+
 def recent_answer_sources(conn: sqlite3.Connection, session_id: str,
                           limit: int = 3) -> list[str]:
     """上一轮回答引用涉及的来源，用于把追问限定在同一批资料里。"""

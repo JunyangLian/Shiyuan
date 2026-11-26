@@ -297,7 +297,8 @@ export type ParseResultStatus =
   | "empty"
   | "pending"
   | "locked"
-  | "unsupported";
+  | "unsupported"
+  | "metadata_only";
 
 export interface ParseResultItem {
   location_id: string;
@@ -328,6 +329,7 @@ export interface ParseResults {
     pending: number;
     locked: number;
     unsupported: number;
+    metadata_only: number;
   };
   items: ParseResultItem[];
   total: number;
@@ -499,6 +501,7 @@ export interface AnswerResult {
     content_pending: number;
     content_empty: number;
     content_failed: number;
+    content_metadata_only: number;
     ocr_indexed: number;
     ocr_pending: number;
   };

@@ -470,10 +470,12 @@ def run_ask_stream(payload: AskPayload,
                            if payload.session_id else [])
                 anchors = (chat.recent_answer_sources(worker_conn, payload.session_id)
                            if payload.session_id else [])
+                previous_answer = (chat.recent_answer(worker_conn, payload.session_id)
+                                   if payload.session_id else None)
                 result = answer.ask(
                     worker_conn, payload.question, source_id=payload.source_id,
                     ext=payload.ext, top_k=payload.top_k, history=history,
-                    anchor_sources=anchors,
+                    anchor_sources=anchors, previous_answer=previous_answer,
                     on_delta=lambda text: events.put({"type": "delta", "text": text}))
                 if payload.session_id:
                     chat.append_exchange(
@@ -514,9 +516,12 @@ def run_ask(payload: AskPayload, conn: sqlite3.Connection = Depends(get_conn)) -
         history = chat.recent_questions(conn, payload.session_id) if payload.session_id else []
         anchor_sources = (chat.recent_answer_sources(conn, payload.session_id)
                           if payload.session_id else [])
+        previous_answer = (chat.recent_answer(conn, payload.session_id)
+                           if payload.session_id else None)
         result = answer.ask(conn, payload.question, source_id=payload.source_id,
                             ext=payload.ext, top_k=payload.top_k, history=history,
-                            anchor_sources=anchor_sources)
+                            anchor_sources=anchor_sources,
+                            previous_answer=previous_answer)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except answer.AnswerError as exc:
@@ -807,10 +812,11 @@ def list_index_jobs(status: str | None = None, stage: str | None = None, limit: 
 def source_parse_results(source_id: str, status: str | None = None,
                          limit: int = 100, offset: int = 0,
                          conn: sqlite3.Connection = Depends(get_conn)) -> dict:
-    """按数据源查看逐文件解析结果：成功、失败、无文本、待解析、不支持。"""
+    """按数据源查看逐文件解析结果：成功、失败、无文本、待解析、仅登记、不支持。"""
     if store.get_source(conn, source_id) is None:
         raise HTTPException(status_code=404, detail="数据源不存在")
-    allowed = {"all", "ok", "failed", "empty", "pending", "locked", "unsupported"}
+    allowed = {"all", "ok", "failed", "empty", "pending", "locked",
+               "unsupported", "metadata_only"}
     if status and status not in allowed:
         raise HTTPException(status_code=400, detail="未知的解析状态")
     return indexer.parse_results(

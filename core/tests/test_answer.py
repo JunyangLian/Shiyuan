@@ -870,3 +870,82 @@ def test_api_followup_question_stays_in_previous_source(client, tmp_path):
     assert second["context_used"] == "单据助手怎么用"
     assert second["citations"]
     assert all(item["path"].startswith(str(tool_root)) for item in second["citations"])
+
+
+def test_messages_include_previous_answer_for_followup():
+    evidence = [answer.Evidence(
+        chunk_id="c1", asset_id="a1", location_id="l1", path="D:\\报告.md",
+        name="报告.md", text="样本量 42", page=None, sheet=None, matches=1)]
+    messages = answer._messages(
+        "它有多少行", evidence, previous="Table S1 比较了什么",
+        previous_answer="Table S1 共 95,992 行。")
+    user = messages[1]["content"]
+    assert "上一轮回答" in user
+    assert "95,992" in user
+
+
+def test_resolve_version_reference_from_previous_answer():
+    previous = (
+        "文件名包含「报告」的版本共 2 个：\n"
+        "1. `D:\\论文\\报告_第1版.md`\n"
+        "2. `D:\\论文\\报告_第2版.md`\n"
+    )
+    assert answer._resolve_reference("我们看版本2吧", previous) == "D:\\论文\\报告_第2版.md"
+    assert answer._resolve_reference("打开第二个", previous) == "D:\\论文\\报告_第2版.md"
+    assert answer._resolve_reference("版本2和版本3有什么区别？", previous) is None
+    assert answer._resolve_reference("我们看版本2吧", None) is None
+
+    titled = "版本一（报告_第1版.md）：第一版\n版本二（报告_第2版.md）：第二版"
+    assert answer._resolve_reference("我们看版本2吧", titled) == "报告_第2版.md"
+
+
+def test_followup_can_open_version_listed_in_previous_answer(client, tmp_path):
+    root = tmp_path / "论文"
+    root.mkdir()
+    (root / "报告_第1版.md").write_text("第一版正文，样本量 10。", encoding="utf-8")
+    (root / "报告_第2版.md").write_text("第二版正文，样本量 42。", encoding="utf-8")
+    source_id = client.post("/api/sources", json={"root": str(root)}).json()["source_id"]
+    client.post(f"/api/sources/{source_id}/scan")
+    client.put("/api/inventory/policies", json={
+        "source_id": source_id, "policies": {"md": "standard_parse"},
+    })
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not client.get("/api/sources").json()["items"][0]["scanning"]:
+            break
+        time.sleep(0.05)
+
+    session = client.post("/api/chat/sessions", json={"title": "版本"}).json()
+    first = client.post("/api/ask", json={
+        "question": "报告有哪些版本？", "session_id": session["session_id"],
+    }).json()
+    assert first["reason"] == "version_overview"
+    assert "报告_第2版.md" in first["answer"]
+
+    second = client.post("/api/ask", json={
+        "question": "我们看版本2吧", "session_id": session["session_id"],
+    }).json()
+    assert second["reason"] == "version_selected"
+    assert second["citations"][0]["name"] == "报告_第2版.md"
+    assert "42" in second["answer"]
+
+
+def test_question_naming_source_limits_evidence(conn, tmp_path):
+    roots = {}
+    for name, content in (("甲库", "样本量是 42 例。"), ("乙库", "样本量是 99 例。")):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "记录.md").write_text(content, encoding="utf-8")
+        source = store.add_source(conn, root)
+        scanner.scan_source(conn, source["source_id"])
+        indexer.index_pending(conn, source["source_id"])
+        roots[name] = source["source_id"]
+
+    assert answer._named_source(conn, "甲库里样本量是多少？") == (roots["甲库"], "甲库")
+    # 只是提到项目名、没有指向目录的说法时，不限定检索范围。
+    assert answer._named_source(conn, "甲库有没有提到样本量？") is None
+
+    result = answer.ask(conn, "甲库里样本量是多少？")
+    assert result["evidence_count"] >= 1
+    assert all("甲库" in item["path"] for item in result["citations"])
+    assert "99" not in result["answer"]

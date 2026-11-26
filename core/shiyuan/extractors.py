@@ -20,6 +20,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 MAX_FILE_BYTES = 64 * 1024 * 1024
+# 纯文本按头部采样：几百 MB 的日志/表格只需要开头就能被检索到，
+# 不再因为超过整文件上限直接判失败。
+MAX_TEXT_SAMPLE_BYTES = 8 * 1024 * 1024
 MAX_CHARS = 2_000_000
 
 # 少于此长度的 PDF 页文本更可能是水印 / 页眉残片，留给 OCR 补全而不是当作正文。
@@ -91,7 +94,19 @@ def _decode(data: bytes) -> str:
 
 
 def _read_text(path: Path) -> list[Section]:
-    return [Section(text=_decode(path.read_bytes()))]
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    if size <= MAX_TEXT_SAMPLE_BYTES:
+        return [Section(text=_decode(path.read_bytes()))]
+    with path.open("rb") as handle:
+        data = handle.read(MAX_TEXT_SAMPLE_BYTES)
+    text = _decode(data)
+    text += (f"\n\n[已截断] 原文件 {size / (1024 * 1024):.1f}MB，"
+             f"仅解析前 {MAX_TEXT_SAMPLE_BYTES // (1024 * 1024)}MB；"
+             "其余内容未进入索引。")
+    return [Section(text=text)]
 
 
 def _usable_pdf_text(text: str) -> bool:
@@ -1065,7 +1080,7 @@ def extract(path: str | Path, ext: str) -> list[Section]:
     if suffix in MEDIA_EXTS:
         if size > MAX_MEDIA_BYTES:
             raise ExtractError(f"音视频超过 {MAX_MEDIA_BYTES // (1024 ** 3)}GB，跳过解析")
-    elif size > MAX_FILE_BYTES:
+    elif size > MAX_FILE_BYTES and suffix not in TEXT_EXTS:
         raise ExtractError(f"文件超过 {MAX_FILE_BYTES // (1024 * 1024)}MB，首版跳过解析")
 
     if suffix in TEXT_EXTS:

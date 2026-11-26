@@ -562,3 +562,21 @@ def test_embed_failure_is_recorded_and_visible(conn, tmp_path, monkeypatch):
     # 修改设置后旧错误清除（未做同步探测）。
     embeddings.update_settings(conn, {"model": "another-model"})
     assert embeddings.public_settings(conn)["last_error"] is None
+
+
+def test_query_vector_cache_reuses_embedding(monkeypatch):
+    calls = []
+
+    def fake_embed(settings, texts):
+        calls.append(list(texts))
+        return [[0.1, 0.2, 0.3]]
+
+    monkeypatch.setattr(embeddings, "embed_texts", fake_embed)
+    with embeddings._QUERY_CACHE_LOCK:
+        embeddings._QUERY_CACHE.clear()
+    settings = {"model": "cache-test-model"}
+    text = "查询缓存唯一语句 42"
+    first = embeddings._query_vector(settings, text)
+    second = embeddings._query_vector(settings, text)
+    assert first == second == [0.1, 0.2, 0.3]
+    assert len(calls) == 1

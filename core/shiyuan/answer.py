@@ -602,7 +602,8 @@ def _plan_note(plan: planner.Plan, stats: dict) -> str:
 def _messages(question: str, evidence: list[Evidence],
               previous: str | None = None,
               plan_note: str | None = None,
-              include_path: bool = False) -> list[dict]:
+              include_path: bool = False,
+              previous_answer: str | None = None) -> list[dict]:
     system = (
         "你是本地知识库的检索助手，只能依据用户消息中的<证据>回答。"
         "禁止补充证据之外的事实或推测。每个事实句末用 [数字] 标注对应证据。"
@@ -620,11 +621,19 @@ def _messages(question: str, evidence: list[Evidence],
         "不要根据证据条数推断文件总数、知识库规模或用户拥有的资料范围。"
         "不要自行做跨行汇总或算术计算（求和、平均、总计），也不要根据片段推算数字；"
         "若问题需要这类统计，说明拾源当前不做表格汇总，并指出相关文件。"
-        "若证据不足，直接回答：根据现有资料无法确定。"
+        "若证据只能回答一部分，先直接回答能确定的部分，再说明还缺什么；"
+        "只有完全无法回答时才说：根据现有资料无法确定。"
     )
+    if previous_answer:
+        system += (
+            "追问里的「它、这个、上述、版本N、第N个」要对照上一轮回答确定指代对象；"
+            "上一轮回答只用于理解指代，不能当作证据或引用来源。"
+        )
     user = f"<问题>\n{question}"
     if previous:
         user += f"\n（对话追问，上一轮问题：{previous}）"
+    if previous_answer:
+        user += f"\n\n<上一轮回答（只用于理解指代，不作为证据）>\n{previous_answer[:800]}"
     if plan_note:
         user += f"\n\n<检索规划>\n{plan_note}"
     user += f"\n\n<证据>\n{_evidence_block(evidence, include_path)}"
@@ -738,7 +747,8 @@ def _openai_answer(settings: dict, question: str, evidence: list[Evidence],
                    previous: str | None = None,
                    plan_note: str | None = None,
                    include_path: bool = False,
-                   on_delta=None) -> str:
+                   on_delta=None,
+                   previous_answer: str | None = None) -> str:
     if not settings.get("allow_cloud"):
         raise AnswerError("云端回答未获授权：请先在对话设置里允许上传证据片段")
     if not settings.get("api_key") or not settings.get("model"):
@@ -748,7 +758,8 @@ def _openai_answer(settings: dict, question: str, evidence: list[Evidence],
         "model": settings["model"],
         "temperature": 0.2,
         "max_tokens": int(settings.get("max_tokens") or 1600),
-        "messages": _messages(question, evidence, previous, plan_note, include_path),
+        "messages": _messages(question, evidence, previous, plan_note, include_path,
+                              previous_answer),
     }
     effort = settings.get("reasoning_effort")
     if effort:
@@ -783,13 +794,14 @@ def _ollama_answer(settings: dict, question: str, evidence: list[Evidence],
                    previous: str | None = None,
                    plan_note: str | None = None,
                    include_path: bool = False,
-                   on_delta=None) -> str:
+                   on_delta=None,
+                   previous_answer: str | None = None) -> str:
     if not settings.get("model"):
         raise AnswerError("Ollama 回答尚未填写模型名称")
     base = (settings.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
     payload = {"model": settings["model"], "stream": on_delta is not None,
                "messages": _messages(question, evidence, previous, plan_note,
-                                     include_path)}
+                                     include_path, previous_answer)}
     if on_delta is not None:
         timeout = float(os.environ.get("SHIYUAN_MODEL_TIMEOUT", "90"))
         return _stream_ollama(f"{base}/api/chat", payload, timeout, on_delta)
@@ -835,6 +847,7 @@ def _coverage(conn: sqlite3.Connection) -> dict:
     counts = indexer.coverage(conn)
     return {"content_indexed": counts["indexed"], "content_pending": counts["pending"],
             "content_empty": counts["empty"], "content_failed": counts["failed"],
+            "content_metadata_only": counts["metadata_only"],
             "ocr_indexed": counts["ocr_indexed"], "ocr_pending": counts["ocr_pending"]}
 
 
@@ -894,6 +907,41 @@ _SOURCE_CUE = re.compile(
 def _bigrams(value: str) -> set[str]:
     compact = re.sub(r"\s+", "", value or "").lower()
     return {compact[index:index + 2] for index in range(len(compact) - 1)}
+
+
+_SOURCE_LOCATIVE = ("里", "中", "内", "数据源", "目录", "文件夹", "下面", "之下", "当中")
+_SOURCE_LIST = re.compile(r"(有哪些|有什么|有多少|多少个|多少份|概况|概览|统计|列出|清单)")
+
+
+def _named_source(conn: sqlite3.Connection, text: str) -> tuple[str, str] | None:
+    """问题明确指向某个数据源时，返回 (source_id, 展示名) 用于限定检索范围。
+
+    只认「X 里/中/内/数据源」或「X 有哪些文件」这类指向目录的说法；
+    「A 论文有没有提到 B」这种提到项目名、但实际可能在别处找证据的问法不限定。
+    """
+    compact = re.sub(r"\s+", "", text or "").lower()
+    if not compact:
+        return None
+    best: tuple[str, str] | None = None
+    for row in store.list_sources(conn):
+        if row["state"] != "active":
+            continue
+        for name in (row["label"] or "", Path(row["root_uri"]).name):
+            candidate = re.sub(r"\s+", "", name).lower()
+            if len(candidate) < 2:
+                continue
+            index = compact.find(candidate)
+            if index < 0:
+                continue
+            tail = compact[index + len(candidate):]
+            scoped = any(tail.startswith(mark) for mark in _SOURCE_LOCATIVE)
+            if not scoped and index == 0 and _SOURCE_LIST.search(tail):
+                scoped = True
+            if not scoped:
+                continue
+            if best is None or len(candidate) > len(best[1]):
+                best = (row["source_id"], row["label"] or name)
+    return best
 
 
 def _match_source(conn: sqlite3.Connection, text: str,
@@ -1344,6 +1392,183 @@ def _focus_terms(text: str) -> list[str]:
             if len(term) >= 2 and not retrieval.is_generic_term(term)]
 
 
+# ---------------------------------------------------------------- 版本指代
+
+_ORDINAL_WORDS = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                  "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+_ORDINAL_REF = re.compile(
+    r"(?:版本|版|version|v)\s*([0-9]{1,2}|[一二两三四五六七八九十]{1,3})(?![\d.])"
+    r"|第\s*([0-9]{1,2}|[一二两三四五六七八九十]{1,3})\s*"
+    r"(?:个(?!文件|文档|来源|引用)|版|篇|份|条)")
+_VERSION_HEAD = re.compile(
+    r"版本\s*([0-9]{1,2}|[一二两三四五六七八九十]{1,3})\s*\*{0,2}\s*[（(]\s*\**\s*"
+    r"([^）)\n]{2,200}?)\s*[）)]")
+_NUMBERED_LINE = re.compile(r"^\s*(?:(\d{1,2})[.、)）]|[-*•])\s*(.+?)\s*$")
+_FILE_IN_TEXT = re.compile(
+    r"([^\s`\"'（）()：:，,、]+?\.(?:docx?|pdf|pptx?|xlsx?|xls|md|txt|tsv|csv|py|zip|rar|7z))",
+    re.IGNORECASE)
+_SELECT_VERB = re.compile(r"(看|打开|读|选择|切换|就用|用一下|采用)")
+_NOT_SELECT = re.compile(r"(区别|对比|不同|为什么|怎么|如何|多少|几个|哪些|什么|多大|大小|在哪|哪里)")
+
+
+def _to_number(value: str) -> int | None:
+    value = (value or "").strip()
+    if value.isdigit():
+        return int(value)
+    if not value:
+        return None
+    if "十" in value:
+        left, _, right = value.partition("十")
+        tens = _ORDINAL_WORDS.get(left, 1) if left else 1
+        ones = _ORDINAL_WORDS.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return _ORDINAL_WORDS.get(value)
+
+
+def _ordinal_ref(text: str) -> int | None:
+    compact = re.sub(r"\s+", "", text or "")
+    match = _ORDINAL_REF.search(compact)
+    if match is None:
+        return None
+    return _to_number(match.group(1) or match.group(2))
+
+
+def _is_selection_followup(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text or "")
+    if not compact or len(compact) > 14 or _NOT_SELECT.search(compact):
+        return False
+    return bool(_SELECT_VERB.search(compact)) or len(compact) <= 8
+
+
+def _resolve_reference(text: str, previous_answer: str | None) -> str | None:
+    """把「我们看版本2吧」解析成上一轮回答里列出的文件名或路径。"""
+    if not previous_answer:
+        return None
+    ordinal = _ordinal_ref(text)
+    if ordinal is None or not _is_selection_followup(text):
+        return None
+
+    # 标题式写法：版本二（Siganus_fuscescens_CBPD_clean_v0.12.docx）
+    for match in _VERSION_HEAD.finditer(previous_answer):
+        if _to_number(match.group(1)) != ordinal:
+            continue
+        body = match.group(2)
+        ticked = re.search(r"`([^`]+)`", body)
+        if ticked:
+            return ticked.group(1).strip()
+        found = _FILE_IN_TEXT.search(body)
+        if found:
+            return found.group(1)
+        return body.strip()
+
+    # 编号或项目符号列表：取第 N 项
+    numbered: dict[int, str] = {}
+    bullets: list[str] = []
+    for line in previous_answer.splitlines():
+        match = _NUMBERED_LINE.match(line)
+        if match is None:
+            continue
+        if match.group(1):
+            numbered.setdefault(int(match.group(1)), match.group(2))
+        else:
+            bullets.append(match.group(2))
+    target = numbered.get(ordinal)
+    if target is None and 0 < ordinal <= len(bullets):
+        target = bullets[ordinal - 1]
+    if not target:
+        return None
+    ticked = re.search(r"`([^`]+)`", target)
+    if ticked:
+        return ticked.group(1).strip()
+    found = _FILE_IN_TEXT.search(target)
+    return found.group(1) if found else target.strip().strip("`")
+
+
+def _selected_version_answer(conn: sqlite3.Connection, reference: str, *,
+                             source_id: str | None
+                             ) -> tuple[str, list[Evidence]] | None:
+    """用户点名要看某一版：给出路径、时间、正文规模和开头预览。"""
+    name = reference.rsplit("\\", 1)[-1].rsplit("/", 1)[-1].strip()
+    if not name:
+        return None
+    sql = [
+        "SELECT l.location_id, l.asset_id, l.path, l.size, l.mtime_ns",
+        "FROM asset_locations l JOIN sources s ON s.source_id = l.source_id",
+        "WHERE l.availability = 'AVAILABLE' AND s.state = 'active'",
+    ]
+    params: list = []
+    if source_id:
+        sql.append("AND l.source_id = ?")
+        params.append(source_id)
+    sql.append("AND (l.path = ? OR lower(l.path) LIKE lower(?))")
+    params.extend([reference, f"%{name}"])
+    row = None
+    for candidate in conn.execute(" ".join(sql), params):
+        candidate_name = candidate["path"].rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+        if candidate_name.lower() == name.lower():
+            row = candidate
+            break
+    if row is None:
+        return None
+
+    version = conn.execute(
+        "SELECT version_id FROM content_versions WHERE asset_id = ? AND is_current = 1"
+        " ORDER BY observed_at DESC LIMIT 1", (row["asset_id"],)).fetchone()
+    chunks: list[sqlite3.Row] = []
+    total_chunks = total_chars = 0
+    if version is not None:
+        total_chunks, total_chars = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)), 0) FROM chunks"
+            " WHERE version_id = ?", (version["version_id"],)).fetchone()
+        chunks = conn.execute(
+            "SELECT chunk_id, text, page, sheet FROM chunks WHERE version_id = ?"
+            " ORDER BY (page IS NULL), page, sheet, ordinal LIMIT 40",
+            (version["version_id"],)).fetchall()
+
+    preview_parts: list[str] = []
+    evidence: list[Evidence] = []
+    for chunk in chunks:
+        text = (chunk["text"] or "").strip()
+        if not text:
+            continue
+        if len("".join(preview_parts)) < 420:
+            preview_parts.append(text)
+        if not evidence:
+            evidence.append(Evidence(
+                chunk_id=chunk["chunk_id"], asset_id=row["asset_id"],
+                location_id=row["location_id"], path=row["path"], name=name,
+                text=text, page=chunk["page"], sheet=chunk["sheet"], matches=0,
+                version_id=version["version_id"] if version else "",
+                mtime=(datetime.fromtimestamp(row["mtime_ns"] / 1e9)
+                       .strftime("%Y-%m-%dT%H:%M") if row["mtime_ns"] else None),
+            ))
+    if not evidence:
+        evidence.append(Evidence(
+            chunk_id="", asset_id=row["asset_id"], location_id=row["location_id"],
+            path=row["path"], name=name, text="", page=None, sheet=None, matches=0,
+            version_id=version["version_id"] if version else "",
+            mtime=(datetime.fromtimestamp(row["mtime_ns"] / 1e9)
+                   .strftime("%Y-%m-%dT%H:%M") if row["mtime_ns"] else None),
+        ))
+
+    lines = [f"你选的是「{name}」：", f"`{row['path']}`"]
+    size_mb = (row["size"] or 0) / 1024 / 1024
+    updated = (datetime.fromtimestamp(row["mtime_ns"] / 1e9).strftime("%Y-%m-%d %H:%M")
+               if row["mtime_ns"] else "未知")
+    lines.append(f"- 大小：{size_mb:.1f} MB，更新于 {updated}")
+    if version is not None:
+        lines.append(f"- 正文：已索引 {total_chars} 字，共 {total_chunks} 个片段")
+    else:
+        lines.append("- 正文：还没有可读的解析结果，请先在桌面端完成解析")
+    preview = "\n".join(preview_parts).strip()
+    if preview:
+        preview = " ".join(preview.split())
+        if len(preview) > 420:
+            preview = preview[:420] + "…"
+        lines.append(f"\n开头预览：{preview}")
+    return "\n".join(lines), evidence
+
+
 def _library_overview(conn: sqlite3.Connection, *, source_id: str | None,
                       ext: str | None) -> str:
     clauses = ["l.availability = 'AVAILABLE'", "s.state = 'active'"]
@@ -1385,6 +1610,7 @@ def _library_overview(conn: sqlite3.Connection, *, source_id: str | None,
     lines.append(
         f"正文索引：已解析 {coverage['indexed']}，待解析 {coverage['pending']}，"
         f"无文本层 {coverage['empty']}，失败 {coverage['failed']}，"
+        f"仅登记（不解压）{coverage['metadata_only']}，"
         f"暂不支持 {coverage['unsupported']}。"
     )
     lines.append(f"OCR：已识别 {coverage['ocr_indexed']}，待 OCR {coverage['ocr_pending']}。")
@@ -1398,6 +1624,7 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
         ext: str | None = None, top_k: int | None = None,
         history: list[str] | None = None,
         anchor_sources: list[str] | None = None,
+        previous_answer: str | None = None,
         on_delta=None) -> dict:
     text = (question or "").strip()
     if not text:
@@ -1408,9 +1635,53 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
     provider = settings["provider"]
     context_text = _contextual_query(text, history)
     previous = _context_base(history) if history and context_text != text else None
+    # 问题里点名了数据源（如「实验记录里…」）就先限定范围，避免被其他库的文档抢答。
+    source_hint: str | None = None
+    if source_id is None:
+        named = _named_source(conn, context_text)
+        if named is not None:
+            source_id, source_hint = named
     # 追问已经通过 _contextual_query 补全了主题词，不再按上一轮数据源强制过滤：
     # FTS 在“MATCH + source_id”组合下为了凑满候选会扫描全库，单个追问可达一分钟。
     effective_source = source_id
+
+    if previous_answer:
+        reference = _resolve_reference(text, previous_answer)
+        if reference:
+            selected = _selected_version_answer(
+                conn, reference, source_id=effective_source)
+            if selected is not None:
+                selected_text, selected_evidence = selected
+                citations = [item.citation(index) for index, item
+                             in enumerate(selected_evidence, start=1)]
+                return {
+                    "question": text,
+                    "answer": selected_text,
+                    "refused": False,
+                    "reason": "version_selected",
+                    "provider": "library",
+                    "model": None,
+                    "citations": citations,
+                    "evidence_count": len(citations),
+                    "warning": None,
+                    "coverage": coverage,
+                    "context_used": previous,
+                }
+            if re.search(r"\.[a-z0-9]{2,5}$", reference, re.IGNORECASE):
+                return {
+                    "question": text,
+                    "answer": (f"上一轮列出的「{reference}」没有在本地索引里找到，"
+                               "可能已移动、改名或还没解析。可以让我按主题重新检索。"),
+                    "refused": False,
+                    "reason": "version_missing",
+                    "provider": "library",
+                    "model": None,
+                    "citations": [],
+                    "evidence_count": 0,
+                    "warning": None,
+                    "coverage": coverage,
+                    "context_used": previous,
+                }
     anchor_prefix: str | None = None
     if (previous and not source_id and anchor_sources
             and len(anchor_sources) == 1):
@@ -1558,7 +1829,8 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
     if not evidence:
         indexed = coverage["content_indexed"]
         pending = coverage["content_pending"]
-        answer = f"没有找到足够证据回答这个问题。当前正文索引覆盖 {indexed} 个文件"
+        scope = f"在「{source_hint}」中" if source_hint else ""
+        answer = f"{scope}没有找到足够证据回答这个问题。当前正文索引覆盖 {indexed} 个文件"
         if pending:
             answer += f"，另有 {pending} 个文件待解析"
         answer += "；扫描件需要 OCR（L2）后才能检索。"
@@ -1583,11 +1855,13 @@ def ask(conn: sqlite3.Connection, question: str, *, source_id: str | None = None
         warning = None
     elif provider == "openai":
         answer = _openai_answer(settings, text, evidence, previous, plan_note,
-                                include_path=path_question, on_delta=on_delta)
+                                include_path=path_question, on_delta=on_delta,
+                                previous_answer=previous_answer if previous else None)
         warning = _citation_warning(answer, len(evidence))
     else:
         answer = _ollama_answer(settings, text, evidence, previous, plan_note,
-                                include_path=path_question, on_delta=on_delta)
+                                include_path=path_question, on_delta=on_delta,
+                                previous_answer=previous_answer if previous else None)
         warning = _citation_warning(answer, len(evidence))
 
     if not answer:

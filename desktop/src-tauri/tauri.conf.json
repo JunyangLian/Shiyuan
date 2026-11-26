@@ -1,7 +1,7 @@
 {
   "$schema": "../../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Shiyuan",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "identifier": "app.shiyuan.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -28,6 +28,6 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
-    "externalBin": ["binaries/shiyuan-core"]
+    "resources": ["binaries/shiyuan-core/**/*"]
   }
 }

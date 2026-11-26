@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from . import __version__, config, db, external, search, store
+from . import __version__, config, db, embeddings, external, search, store
 
 SERVER_NAME = "shiyuan-mcp"
 DEFAULT_PROTOCOL = "2025-06-18"
@@ -736,6 +736,8 @@ def main(argv: list[str] | None = None) -> None:
     try:
         db.init_db(conn)
         conn.execute("PRAGMA query_only = ON")
+        # 后台预热向量矩阵与本地模型，避免 Agent 的第一次检索等冷启动。
+        embeddings.warm_cache_async()
         serve(conn, once=args.once)
     finally:
         conn.close()

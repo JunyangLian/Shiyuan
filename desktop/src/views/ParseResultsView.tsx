@@ -14,6 +14,7 @@ const FILTERS: { key: Filter; label: string }[] = [
   { key: "empty", label: "无文本" },
   { key: "pending", label: "待解析" },
   { key: "locked", label: "被占用" },
+  { key: "metadata_only", label: "仅登记" },
   { key: "unsupported", label: "暂不支持" },
 ];
 
@@ -23,6 +24,7 @@ const STATUS_LABEL: Record<ParseResultStatus, string> = {
   empty: "无文本",
   pending: "待解析",
   locked: "文件被占用",
+  metadata_only: "仅登记",
   unsupported: "暂不支持",
 };
 
@@ -32,6 +34,7 @@ const STATUS_CHIP: Record<ParseResultStatus, string> = {
   empty: "chip subtle",
   pending: "chip subtle",
   locked: "chip warn",
+  metadata_only: "chip subtle",
   unsupported: "chip subtle",
 };
 
@@ -41,6 +44,7 @@ const STATUS_HINT: Record<ParseResultStatus, string> = {
   empty: "没有可提取的文本；扫描件可尝试 OCR",
   pending: "尚未进入解析队列",
   locked: "解析时文件被其他程序占用",
+  metadata_only: "按盘点策略只登记文件名和路径，不解析内容",
   unsupported: "当前解析器暂不支持此类型",
 };
 
@@ -110,6 +114,7 @@ export default function ParseResultsView({
     empty: summary?.empty ?? 0,
     pending: summary?.pending ?? 0,
     locked: summary?.locked ?? 0,
+    metadata_only: summary?.metadata_only ?? 0,
     unsupported: summary?.unsupported ?? 0,
   };
   const currentLabel = FILTERS.find((item) => item.key === filter)?.label ?? "全部";
@@ -127,7 +132,7 @@ export default function ParseResultsView({
           <p className="sub">
             {source.root_uri}
             <br />
-            逐文件查看解析成功、失败与待处理记录。
+            逐文件查看解析状态；压缩包等「仅登记」条目不会解压或解析。
           </p>
         </div>
         <button className="ghost small" disabled={loading} onClick={() => void load(filter)}>
@@ -153,6 +158,10 @@ export default function ParseResultsView({
         <div>
           <span>待解析</span>
           <strong>{summary?.pending ?? 0}</strong>
+        </div>
+        <div>
+          <span>仅登记</span>
+          <strong>{summary?.metadata_only ?? 0}</strong>
         </div>
       </div>
 

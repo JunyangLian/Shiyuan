@@ -12,6 +12,7 @@ import math
 import re
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -441,6 +442,33 @@ def _new_cache(model: str | None = None, dim: int = 0) -> dict:
     }
 
 
+# 查询向量缓存：同一句话反复检索时省掉一次模型调用（Agent 经常会重复问）。
+_QUERY_CACHE: dict[tuple[str, str], tuple[float, list[float]]] = {}
+_QUERY_CACHE_LOCK = threading.Lock()
+_QUERY_CACHE_TTL = 600.0
+_QUERY_CACHE_MAX = 128
+
+
+def _query_vector(settings: dict, text: str) -> list[float]:
+    key = (settings.get("model") or "", text)
+    now = time.monotonic()
+    with _QUERY_CACHE_LOCK:
+        hit = _QUERY_CACHE.get(key)
+        if hit is not None and now - hit[0] < _QUERY_CACHE_TTL:
+            return hit[1]
+        if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
+            expired = [item for item, value in _QUERY_CACHE.items()
+                       if now - value[0] >= _QUERY_CACHE_TTL]
+            for item in expired:
+                _QUERY_CACHE.pop(item, None)
+            if len(_QUERY_CACHE) >= _QUERY_CACHE_MAX:
+                _QUERY_CACHE.clear()
+    vector = embed_texts(settings, [text])[0]
+    with _QUERY_CACHE_LOCK:
+        _QUERY_CACHE[key] = (time.monotonic(), vector)
+    return vector
+
+
 def _vector_cache_key(conn: sqlite3.Connection, model: str) -> tuple:
     """只查总数与 rowid 水位；MAX(updated_at) 会退化成全表扫描，约 0.6 秒。"""
     row = conn.execute(
@@ -689,7 +717,7 @@ def _cached_scores(conn: sqlite3.Connection, model: str, query_vector: list[floa
 
 
 def warm_cache_async() -> None:
-    """后台预热 int8 向量缓存；有新增向量时顺带追加，不重复整库重建。"""
+    """后台预热向量缓存与本地向量模型；有新增向量时顺带追加，不重复整库重建。"""
     def worker() -> None:
         conn = None
         try:
@@ -697,6 +725,12 @@ def warm_cache_async() -> None:
             settings = load_settings(conn)
             if not enabled(settings):
                 return
+            if settings["provider"] == "ollama":
+                # 让本地服务先把模型加载进内存，首个检索不必等冷启动。
+                try:
+                    embed_texts(settings, ["检索预热"])
+                except EmbeddingError:
+                    pass
             with _VECTOR_CACHE_LOCK:
                 _refresh_cache(conn, settings["model"])
         except Exception:  # noqa: BLE001 - 预热失败不影响功能，查询时会再处理
@@ -714,7 +748,7 @@ def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | Non
     if not enabled(settings):
         return []
     try:
-        query_vector = embed_texts(settings, [text])[0]
+        query_vector = _query_vector(settings, text)
     except EmbeddingError as exc:
         _set_last_error(conn, str(exc))
         raise

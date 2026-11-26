@@ -294,7 +294,8 @@ function AnswerCard({ result }: { result: AnswerResult }) {
 
       <div className="answer-coverage">
         覆盖：已解析 {result.coverage.content_indexed} 个文件 · OCR {result.coverage.ocr_indexed} ·
-        待解析 {result.coverage.content_pending} · 无文本层 {result.coverage.content_empty}
+        待解析 {result.coverage.content_pending} · 无文本层 {result.coverage.content_empty} ·
+        仅登记 {result.coverage.content_metadata_only}
       </div>
 
       {openFamily && (

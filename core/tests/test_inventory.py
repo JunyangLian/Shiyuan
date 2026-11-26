@@ -204,7 +204,38 @@ def test_parse_results_lists_success_and_failure(conn, tmp_path):
 
     progress = indexer.parse_progress(conn, source_id)
     assert progress == {"total": 3, "parsed": 1, "failed": 1, "empty": 0,
-                        "pending": 0, "locked": 0, "unsupported": 1}
+                        "pending": 0, "locked": 0, "unsupported": 1,
+                        "metadata_only": 0}
+
+
+def test_metadata_only_files_are_not_pending(conn, tmp_path):
+    root = tmp_path / "资料"
+    root.mkdir()
+    (root / "说明.md").write_text("正文内容", encoding="utf-8")
+    (root / "资料包.zip").write_bytes(b"PK\x03\x04fake")
+
+    source = store.add_source(conn, root)
+    source_id = source["source_id"]
+    inventory.save_policies(conn, {"md": "standard_parse", "zip": "metadata_only"},
+                            source_id=source_id)
+    scanner.scan_source(conn, source_id)
+    indexer.index_pending(conn, source_id,
+                          allowed_exts=inventory.allowed_exts(conn, source_id))
+
+    report = indexer.parse_results(conn, source_id)
+    items = {item["name"]: item for item in report["items"]}
+    assert items["资料包.zip"]["status"] == "metadata_only"
+    assert items["说明.md"]["status"] == "ok"
+    assert report["summary"]["metadata_only"] == 1
+    assert report["summary"]["pending"] == 0
+
+    progress = indexer.parse_progress(conn, source_id)
+    assert progress["metadata_only"] == 1
+    assert progress["pending"] == 0
+
+    filtered = indexer.parse_results(conn, source_id, status="metadata_only")
+    assert filtered["total"] == 1
+    assert filtered["items"][0]["name"] == "资料包.zip"
 
 
 def test_incremental_parse_only_new_or_modified(conn, tmp_path):

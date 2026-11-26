@@ -788,8 +788,13 @@ def retry_job(conn: sqlite3.Connection, job_id: str) -> dict:
     return {"job_id": job_id, "stage": job["stage"], "state": state}
 
 
-def _classify_parse(row: sqlite3.Row) -> tuple[str, str | None]:
-    """把一个文件的解析产物归为 成功/失败/占用/无文本/不支持/待处理。"""
+def _classify_parse(row: sqlite3.Row,
+                   allowed_exts: set[str] | None = None) -> tuple[str, str | None]:
+    """把一个文件的解析产物归为 成功/失败/占用/无文本/仅登记/不支持/待处理。
+
+    allowed_exts 来自盘点策略：解析器支持、但用户选择只登记不解压的类型
+    （典型是压缩包）不再算「待解析」，避免看起来像永远处理不完的积压。
+    """
     ext = (row["ext"] or "").lower()
     supported = extractors.is_supported(ext)
     ocr_ext = ext in ocr.OCR_EXTS
@@ -808,8 +813,12 @@ def _classify_parse(row: sqlite3.Row) -> tuple[str, str | None]:
         return "locked", "L2" if row["ocr_locked"] else "L1"
     if l1_state == "empty" or row["ocr_empty"] or (l1_state == "ok" and l1_chars == 0):
         return "empty", "L1"
-    if not supported and not ocr_ext:
-        return "unsupported", None
+    if not supported:
+        if not ocr_ext:
+            return "unsupported", None
+        return "pending", None
+    if allowed_exts is not None and ext not in allowed_exts:
+        return "metadata_only", None
     return "pending", None
 
 
@@ -849,12 +858,14 @@ def parse_results(conn: sqlite3.Connection, source_id: str, *,
         (PARSER_SIGNATURE, source_id),
     ).fetchall()
 
-    counts = {key: 0 for key in ("ok", "failed", "empty", "pending", "locked", "unsupported")}
+    counts = {key: 0 for key in ("ok", "failed", "empty", "pending", "locked",
+                                 "unsupported", "metadata_only")}
+    allowed = inventory.allowed_exts(conn, source_id)
     items: list[dict] = []
     for row in rows:
         ext = (row["ext"] or "").lower()
         l1_chars = int(row["char_count"] or 0)
-        item_status, stage = _classify_parse(row)
+        item_status, stage = _classify_parse(row, allowed)
         counts[item_status] += 1
         items.append({
             "location_id": row["location_id"],
@@ -891,6 +902,7 @@ def parse_results(conn: sqlite3.Connection, source_id: str, *,
             "pending": counts["pending"],
             "locked": counts["locked"],
             "unsupported": counts["unsupported"],
+            "metadata_only": counts["metadata_only"],
         },
         "items": selected,
         "total": len(chosen),
@@ -925,9 +937,11 @@ def parse_progress(conn: sqlite3.Connection, source_id: str) -> dict:
         "  AND l.availability = 'AVAILABLE'",
         (PARSER_SIGNATURE, source_id),
     ).fetchall()
-    counts = {key: 0 for key in ("ok", "failed", "empty", "pending", "locked", "unsupported")}
+    counts = {key: 0 for key in ("ok", "failed", "empty", "pending", "locked",
+                                 "unsupported", "metadata_only")}
+    allowed = inventory.allowed_exts(conn, source_id)
     for row in rows:
-        status, _ = _classify_parse(row)
+        status, _ = _classify_parse(row, allowed)
         counts[status] += 1
     return {
         "total": len(rows),
@@ -937,13 +951,14 @@ def parse_progress(conn: sqlite3.Connection, source_id: str) -> dict:
         "pending": counts["pending"],
         "locked": counts["locked"],
         "unsupported": counts["unsupported"],
+        "metadata_only": counts["metadata_only"],
     }
 
 
 def coverage(conn: sqlite3.Connection) -> dict:
-    """当前内容版本的解析覆盖：已解析 / 无文本层 / 失败 / 未支持 / 待处理。"""
+    """当前内容版本的解析覆盖：已解析 / 无文本层 / 失败 / 未支持 / 仅登记 / 待处理。"""
     rows = conn.execute(
-        "SELECT v.version_id, l.ext, a.state FROM content_versions v"
+        "SELECT v.version_id, l.ext, l.source_id, a.state FROM content_versions v"
         " JOIN asset_locations l ON l.asset_id = v.asset_id"
         " JOIN sources s ON s.source_id = l.source_id"
         " LEFT JOIN parse_artifacts a ON a.version_id = v.version_id"
@@ -952,14 +967,23 @@ def coverage(conn: sqlite3.Connection) -> dict:
         (PARSER_SIGNATURE,),
     ).fetchall()
     counts = {"indexed": 0, "empty": 0, "failed": 0, "locked": 0,
-              "pending": 0, "unsupported": 0}
+              "pending": 0, "unsupported": 0, "metadata_only": 0}
+    allowed_cache: dict[str, set[str] | None] = {}
     for row in rows:
-        if not extractors.is_supported(row["ext"]):
+        ext = (row["ext"] or "").lower()
+        if not extractors.is_supported(ext):
             # 图片与 PDF 由 L2 接管，不算"暂不支持"。
-            if row["ext"] not in ocr.OCR_EXTS:
+            if ext not in ocr.OCR_EXTS:
                 counts["unsupported"] += 1
         elif row["state"] is None:
-            counts["pending"] += 1
+            source_id = row["source_id"]
+            if source_id not in allowed_cache:
+                allowed_cache[source_id] = inventory.allowed_exts(conn, source_id)
+            allowed = allowed_cache[source_id]
+            if allowed is not None and ext not in allowed:
+                counts["metadata_only"] += 1
+            else:
+                counts["pending"] += 1
         elif row["state"] == "ok":
             counts["indexed"] += 1
         elif row["state"] == "empty":

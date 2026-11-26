@@ -396,3 +396,21 @@ def test_api_scan_indexes_content_before_finishing(client, tmp_path):
     assert hits["total"] == 1
     assert hits["items"][0]["match"] == "content"
     assert client.get("/api/stats").json()["coverage"]["content_indexed"] == 1
+
+def test_large_text_file_is_sampled_instead_of_failed(conn, tmp_path, monkeypatch):
+    monkeypatch.setattr(extractors, "MAX_FILE_BYTES", 200)
+    monkeypatch.setattr(extractors, "MAX_TEXT_SAMPLE_BYTES", 64)
+    root = tmp_path / "资料"
+    root.mkdir()
+    big = root / "大表.txt"
+    big.write_text("样本量 42\n" + "x" * 400, encoding="utf-8")
+
+    sections = extractors.extract(big, "txt")
+    assert "已截断" in sections[0].text
+    assert "样本量 42" in sections[0].text
+
+    source_id = _scan_and_index(conn, root)
+    report = indexer.parse_results(conn, source_id)
+    assert report["items"][0]["status"] == "ok"
+    texts = [row["text"] for row in conn.execute("SELECT text FROM chunks")]
+    assert any("已截断" in text for text in texts)
