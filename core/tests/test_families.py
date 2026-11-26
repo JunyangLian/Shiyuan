@@ -346,6 +346,27 @@ def test_compare_versions_output_is_capped(conn, tmp_path):
     assert all(value <= 1 for value in payload["returned"].values())
 
 
+def test_version_rank_prefers_final_and_orders_numbers():
+    assert families._version_rank("终稿 10") > families._version_rank("终稿 9")
+    assert families._version_rank("终稿 10") > families._version_rank("4.22")
+    assert families._version_rank("终稿 10") > families._version_rank("最新")
+    assert families._version_rank("4.22") > families._version_rank("最新")
+    assert families._version_rank("最新") > families._version_rank("初稿")
+    assert families._version_rank("0.13") > families._version_rank("0.9")
+    assert families._version_rank("初稿") > families._version_rank("备份")
+
+
+def test_latest_versions_prefers_explicit_final_over_date_label():
+    records = [
+        {"family_id": "f", "asset_id": "a", "version_label": "4.22",
+         "mtime_ns": 200, "ext": "doc", "path": "a.doc"},
+        {"family_id": "f", "asset_id": "b", "version_label": "终稿 10",
+         "mtime_ns": 100, "ext": "doc", "path": "b.doc"},
+    ]
+    latest = families._latest_versions(records)["f"]
+    assert latest["asset_id"] == "b"
+
+
 def test_unlabeled_duplicate_family_has_unknown_latest(conn, tmp_path):
     """只有重复副本、没有版本标记的家族不能声称存在“最新版本”。"""
     root = tmp_path / "重复"
@@ -363,6 +384,9 @@ def test_unlabeled_duplicate_family_has_unknown_latest(conn, tmp_path):
     assert len(mapping) == 2
     assert all(info["is_latest_version"] is None for info in mapping.values())
     assert all(info["family_latest_version_label"] is None for info in mapping.values())
+    # 没有版本标签时仍能给出“最后修改”的成员，供外部 Agent 如实回答。
+    assert len({info["family_newest_asset_id"] for info in mapping.values()}) == 1
+    assert all(info["family_newest_mtime_ns"] > 0 for info in mapping.values())
 
     family = conn.execute("SELECT family_id FROM document_families").fetchone()
     members = families.family_members(conn, family["family_id"])

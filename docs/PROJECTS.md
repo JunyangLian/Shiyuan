@@ -105,9 +105,13 @@ external_clients(..., project_id)                 -- 令牌绑定的项目
 
 - 家族成员带 `version_label`（如 `0.13` / `终稿` / `修改版`），并按
   `is_latest_version`、`family_latest_version_label`、`family_latest_mtime` 标记最新版本。
-- 新旧排序不是简单看 mtime：数字版本按数字段比较（`0.13 > 0.9 > 0.8`），
-  `终稿 / 定稿 / final` 高于 `修订版`，`初稿` 最低；只有无标签时才退回 mtime。
+- 新旧排序不是简单看 mtime：`终稿 / 定稿 / final`（带序号按序号，`终稿 10 > 终稿 9`）
+  高于数字版本；数字版本按数字段比较（`0.13 > 0.9 > 0.8`）；再往下是 `修订`、`初稿`、`副本`。
+  `最新` 只是命名，可能比终稿更旧，因此压在终稿与数字版本之下。只有无标签时才退回 mtime。
   因此“初稿_备份”即使复制时间更晚，也不会被当成最新稿。
+- 没有版本标签的家族不判断“最新版本”（`is_latest_version=null`），但会额外给出
+  `newest_asset_id / newest_mtime`（最后修改的成员），供外部 Agent 如实回答“哪个文件更新过”。
+- `list_document_families` 返回 `built_at`（家族快照时间）；扫描后家族会重建，版本结论以该时间为准。
 - 问「最新版本 / 当前版本」时，检索会补上各大家族的最新版本，并优先展示；
   问「历史版本 / 改了什么 / v0.12」时，不提升最新版本，允许同一家族的不同版本分别出现。
 - `search_knowledge` 的每条结果都带版本字段；`list_document_families` 用于先确定

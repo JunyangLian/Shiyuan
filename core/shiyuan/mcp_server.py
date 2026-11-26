@@ -221,7 +221,10 @@ class MCPServer:
                 "Search items carry version_label, is_latest_version and "
                 "family_latest_version_label: never present an older version as current. "
                 "is_latest_version is null when the file has no version label (plain "
-                "duplicates), so do not describe such files as the latest version. "
+                "duplicates), so do not describe such files as the latest version; "
+                "for families use newest_asset_id / newest_mtime when labels are absent. "
+                "Families are rebuilt after scans: list_document_families returns built_at, "
+                "so treat version answers as a snapshot. "
                 "Items with weak=true are below the evidence threshold: mention them only "
                 "as weak leads, never as the answer. Items whose match is 'name' only "
                 "matched the file name or path; for factual questions prefer items with a "
@@ -472,7 +475,10 @@ class MCPServer:
                 "description": (
                     "List multi-version document families in the shared project, with "
                     "the latest version first. Use this to answer 'which version is "
-                    "current' before reading a specific document."
+                    "current' before reading a specific document. Families with no "
+                    "version label (plain duplicates) are excluded. Items also carry "
+                    "newest_asset_id / newest_mtime: the last modified member, useful "
+                    "when labels are absent or mixed. built_at is the family snapshot time."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -982,6 +988,10 @@ class MCPServer:
             if visible is None or member["asset_id"] in visible
         ]
         latest_ns = info.get("family_latest_mtime_ns") or 0
+        newest_id = info.get("family_newest_asset_id")
+        newest = next(
+            (member for member in members if member["asset_id"] == newest_id), None)
+        newest_ns = info.get("family_newest_mtime_ns") or 0
         return {
             "asset_id": asset_id,
             "family_id": info["family_id"],
@@ -992,6 +1002,14 @@ class MCPServer:
             "latest_mtime": (
                 datetime.fromtimestamp(latest_ns / 1e9).astimezone()
                 .isoformat(timespec="seconds") if latest_ns else None
+            ),
+            # 没有版本标签时，用“最后修改”作为唯一可核实的参照。
+            "newest_asset_id": newest_id,
+            "newest_path": newest["path"] if newest else None,
+            "newest_version_label": newest["version_label"] if newest else None,
+            "newest_mtime": (
+                datetime.fromtimestamp(newest_ns / 1e9).astimezone()
+                .isoformat(timespec="seconds") if newest_ns else None
             ),
             "members": members,
         }
@@ -1129,6 +1147,11 @@ class MCPServer:
                 # 没有任何版本标记的只是重复副本，不属于“多版本文档”。
                 continue
             title = (info_map.get(asset_ids[0]) or {}).get("family_title") or ""
+            family_info = info_map.get(asset_ids[0]) or {}
+            newest_id = family_info.get("family_newest_asset_id")
+            newest = next(
+                (member for member in members if member["asset_id"] == newest_id), None)
+            newest_ns = family_info.get("family_newest_mtime_ns") or 0
             latest = next(
                 (member for member in members if member["is_latest"]), members[0]
             )
@@ -1155,6 +1178,14 @@ class MCPServer:
                 ),
                 "latest_mtime_ns": latest_ns,
                 "latest_path": latest["path"],
+                "newest_asset_id": newest_id,
+                "newest_version_label": newest["version_label"] if newest else None,
+                "newest_path": newest["path"] if newest else None,
+                "newest_mtime": (
+                    datetime.fromtimestamp(newest_ns / 1e9).astimezone()
+                    .isoformat(timespec="seconds") if newest_ns else None
+                ),
+                "newest_mtime_ns": newest_ns,
                 "versions": [
                     {
                         "label": bucket["label"],
@@ -1184,7 +1215,15 @@ class MCPServer:
         # 否则外部 Agent 会以为过滤生效，实际拿到的是全量列表。
         selected = matched if query else items
         selected.sort(key=lambda item: (-item["size"], -item["latest_mtime_ns"]))
-        return {"total": len(selected), "items": selected[:limit]}
+        snapshot = self.conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'document_families'").fetchone()
+        built_at = None
+        if snapshot:
+            try:
+                built_at = json.loads(snapshot["value"]).get("built_at")
+            except ValueError:
+                built_at = None
+        return {"total": len(selected), "items": selected[:limit], "built_at": built_at}
 
     def _source_status(self, args: dict) -> dict:
         source_id = _string(args, "source_id", required=False)

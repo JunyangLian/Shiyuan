@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/JunyangLian/SourceLoom)](https://github.com/JunyangLian/SourceLoom/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/JunyangLian/SourceLoom/total)](https://github.com/JunyangLian/SourceLoom/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
-![Version](https://img.shields.io/badge/version-0.2.1-005E9B)
+![Version](https://img.shields.io/badge/version-0.2.2-005E9B)
 
 [下载安装包](https://github.com/JunyangLian/SourceLoom/releases/latest) · [产品需求](docs/PRD.md) · [项目知识空间](docs/PROJECTS.md) · [解析说明](docs/INGESTION.md) · [开发断点](docs/BREAKPOINT.md)
 
@@ -73,8 +73,9 @@
 
 - 同一份知识的多版本自动归并为家族，家族 ID 基于成员哈希，重建后引用不失效
 - 按**内容段落**去重而非按文件：重复段落合并展示并保留全部来源，各版本独有或修改过的段落仍在
-- **版本新旧可判断**：数字版本按数字段比较（`0.13 > 0.9 > 0.8`），`终稿 / 定稿` 高于 `修订版`，
-  `初稿` 最低；只有无标签时才退回修改时间
+- **版本新旧可判断**：`终稿 / 定稿`（带序号按序号，`终稿 10 > 终稿 9`）高于数字版本，
+  数字版本按数字段比较（`0.13 > 0.9 > 0.8`），再往下是 `修订`、`初稿`、`副本`；
+  `最新` 只是命名，不等于真的最后修改，压在终稿与数字版本之下
 - 问「最新版本 / 当前版本」时补齐各大家族的最新稿；点名旧版本（如「v0.2 的 BUSCO」）时
   即使词面召回被同名笔记挤占也会补回该版本，并标记 `is_latest_version=false`，不会把旧稿当成当前数据
 - 没有版本标签的家族只是重复副本：`is_latest_version` 返回 `null`（未知），不冒充“最新版本”
@@ -209,7 +210,7 @@ core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            scanner · watcher · ingest · extractors · ocr · indexer
                       projects · query · retrieval · families · rerank · answer · chat
                       external · mcp_server · inventory · maintenance · api
-  tests/              264 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 项目 / 外部接口 / 安全 / 基线）
+  tests/              266 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 项目 / 外部接口 / 安全 / 基线）
   benchmarks/         目录级扫描基准
 desktop/              Tauri v2 + React + TypeScript
   src/                项目（含外部接口）· 对话 · 数据 · 更新 四个模块
@@ -283,7 +284,7 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 264 passed（另需 pip install pytest httpx）
+cd core; python -m pytest -q          # 266 passed（另需 pip install pytest httpx）
 cd desktop; npm test                  # 17 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR

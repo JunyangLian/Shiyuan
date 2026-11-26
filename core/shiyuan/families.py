@@ -490,15 +490,27 @@ def _family_records(conn: sqlite3.Connection, family_id: str | None = None) -> l
 
 
 def _version_rank(label: str | None) -> tuple[int, ...]:
-    """版本新旧：数字版本 > 终稿/定稿 > 修订版 > 初稿；无标签时只按时间。"""
+    """版本新旧：带序号终稿 > 终稿 > 数字版本 > “最新” > 修订 > 初稿 > 副本。
+
+    文件名里的 `4.22` 这类日期标签本质上是“4 月 22 日”，但在只看到标签时
+    与语义版本（`0.13`）无法区分；因此把作者显式写出的终稿/定稿放在
+    数字标签之上，序号（终稿 10 > 终稿 9）单独比较。`最新` 只是命名，
+    可能比终稿更旧，压在终稿与数字版本之下。
+    """
     text = (label or "").strip().lower()
     if not text:
         return (0,)
+    numbered_final = re.fullmatch(r"(?:终稿|定稿|final)\s*[（(]?(\d+)[)）]?", text)
+    if numbered_final:
+        return (3, 2, int(numbered_final.group(1)))
+    if any(token in text for token in ("终稿", "定稿", "final")):
+        return (3, 1)
     numeric = re.fullmatch(r"v?(\d+(?:\.\d+)*)", text)
     if numeric:
         # 0.13 必须大于 0.9：按数字段比较，不能转成浮点数。
         return (2, *(int(part) for part in numeric.group(1).split(".")))
-    if any(token in text for token in ("终稿", "定稿", "final")):
+    if "最新" in text or "latest" in text:
+        # “最新”只是命名，不等于真的最后修改；压在终稿/数字版本之下，避免误判。
         return (1, 3)
     if any(token in text for token in ("修改", "修订", "revision", "revised")):
         return (1, 2)
@@ -552,9 +564,16 @@ def family_map(conn: sqlite3.Connection) -> dict[str, dict]:
     }
     records = _family_records(conn)
     latest = _latest_versions(records)
+    # 版本标签之外的第二个参照：最后修改的文件。没有标签的重复副本只能看这个。
+    newest: dict[str, dict] = {}
+    for record in records:
+        current = newest.get(record["family_id"])
+        if current is None or (record["mtime_ns"] or 0) > (current["mtime_ns"] or 0):
+            newest[record["family_id"]] = record
     mapping: dict[str, dict] = {}
     for record in records:
         info = latest.get(record["family_id"]) or {}
+        newest_record = newest.get(record["family_id"]) or {}
         label = (record["version_label"] or "").strip()
         latest_label = info.get("version_label", "")
         # 没有版本标签的家族只是重复副本，不存在“最新版本”这一说；
@@ -573,6 +592,8 @@ def family_map(conn: sqlite3.Connection) -> dict[str, dict]:
             "family_latest_asset_id": info.get("asset_id"),
             "family_latest_version_label": latest_label or None,
             "family_latest_mtime_ns": info.get("mtime_ns") or 0,
+            "family_newest_asset_id": newest_record.get("asset_id"),
+            "family_newest_mtime_ns": newest_record.get("mtime_ns") or 0,
         }
     return mapping
 
