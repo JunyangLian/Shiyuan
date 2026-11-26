@@ -564,6 +564,21 @@ def test_embed_failure_is_recorded_and_visible(conn, tmp_path, monkeypatch):
     assert embeddings.public_settings(conn)["last_error"] is None
 
 
+def test_successful_vector_query_clears_stale_error(conn, tmp_path, monkeypatch):
+    embeddings.update_settings(conn, {"provider": "ollama", "model": "fake-embed"})
+    monkeypatch.setattr(embeddings, "embed_texts",
+                        lambda settings, texts: _fake_vectors(texts))
+    _source(conn, tmp_path, {"记录.md": "样本量 42 例\n重复测量记录\n"})
+    embeddings.index_pending(conn)
+    embeddings._set_last_error(conn, "无法连接向量接口")
+    assert embeddings.public_settings(conn)["last_error"]
+
+    hits = embeddings.semantic_chunks(conn, "样本量", top_k=5)
+
+    assert hits
+    assert embeddings.public_settings(conn)["last_error"] is None
+
+
 def test_query_vector_cache_reuses_embedding(monkeypatch):
     calls = []
 

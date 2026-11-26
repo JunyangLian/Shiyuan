@@ -97,6 +97,11 @@ def _set_last_error(conn: sqlite3.Connection, message: str | None) -> None:
                 (ERROR_KEY, str(message)[:500]),
             )
         else:
+            # 成功路径每次都写会留下无意义的 WAL；只在确有旧错误时清除。
+            if not conn.execute(
+                "SELECT 1 FROM app_settings WHERE key = ?", (ERROR_KEY,)
+            ).fetchone():
+                return
             conn.execute("DELETE FROM app_settings WHERE key = ?", (ERROR_KEY,))
         conn.commit()
     except sqlite3.OperationalError:
@@ -836,6 +841,8 @@ def semantic_chunks(conn: sqlite3.Connection, text: str, *, source_id: str | Non
     except EmbeddingError as exc:
         _set_last_error(conn, str(exc))
         raise
+    # 查询成功说明接口已恢复，不能让旧的“无法连接”一直挂在设置页上。
+    _set_last_error(conn, None)
 
     # 两段式：先只取 chunk_id + 向量做相似度，最后只回表取前 top_k 条的正文与路径。
     sql = [

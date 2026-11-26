@@ -15,7 +15,7 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 260 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 261 passed | `cd core && python -m pytest -q` |
 | 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
 | 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
@@ -475,7 +475,7 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 - MCP：新增 `list_projects`、`get_project`、`search_assets`、`get_evidence`、
   `get_document_family`、`get_related_documents`、`compare_versions`、`get_source_status`；
   `project_id` 只允许 `external_allowed` 项目，`local_only` 对外部 Agent 不可见；MCP 保持只读。
-- 测试：后端 260（新增项目模块 12 项，覆盖复用、子目录、多项目、三种范围、排除、
+- 测试：后端 261（新增项目模块 12 项，覆盖复用、子目录、多项目、三种范围、排除、
   语义范围、路径泄漏、关联资料、迁移幂等、数据源删除、API 全链路；另含全局项目、
   令牌绑定与版本新旧）；前端 17。
 - 外部接口有用性（v3 补强）：
