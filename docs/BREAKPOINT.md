@@ -1,6 +1,6 @@
 # 开发断点文档
 
-更新：2026-11-22
+更新：2026-11-26
 
 ## 一、当前基准（已验证）
 
@@ -15,14 +15,14 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 175 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 242 passed | `cd core && python -m pytest -q` |
 | 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
 | 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
-| 前端单元测试 | 14 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
+| 前端单元测试 | 17 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `Shiyuan_0.1.3_x64-setup.exe`（约 180MiB，含多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），静默安装后 `/api/health` 无令牌 401、带令牌 200 |
+| 桌面端安装包 | 完成 | `Shiyuan_0.1.7_x64-setup.exe`（约 138MiB，onedir 核心随包分发，含多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），静默安装后 `/api/health` 无令牌 401、带令牌 200 |
 
 ## 二、已实现范围（M1）
 
@@ -118,11 +118,12 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 
 ## 三、当前状态与已知缺口
 
-1. ~~**Python core 需要手动启动**~~：已由 M5 解决。`core/sidecar.py` 经 PyInstaller 打成单文件
-   `shiyuan-core.exe`，Tauri 通过 `bundle.externalBin` 随安装包分发；release 启动时探测
-   `127.0.0.1:8737`，无监听才 spawn sidecar，`RunEvent::Exit` 时 `kill`。开发模式仍不托管。
-2. **单文件 sidecar 启动有解包延迟**：onefile 每次启动需解压到临时目录，首次 `/api/health`
-   约 10–15 秒才可用；前端令牌获取最多重试 30 秒，窗口初始短暂显示「未连接」后自动恢复。
+1. ~~**Python core 需要手动启动**~~：已解决。`core/shiyuan-core.spec` 产出 onedir 目录，
+   经 `tauri.conf.json` 的 `bundle.resources` 随安装包分发；release 启动时探测
+   `127.0.0.1:8737`，无监听才从资源目录 `binaries/shiyuan-core/shiyuan-core.exe` 拉起，
+   `RunEvent::Exit` 时 `kill`。开发模式仍不托管。
+2. ~~**单文件 sidecar 启动有解包延迟**~~：v0.1.7 改为 onedir 分发，核心启动与 MCP 握手约 1 秒，
+   onefile 版本不再使用。
 3. **强制结束桌面端会残留核心**：任务管理器结束进程不触发 `RunEvent::Exit`，sidecar 会继续
    监听 8737；下次启动会复用它（不重复拉起）。命名互斥量已避免同一端口出现两个 HTTP 核心，
    但用户仍无法从界面关闭该后台进程。
@@ -151,8 +152,8 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
     缺少外部工具时相应文件会显式失败（不静默跳过）。
 14. ~~**API Key 明文存储**~~：已用 Windows DPAPI 加密（`dpapi:v1:`），启动时自动迁移旧明文并
     `secure_delete` + `VACUUM`；同一 Windows 用户下的进程仍可调用 DPAPI，不能替代独立账户隔离。
-15. **对话仍是单轮检索**：会话与历史消息已持久化，但提问不会把上一轮消息作为上下文，
-    追问「那第二个文件呢」仍然无法解析指代。
+15. ~~**对话仍是单轮检索**~~：v0.1.7 起追问会带上上一轮问题与回答，支持「版本2 / 第二个 /
+    它 / 这个」并解析到具体文件；更早的对话与跨会话仍无记忆。
 16. **语义召回依赖外部服务**：向量由 OpenAI 兼容接口或本机 Ollama 生成，没有内置模型；
     未开启时行为与纯关键词一致。余弦比对是内存全量扫描，无 ANN 索引，块数上万后会变慢；
     自定义同义词需手动配置，跨语言提问仍偏弱。
@@ -168,8 +169,9 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 22. **向量补建占用扫描线程**：扫描结束后在同一线程里继续 `index_pending` 与 `index_pending_embeddings`，
     外部接口慢时会明显拉长"扫描中"时间；没有并发限速、失败重试与费用估算。
 23. **MCP 已合入核心 exe**：`shiyuan-core.exe --mcp` 提供 stdio，桌面端默认仍走 HTTP；
-    `--noconsole` 下依赖客户端用管道启动（本机已验证），不再需要单独 exe。
-    MCP 只读、无认证，只走本机 stdio，不应直接暴露为网络服务。
+    `--noconsole` 下依赖客户端用管道启动（本机已验证），不再需要单独 exe；onedir 下握手约 1 秒。
+    MCP 只读，要求外部连接令牌（`SHIYUAN_EXT_TOKEN`，非法令牌直接退出），只走本机 stdio，
+    不应直接暴露为网络服务。
 
 ### 数据源合并
 - `store.plan_source_add` 判断新目录与现有授权的关系：
@@ -275,12 +277,16 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 ### 打包与托管（M5）
 - `core/sidecar.py`：PyInstaller 入口。`--noconsole` 冻结后 `sys.stdout/stderr` 为 `None`，
   入口先把两者重定向到 `%LOCALAPPDATA%\ShiyuanData\core.log`，否则 uvicorn 日志配置直接崩溃。
-- 单文件构建命令（含 OCR 双引擎）：
+- 单文件构建命令（含 OCR 双引擎）：**v0.1.7 起已改用 onedir**——`python -m PyInstaller
+  shiyuan-core.spec --noconfirm` 生成 `dist/shiyuan-core/`，整体复制到
+  `desktop/src-tauri/binaries/shiyuan-core/`，由 `bundle.resources` 分发。下面这条 onefile
+  长命令仅作历史记录：
   `python -m PyInstaller --onefile --noconsole --name shiyuan-core --paths core --hidden-import shiyuan.api --hidden-import shiyuan.mcp_server --collect-submodules uvicorn --collect-submodules winsdk --collect-data rapidocr --hidden-import rapidocr.inference_engine.onnxruntime --hidden-import rapidocr.inference_engine.onnxruntime.main --hidden-import rapidocr.inference_engine.onnxruntime.provider_config --collect-binaries onnxruntime --collect-data onnxruntime --exclude-module onnx --exclude-module torch --exclude-module paddle --exclude-module openvino --exclude-module tensorrt --exclude-module jupyter_client --exclude-module ipykernel --exclude-module zmq --exclude-module PyQt5 --exclude-module matplotlib --exclude-module pandas --exclude-module tkinter --collect-all pypdfium2 core/sidecar.py`
   - **不要用 `--collect-all rapidocr`**：会连带 PyTorch 后端与 CUDA DLL，单文件膨胀到 2.7GB；
   - 不要收 jupyter/ipykernel/zmq：pyzmq 自带的旧版 `msvcp140/vcruntime140` 会导致
     `onnxruntime_pybind11_state` 初始化失败（0x8007045A）。
-  - 当前单文件约 185MB；安装包 180.2MiB（含多格式解析、PP-OCRv6 small、onnxruntime 与 MCP 模式）。
+  - 当前 onedir 目录约 390MB，NSIS 安装包 138MiB（含多格式解析、PP-OCRv6 small、
+    onnxruntime 与 MCP 模式）；onefile 版本约 185MB / 180.2MiB。
 - 产物复制为 `desktop/src-tauri/binaries/shiyuan-core-x86_64-pc-windows-gnu.exe`，
   `tauri.conf.json` 的 `bundle.externalBin` 引用之（该目录不入库）。
 - 安装版前端 API 基址固定为 `http://127.0.0.1:8737`；不要用相对 `/api`，否则 Tauri 资源服务器
@@ -301,7 +307,7 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 - 已合入 `core/sidecar.py`：`shiyuan-core.exe --mcp` 进入 stdio 模式，默认不带参数仍启动 HTTP 核心；
   `--noconsole` 冻结后若 `sys.stdin/stdout` 为 None，用 `GetStdHandle` + `open_osfhandle` 兜底管道；
   冻结模式 `--print-config` 输出 `command=<exe>`、`args=["--mcp"]`。
-  onefile 首次启动需解包，本机实测约 14 秒；MCP 客户端启动超时应设为 ≥30 秒。
+  onefile 首次启动需解包（约 14 秒）；v0.1.7 的 onedir 版本握手约 1 秒。
 - stdout 只输出协议消息，调试日志走 `SHIYUAN_MCP_DEBUG=1` 的 stderr。
 - 测试 `core/tests/test_mcp.py`：握手、工具、资源、分块选择、stdio 帧、源码/冻结配置（12 项）。
 
@@ -425,6 +431,28 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 - 验证：`npm test` 14 passed、`npm run build` 通过；Edge 无头截图检查对话 / 数据 /
   外部调用 / 更新四个页面。
 
+## 三点十、本轮（v0.1.7）追问上下文、大文本与启动优化
+
+- 追问上下文：`chat.recent_answer` 读取上一轮助手回答；`answer._resolve_reference` 支持
+  「版本二（file.docx）」与「1. `path`」两种列举形式，以及「版本2 / 第二个 / v2」指代；
+  `_selected_version_answer` 直接返回路径、更新时间、正文字数、片段数与开头预览。
+  追问提示词加入上一轮回答（明确标注只用于理解指代、不作为证据），
+  实测「Table S1 比较了什么」→「它有多少行」可落到 95,992 行。
+- 大文本：`extractors.MAX_TEXT_SAMPLE_BYTES = 8MB`；纯文本超过 64MB 改为头部采样，
+  正文末尾标注「已截断」。真实库中 86MB 的 BSA 结果表与 168MB 的 SNP 表恢复可检索，
+  搜索「黄姑鱼 BSA 结果表」时表格文件排到第 1、2 位。
+- 数据源点名：`answer._named_source` 只认「X 里/中/内/数据源」或「X 有哪些文件」，
+  「A 论文有没有提到 B」不限定范围，避免把实验记录里的同名文档挡在外面。
+- 解析状态：`indexer._classify_parse` 新增 `metadata_only`（仅登记）；
+  压缩包、html、log 等按盘点策略只登记的类型不再计入「待解析」，
+  前端解析结果页新增「仅登记」筛选、汇总卡与说明文案。
+- 性能：`embeddings.warm_cache_async` 预热向量模型与 int8 矩阵；新增查询向量缓存
+  （10 分钟 / 128 条）；重排与回答请求带 `reasoning_effort=low`。
+- 分发：PyInstaller 改 onedir，Tauri 用 `bundle.resources` 分发并由 Rust 直接拉起，
+  安装包 180MB → 138MB，MCP 握手 18s → 约 1s。
+- 测试：后端 242、前端 17；问答评测主集 27/28、第三集 10/10（唯一失分为 Table S1 的
+  `Contig` 细节，模型偶发不提）。
+
 ## 四、禁止操作
 
 - 不要在扫描中删除或重命名用户的原始文件；本项目对用户文件只读。
@@ -437,6 +465,6 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 1. 检索可靠性：补充 100–200 道真实用户问句与目标文件标注，再依据基线决定 ANN、Reranker
    或本地小模型；当前合成基线已满分，不能据此判断真实语料。
 2. OCR 效果提升：手写识别、表格结构与版面还原、真实扫描件基准；按耗时/预算调度引擎。
-3. 对话增强：多轮上下文、引用跳转与对话导出。
+3. 对话增强：更早轮次的记忆、引用跳转与对话导出。
 4. 预算与任务：按耗时/字符数计量、任务取消与优先级、低质量文本的二次解析器。
-5. 打包优化：按需下载 OCR 组件、`--onedir` 资源分发、压缩启动延迟与安装体积。
+5. 打包优化：按需下载 OCR 组件、安装体积与冷启动进一步压缩。

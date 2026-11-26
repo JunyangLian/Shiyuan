@@ -35,7 +35,10 @@
 - 授权本地目录后自动扫描，记录文件名、路径、大小、修改时间与稳定文件 ID，支持增量对账
 - 实时监听（1.5s 去抖 + 10s 封顶），同盘移动/改名沿用同一 asset_id；周期对账兜住休眠与事件丢失
 - 解析 TXT/MD/代码、DOCX、PPTX、PDF 文本层、XLSX（值 + 公式）、旧版 Office（经 LibreOffice）、
-  ZIP/7Z/RAR（安全解压递归索引）、EML/MSG、DXF，音视频只取元数据
+  EML/MSG、DXF，音视频只取元数据；超过 64MB 的纯文本按前 8MB 头部采样，不再整文件跳过
+- 压缩包（ZIP/7Z/RAR）默认「仅登记」：只记录文件名、路径与大小，不解压；确有需要时可在盘点策略里
+  改为标准解析（临时目录解压，限制条目数、单文件与总量）
+- 解析结果区分「待解析 / 仅登记 / 暂不支持」，策略性跳过不会显示成处理积压
 - OCR 双引擎：随包 PP-OCRv6 small（扫描 PDF，离线）与 Windows 本机 OCR（图片、混合版式 PDF、PPTX 位图），
   结果带页码与行坐标，无文本层的扫描件会被显式标记而不是当成"内容为空"
 
@@ -49,8 +52,9 @@
 - 统计问句：「单据金额合计多少」这类需要跨行汇总的问题，明确说明不做求和，并列出命中的表格与工作表，
   不编造数字
 - 查重 / 比对报告在普通问题里自动后置，问「重复率多少」时再正常召回
-- 多轮追问：同一会话里「那第三章呢」「它的环境变量怎么配」会带上上一轮问题检索，
-  上一轮只涉及一个数据源时自动收窄
+- 多轮追问：同一会话里会带上上一轮问题与上一轮回答；「版本2」「第二个」「它 / 这个 / 上述」
+  能解析成具体文件，选择版本时直接给出路径、更新时间、正文规模与开头预览
+- 问题里点名数据源（「实验记录里…」）时，检索自动限定在该数据源内，避免跨库抢答
 - 检索规划：按问题区分「精确查找 / 知识解释 / 综合探索 / 历史追溯」，决定证据预算（4 / 6 / 10 / 6 条）、
   同家族配额与最小覆盖面；回答下方会显示候选数、采用数、覆盖家族数与「证据缺口」
 - 动态证据选择：先跨家族取样保证覆盖面，再补同家族细节；与已选片段高度重合的内容直接跳过
@@ -120,7 +124,7 @@ core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            scanner · watcher · ingest · extractors · ocr · indexer
                       query · retrieval · families · rerank · answer · chat
                       external · mcp_server · inventory · maintenance · api
-  tests/              184 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 安全 / 基线）
+  tests/              242 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 安全 / 基线）
   benchmarks/         目录级扫描基准
 desktop/              Tauri v2 + React + TypeScript
   src/                数据 · 对话 · 外部调用 · 更新 四个模块
@@ -169,21 +173,22 @@ python -m shiyuan.mcp_server --print-config  # 打印客户端配置
 | resource | `shiyuan://stats` | 统计 JSON |
 
 推荐顺序：先 `search_knowledge`，再用返回的 `location_id` 调 `get_document_text`。
-MCP 不触发扫描，新文件仍需先在桌面端完成索引。安装版无需单独 exe：
+MCP 不触发扫描，新文件仍需先在桌面端完成索引。安装版核心以 onedir 随包分发，
+路径在安装目录的 `binaries\shiyuan-core\` 下：
 
 ```json
 {
   "mcpServers": {
     "shiyuan": {
-      "command": "C:\\Users\\<你>\\AppData\\Local\\Shiyuan\\shiyuan-core.exe",
+      "command": "C:\\Users\\<你>\\AppData\\Local\\Shiyuan\\binaries\\shiyuan-core\\shiyuan-core.exe",
       "args": ["--mcp"]
     }
   }
 }
 ```
 
-> onefile 首次启动需解包核心（约 10–15 秒），客户端启动超时请设为 30 秒以上。
-> 也可以直接在桌面端「外部调用」页选择预设、生成配置并测试连通性。
+> MCP 进程直接加载目录内依赖，握手约 1 秒；桌面端「外部调用」页会按实际安装位置生成配置，
+> 也可以在那里直接测试连通性。
 
 ## 打包安装包
 
@@ -191,35 +196,25 @@ MCP 不触发扫描，新文件仍需先在桌面端完成索引。安装版无�
 <summary>PyInstaller sidecar + Tauri NSIS（点击展开）</summary>
 
 ```powershell
-# 1. 生成核心可执行文件（约 185MB，需 pip install pyinstaller）
+# 1. 生成核心目录（onedir，约 390MB；需 pip install pyinstaller）
 cd core
 $root = Split-Path (Get-Location) -Parent
 $env:TMP = Join-Path $root ".tmp\tmp"
 $env:TEMP = $env:TMP
 $env:PYINSTALLER_CONFIG_DIR = Join-Path $root ".tmp\pyinstaller"
 New-Item -ItemType Directory -Path $env:TMP, $env:PYINSTALLER_CONFIG_DIR -Force | Out-Null
-python -m PyInstaller --onefile --noconsole --name shiyuan-core --paths . `
-  --hidden-import shiyuan.api --hidden-import shiyuan.mcp_server `
-  --collect-submodules uvicorn --collect-submodules winsdk `
-  --collect-data rapidocr `
-  --hidden-import rapidocr.inference_engine.onnxruntime `
-  --hidden-import rapidocr.inference_engine.onnxruntime.main `
-  --hidden-import rapidocr.inference_engine.onnxruntime.provider_config `
-  --collect-binaries onnxruntime --collect-data onnxruntime `
-  --exclude-module onnx --exclude-module torch --exclude-module paddle `
-  --exclude-module openvino --exclude-module tensorrt --exclude-module jupyter_client `
-  --exclude-module ipykernel --exclude-module zmq --exclude-module PyQt5 `
-  --exclude-module matplotlib --exclude-module pandas --exclude-module tkinter `
-  --collect-all pypdfium2 sidecar.py
-Copy-Item .\dist\shiyuan-core.exe ..\desktop\src-tauri\binaries\shiyuan-core-x86_64-pc-windows-gnu.exe -Force
+python -m PyInstaller shiyuan-core.spec --noconfirm
+Copy-Item .\dist\shiyuan-core ..\desktop\src-tauri\binaries\shiyuan-core -Recurse -Force
 
 # 2. 构建 NSIS 安装包
-$env:CARGO_TARGET_DIR="D:\cargo-target\shiyuan"
+$env:CARGO_TARGET_DIR="D:\cargo-target"
 cd ..\desktop
 npm run tauri build
 ```
 
-产物：`D:\cargo-target\shiyuan\release\bundle\nsis\Shiyuan_<版本>_x64-setup.exe`。
+产物：`D:\cargo-target\release\bundle\nsis\Shiyuan_<版本>_x64-setup.exe`（约 138MB）。
+核心以 onedir 目录随安装包分发（`tauri.conf.json` 的 `bundle.resources`），Rust 外壳从资源目录
+拉起 `binaries\shiyuan-core\shiyuan-core.exe`，启动不再解包，MCP 握手约 1 秒。
 `desktop/src-tauri/binaries/` 是构建产物，不入库；新克隆仓库需先执行第 1 步。
 
 **Windows + MinGW 注意**：仓库路径含中文时，`ld.exe` 会按 GBK 解析 UTF-8 路径并在链接阶段报
@@ -231,8 +226,8 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 184 passed（另需 pip install pytest httpx）
-cd desktop; npm test                  # 14 passed（Vitest + jsdom）
+cd core; python -m pytest -q          # 242 passed（另需 pip install pytest httpx）
+cd desktop; npm test                  # 17 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
 ```
@@ -245,15 +240,17 @@ cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
 - **OCR 只保留行坐标**，不还原表格结构与版面，没有手写专项
 - **不内置本地大模型**：Ollama 需自行安装；语义检索依赖外部 Embedding 服务，未使用 ANN，
   填了不支持 `/embeddings` 的模型时该通道会被静默跳过
-- **会话记忆只到上一轮**：不保留完整对话状态，跨会话无记忆
+- **会话记忆只覆盖上一轮**：能解析「版本N / 第二个 / 它」，但不保留更早的对话状态，跨会话无记忆
 - **跨盘移动**识别为「新增 + 失联」，不做自动合并
 - **网络盘 / SMB** 的监听可靠性未实测，主要依赖周期对账
 - **新建 / 删除 / 改名文件夹**会触发整源重扫，大目录会明显变慢
 - **短词检索**（<3 字符）走 LIKE 扫描，语料很大时比 FTS 慢
 - **引用只校验编号**：无法证明模型每句话都忠于证据，仍需点开来源核对
 - **不做表格汇总**：合计 / 平均 / 总额这类问题只定位表格并说明，不会真的计算
+- **压缩包默认不解压**：ZIP/7Z/RAR 只登记文件名与路径；需要内容时在盘点策略里改为标准解析
+- **超限文件有取舍**：纯文本超过 64MB 只采样前 8MB 并标注截断；PDF/PPTX 超过 64MB 仍跳过
 - **重排依赖外部模型**：只有配置生成模型并允许云端时，「知识解释 / 综合探索」才重排，
-  单次约 5–15 秒；精确查找、历史追溯与本地摘录模式仍靠关键词与路径打分。
+  单次约 2–5 秒；精确查找、历史追溯与本地摘录模式仍靠关键词与路径打分。
   推理模型会消耗较多思考 token，宽泛问题在语料缺少对应主题时仍会如实说明覆盖不足
 
 ## 文档
