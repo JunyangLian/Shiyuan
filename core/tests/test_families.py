@@ -397,6 +397,70 @@ def test_graphical_abstract_stays_out_of_manuscript_family(conn, tmp_path):
     assert not (left and right and left["family_id"] == right["family_id"])
 
 
+def test_date_labels_resolved_in_family_context():
+    types = families._resolve_label_types(["4.22", "4.21", "终稿 10"])
+    assert types["4.22"] == "date"
+    assert types["4.21"] == "date"
+    assert types["终稿 10"] == "final_seq"
+
+    types = families._resolve_label_types(["0.13", "0.9"])
+    assert types == {"0.13": "numeric", "0.9": "numeric"}
+
+
+def test_latest_version_reports_basis_and_confidence():
+    records = [
+        {"family_id": "f", "asset_id": "a", "version_label": "4.22",
+         "mtime_ns": 200, "ext": "doc", "path": "a.doc"},
+        {"family_id": "f", "asset_id": "b", "version_label": "终稿 10",
+         "mtime_ns": 100, "ext": "doc", "path": "b.doc"},
+    ]
+    info = families._latest_versions(records)["f"]
+    assert info["asset_id"] == "b"
+    assert info["version_type"] == "final_seq"
+    assert info["basis"] == "version_label"
+    assert info["confidence"] == "high"
+
+    unlabeled = [
+        {"family_id": "g", "asset_id": "a", "version_label": "",
+         "mtime_ns": 10, "ext": "doc", "path": "a.doc"},
+        {"family_id": "g", "asset_id": "b", "version_label": "",
+         "mtime_ns": 20, "ext": "doc", "path": "b.doc"},
+    ]
+    info = families._latest_versions(unlabeled)["g"]
+    assert info["asset_id"] == "b"
+    assert info["basis"] == "modified_time"
+    assert info["confidence"] == "low"
+
+
+def test_family_id_stable_when_new_version_added(conn, tmp_path):
+    root = tmp_path / "稳定族"
+    root.mkdir()
+    for day in ("2024.01.01", "2024.02.02"):
+        (root / f"城市创新研究_{day}.md").write_text(
+            f"城市创新研究，样本量 42。\n版本日期 {day}\n", encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    families.rebuild(conn)
+    first = conn.execute("SELECT family_id FROM document_families").fetchone()["family_id"]
+
+    (root / "城市创新研究_2024.03.03.md").write_text(
+        "城市创新研究，样本量 48。\n版本日期 2024.03.03\n", encoding="utf-8")
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    families.rebuild(conn)
+    second = conn.execute("SELECT family_id FROM document_families").fetchone()["family_id"]
+    assert first == second
+
+
+def test_audit_reports_no_mixed_role_families(conn, tmp_path):
+    _seed_versions(conn, tmp_path)
+    families.rebuild(conn)
+    report = families.audit(conn)
+    assert report["mixed_roles"] == []
+    assert report["families"] >= 1
+
+
 def test_version_rank_prefers_final_and_orders_numbers():
     assert families._version_rank("终稿 10") > families._version_rank("终稿 9")
     assert families._version_rank("终稿 10") > families._version_rank("4.22")

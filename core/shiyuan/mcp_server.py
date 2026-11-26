@@ -223,6 +223,9 @@ class MCPServer:
                 "is_latest_version is null when the file has no version label (plain "
                 "duplicates), so do not describe such files as the latest version; "
                 "for families use newest_asset_id / newest_mtime when labels are absent. "
+                "Family items also carry role, latest_version_type, latest_basis and "
+                "latest_confidence: when confidence is not high, say which basis "
+                "(version label or modified time) the answer uses. "
                 "Families are rebuilt after scans: list_document_families returns built_at, "
                 "so treat version answers as a snapshot. "
                 "Items with weak=true are below the evidence threshold: mention them only "
@@ -475,10 +478,13 @@ class MCPServer:
                 "description": (
                     "List multi-version document families in the shared project, with "
                     "the latest version first. Use this to answer 'which version is "
-                    "current' before reading a specific document. Items carry "
-                    "has_versions / latest_version_label: when has_versions is false the "
-                    "family is a duplicate set with no version labels, so use newest_* "
-                    "(last modified member) and never call it the latest version. "
+                    "current' before reading a specific document. Items carry role "
+                    "(manuscript / graphical_abstract / cover_letter / highlights / "
+                    "supplementary / response), has_versions and latest_version_label. "
+                    "latest_basis says whether the choice came from the version label or "
+                    "the modified time; latest_confidence is high / medium / low. "
+                    "When has_versions is false the family is a duplicate set, so use "
+                    "newest_* and never call it the latest version. "
                     "built_at is the family snapshot time."
                 ),
                 "inputSchema": {
@@ -993,13 +999,20 @@ class MCPServer:
         newest = next(
             (member for member in members if member["asset_id"] == newest_id), None)
         newest_ns = info.get("family_newest_mtime_ns") or 0
+        has_versions = any(
+            (member["version_label"] or "").strip() for member in members)
         return {
             "asset_id": asset_id,
             "family_id": info["family_id"],
             "title": info.get("family_title"),
+            "role": families._doc_role(members[0]["name"]) if members else None,
             "size": len(members),
+            "has_versions": has_versions,
             "latest_asset_id": info.get("family_latest_asset_id"),
             "latest_version_label": info.get("family_latest_version_label"),
+            "latest_version_type": info.get("family_latest_version_type"),
+            "latest_basis": info.get("family_latest_basis"),
+            "latest_confidence": info.get("family_latest_confidence"),
             "latest_mtime": (
                 datetime.fromtimestamp(latest_ns / 1e9).astimezone()
                 .isoformat(timespec="seconds") if latest_ns else None
@@ -1171,8 +1184,12 @@ class MCPServer:
                 "title": title,
                 "size": len(members),
                 "has_versions": has_versions,
+                "role": families._doc_role(members[0]["name"]) if members else None,
                 "latest_asset_id": latest["asset_id"],
                 "latest_version_label": latest["version_label"] or None,
+                "latest_version_type": family_info.get("family_latest_version_type"),
+                "latest_basis": family_info.get("family_latest_basis"),
+                "latest_confidence": family_info.get("family_latest_confidence"),
                 "latest_mtime": (
                     datetime.fromtimestamp(latest_ns / 1e9).astimezone()
                     .isoformat(timespec="seconds") if latest_ns else None

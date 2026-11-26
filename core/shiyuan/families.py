@@ -194,6 +194,26 @@ def _merge_roles_compatible(first: dict, second: dict) -> bool:
     return left not in _AUX_ROLES and right not in _AUX_ROLES
 
 
+def _family_key(members: list[dict], role: str) -> str:
+    """稳定族键：角色 + 最常见的规范化文件名。
+
+    以“这族是什么”为锚，而不是成员列表哈希；新增/删除一个版本不会让
+    family_id 变化，外部 Agent 可以在多次重建之间继续引用同一个族。
+    """
+    keys = Counter(
+        asset["key"] for asset in members
+        if len(asset["key"]) >= 2 and asset["key"] not in _GENERIC_KEYS
+    )
+    if keys:
+        anchor = sorted(keys.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    else:
+        titles = Counter(display_name(asset["name"]) for asset in members)
+        anchor = sorted(titles.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    if not anchor:
+        anchor = "|".join(sorted(asset["asset_id"] for asset in members))
+    return f"{role}|{anchor}"
+
+
 def _shingle_set(text: str, size: int = 8) -> set[int]:
     compact = re.sub(r"\s+", "", (text or "").lower())
     if len(compact) <= size:
@@ -374,62 +394,82 @@ def rebuild(conn: sqlite3.Connection) -> dict:
     family_count = 0
     member_count = 0
     family_ids: list[str] = []
-    for members in clusters.values():
-        if len(members) < 2 or len(members) > MAX_FAMILY_SIZE:
-            continue
-        # 家族名只是展示标签，不表示哪个版本更好。
-        title = Counter(display_name(asset["name"]) for asset in members).most_common(1)[0][0]
-        has_marker = any(
-            version_label(asset["name"]) or _VERSION_TOKEN_RE.search(asset["name"])
-            for asset in members
-        )
-        family_id = "fam_" + hashlib.sha1(
-            "|".join(sorted(asset["asset_id"] for asset in members)).encode("utf-8")
-        ).hexdigest()[:12]
-        conn.execute(
-            "INSERT INTO document_families"
-            " (family_id, title, recommended_asset_id, confidence, rules_version,"
-            " created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, ?)",
-            (
-                family_id,
-                title,
-                "high" if has_marker else "medium",
-                RULES_VERSION,
-                now,
-                now,
-            ),
-        )
-        for asset in members:
-            others = [other for other in members if other["asset_id"] != asset["asset_id"]]
-            same_hash = any(other["hash"] == asset["hash"] for other in others)
-            same_name = bool(asset["key"]) and any(
-                other["key"] == asset["key"] for other in others
+    used_ids: set[str] = set()
+    for cluster in clusters.values():
+        # 即使上游并查集出现了跨角色的弱连接，这里也按角色再拆一次，
+        # 保证“正文族里不会出现图形摘要”是结构性约束而不是阈值运气。
+        by_role: dict[str, list[dict]] = {}
+        for asset in cluster:
+            role = _doc_role(asset["name"]) or "unknown"
+            by_role.setdefault(role, []).append(asset)
+        for role, members in sorted(by_role.items()):
+            if len(members) < 2 or len(members) > MAX_FAMILY_SIZE:
+                continue
+            # 家族名只是展示标签，不表示哪个版本更好。
+            title = Counter(
+                display_name(asset["name"]) for asset in members).most_common(1)[0][0]
+            has_marker = any(
+                version_label(asset["name"]) or _VERSION_TOKEN_RE.search(asset["name"])
+                for asset in members
             )
-            if same_hash:
-                reason = "same_hash"
-                similarity = 1.0
-            elif same_name:
-                reason = "same_name"
-                similarity = round(max(_similarity(asset, other) for other in others), 3)
-            else:
-                reason = "similar_text"
-                similarity = round(max(_similarity(asset, other) for other in others), 3)
+            family_key = _family_key(members, role)
+            family_id = "fam_" + hashlib.sha1(
+                family_key.encode("utf-8")).hexdigest()[:12]
+            if family_id in used_ids:
+                # 同名同角色但确实是两个簇：用成员哈希做确定性后缀。
+                family_id = "fam_" + hashlib.sha1(
+                    (family_key + "|" + "|".join(
+                        sorted(asset["asset_id"] for asset in members)
+                    )).encode("utf-8")
+                ).hexdigest()[:12]
+            used_ids.add(family_id)
             conn.execute(
-                "INSERT INTO document_family_members"
-                " (family_id, asset_id, version_label, similarity, is_recommended, reason)"
-                " VALUES (?, ?, ?, ?, 0, ?)",
+                "INSERT INTO document_families"
+                " (family_id, title, recommended_asset_id, confidence, rules_version,"
+                " created_at, updated_at) VALUES (?, ?, NULL, ?, ?, ?, ?)",
                 (
                     family_id,
-                    asset["asset_id"],
-                    asset["version_label"],
-                    similarity,
-                    reason,
+                    title,
+                    "high" if has_marker else "medium",
+                    RULES_VERSION,
+                    now,
+                    now,
                 ),
             )
-            member_count += 1
-        _build_content_groups(conn, family_id, members, now)
-        family_ids.append(family_id)
-        family_count += 1
+            for asset in members:
+                others = [other for other in members
+                          if other["asset_id"] != asset["asset_id"]]
+                same_hash = any(other["hash"] == asset["hash"] for other in others)
+                same_name = bool(asset["key"]) and any(
+                    other["key"] == asset["key"] for other in others
+                )
+                if same_hash:
+                    reason = "same_hash"
+                    similarity = 1.0
+                elif same_name:
+                    reason = "same_name"
+                    similarity = round(
+                        max(_similarity(asset, other) for other in others), 3)
+                else:
+                    reason = "similar_text"
+                    similarity = round(
+                        max(_similarity(asset, other) for other in others), 3)
+                conn.execute(
+                    "INSERT INTO document_family_members"
+                    " (family_id, asset_id, version_label, similarity, is_recommended, reason)"
+                    " VALUES (?, ?, ?, ?, 0, ?)",
+                    (
+                        family_id,
+                        asset["asset_id"],
+                        asset["version_label"],
+                        similarity,
+                        reason,
+                    ),
+                )
+                member_count += 1
+            _build_content_groups(conn, family_id, members, now)
+            family_ids.append(family_id)
+            family_count += 1
 
     conn.execute(
         "INSERT INTO app_settings (key, value) VALUES (?, ?)"
@@ -558,59 +598,125 @@ def _family_records(conn: sqlite3.Connection, family_id: str | None = None) -> l
     return [dict(row) for row in conn.execute(sql, params)]
 
 
-def _version_rank(label: str | None) -> tuple[int, ...]:
-    """版本新旧：带序号终稿 > 终稿 > 数字版本 > “最新” > 修订 > 初稿 > 副本。
+_DATE_LABEL_RE = re.compile(r"(\d{1,2})\.(\d{1,2})")
 
-    文件名里的 `4.22` 这类日期标签本质上是“4 月 22 日”，但在只看到标签时
-    与语义版本（`0.13`）无法区分；因此把作者显式写出的终稿/定稿放在
-    数字标签之上，序号（终稿 10 > 终稿 9）单独比较。`最新` 只是命名，
-    可能比终稿更旧，压在终稿与数字版本之下。
-    """
+
+def _label_type(label: str | None) -> str:
+    """把文件名里的版本标记归到有限的几种类型，后续只在这一处扩展新命名习惯。"""
     text = (label or "").strip().lower()
     if not text:
-        return (0,)
-    numbered_final = re.fullmatch(r"(?:终稿|定稿|final)\s*[（(]?(\d+)[)）]?", text)
-    if numbered_final:
-        return (3, 2, int(numbered_final.group(1)))
+        return "none"
+    if re.fullmatch(r"(?:终稿|定稿|final)\s*[（(]?(\d+)[)）]?", text):
+        return "final_seq"
     if any(token in text for token in ("终稿", "定稿", "final")):
-        return (3, 1)
-    numeric = re.fullmatch(r"v?(\d+(?:\.\d+)*)", text)
-    if numeric:
-        # 0.13 必须大于 0.9：按数字段比较，不能转成浮点数。
-        return (2, *(int(part) for part in numeric.group(1).split(".")))
+        return "final"
+    if re.fullmatch(r"v?(\d+(?:\.\d+)*)", text):
+        return "numeric"
     if "最新" in text or "latest" in text:
-        # “最新”只是命名，不等于真的最后修改；压在终稿/数字版本之下，避免误判。
-        return (1, 3)
+        return "latest"
     if any(token in text for token in ("修改", "修订", "revision", "revised")):
-        return (1, 2)
+        return "revision"
     if any(token in text for token in ("初稿", "draft")):
+        return "draft"
+    return "copy"
+
+
+def _looks_like_date(label: str | None) -> bool:
+    match = _DATE_LABEL_RE.fullmatch((label or "").strip())
+    if not match:
+        return False
+    month, day = int(match.group(1)), int(match.group(2))
+    return 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _resolve_label_types(labels: list[str]) -> dict[str, str]:
+    """按家族上下文解释标签：同一族出现多个“月.日”或终稿时，两位小数是日期。
+
+    `4.22` 单看可能是版本号，也可能是 4 月 22 日；在《连峻洋毕业论文》这种
+    同时存在 `终稿 10` 的家族里，日期解释才是对的。`0.13` 这类 0 开头的
+    编号仍按语义版本处理。
+    """
+    types = {label: _label_type(label) for label in labels}
+    numeric = [label for label, kind in types.items() if kind == "numeric"]
+    date_like = {label for label in numeric if _looks_like_date(label)}
+    semantic = {label for label in numeric if label not in date_like}
+    has_final = any(kind in {"final", "final_seq"} for kind in types.values())
+    if date_like and (len(date_like) >= 2 or has_final or not semantic):
+        for label in date_like:
+            types[label] = "date"
+    return types
+
+
+def _rank_of(label: str | None, label_type: str) -> tuple[int, ...]:
+    text = (label or "").strip().lower()
+    if label_type == "final_seq":
+        match = re.search(r"(\d+)", text)
+        return (5, int(match.group(1)) if match else 0)
+    if label_type == "final":
+        return (4,)
+    if label_type == "numeric":
+        match = re.fullmatch(r"v?(\d+(?:\.\d+)*)", text)
+        if match:
+            return (3, *(int(part) for part in match.group(1).split(".")))
+        return (3,)
+    if label_type == "date":
+        match = _DATE_LABEL_RE.fullmatch(text)
+        if match:
+            return (2, int(match.group(1)), int(match.group(2)))
+        return (2,)
+    if label_type == "latest":
+        return (1, 3)
+    if label_type == "revision":
+        return (1, 2)
+    if label_type == "draft":
         return (1, 1)
-    return (1, 0)
+    if label_type == "copy":
+        return (1, 0)
+    return (0,)
+
+
+def _version_rank(label: str | None) -> tuple[int, ...]:
+    """无家族上下文时的排序；日期形态按数字版本比较，家族内会再识别为日期。"""
+    return _rank_of(label, _label_type(label))
 
 
 def _latest_versions(records: list[dict]) -> dict[str, dict]:
-    """找出每个家族的最新版本；同一版本优先选可读文本格式。"""
-    latest: dict[str, dict] = {}
+    """找出每个家族的最新版本，并给出判据与置信度。"""
+    grouped: dict[str, list[dict]] = {}
     for record in records:
-        current = latest.get(record["family_id"])
-        key = (_version_rank(record["version_label"]), record["mtime_ns"] or 0)
-        current_key = (
-            (_version_rank(current["version_label"]), current["mtime_ns"] or 0)
-            if current is not None else None
-        )
-        if current_key is None or key > current_key:
-            latest[record["family_id"]] = record
+        grouped.setdefault(record["family_id"], []).append(record)
     resolved: dict[str, dict] = {}
-    for family_id, record in latest.items():
-        label = (record["version_label"] or "").strip()
-        if label:
-            candidates = [
-                item for item in records
-                if item["family_id"] == family_id
-                and (item["version_label"] or "").strip() == label
-            ]
+    for family_id, items in grouped.items():
+        labels = [(item["version_label"] or "").strip() for item in items]
+        types = _resolve_label_types(labels)
+
+        def rank(record: dict) -> tuple[int, ...]:
+            label = (record["version_label"] or "").strip()
+            return _rank_of(label, types.get(label, "none"))
+
+        best = max(items, key=lambda item: (rank(item), item["mtime_ns"] or 0))
+        label = (best["version_label"] or "").strip()
+        label_type = types.get(label, "none")
+        top_rank = rank(best)
+        top_labels = {
+            (item["version_label"] or "").strip()
+            for item in items if rank(item) == top_rank
+        }
+        if not label:
+            basis, confidence = "modified_time", "low"
+        elif len(top_labels) > 1:
+            basis, confidence = "version_label", "medium"
+        elif label_type in {"final_seq", "final", "numeric", "date"}:
+            basis, confidence = "version_label", "high"
         else:
-            candidates = [record]
+            basis, confidence = "version_label", "medium"
+        if label_type == "date" and any(kind == "numeric" for kind in types.values()):
+            # 日期与语义版本混用：标签本身不足以判断，置信度降级。
+            confidence = "low"
+        candidates = [
+            item for item in items
+            if (item["version_label"] or "").strip() == label
+        ] if label else [best]
         preferred = sorted(candidates, key=lambda item: (
             0 if (item["ext"] or "").lower() in _TEXT_EXTS else 1,
             0 if item["path"] else 1,
@@ -619,7 +725,10 @@ def _latest_versions(records: list[dict]) -> dict[str, dict]:
         resolved[family_id] = {
             "asset_id": preferred["asset_id"],
             "version_label": label,
-            "mtime_ns": record["mtime_ns"] or 0,
+            "version_type": label_type,
+            "mtime_ns": best["mtime_ns"] or 0,
+            "basis": basis,
+            "confidence": confidence,
         }
     return resolved
 
@@ -660,6 +769,9 @@ def family_map(conn: sqlite3.Connection) -> dict[str, dict]:
             "is_latest_version": is_latest,
             "family_latest_asset_id": info.get("asset_id"),
             "family_latest_version_label": latest_label or None,
+            "family_latest_version_type": info.get("version_type"),
+            "family_latest_basis": info.get("basis"),
+            "family_latest_confidence": info.get("confidence"),
             "family_latest_mtime_ns": info.get("mtime_ns") or 0,
             "family_newest_asset_id": newest_record.get("asset_id"),
             "family_newest_mtime_ns": newest_record.get("mtime_ns") or 0,
@@ -671,6 +783,8 @@ def family_members(conn: sqlite3.Connection, family_id: str) -> list[dict]:
     records = _family_records(conn, family_id)
     latest = _latest_versions(records).get(family_id) or {}
     latest_label = latest.get("version_label") or ""
+    labels = [(record["version_label"] or "").strip() for record in records]
+    types = _resolve_label_types(labels)
     groups: dict[str, list[dict]] = {}
     for record in records:
         label = (record["version_label"] or "").strip()
@@ -680,7 +794,8 @@ def family_members(conn: sqlite3.Connection, family_id: str) -> list[dict]:
     for _, group in sorted(
             groups.items(),
             key=lambda item: (
-                _version_rank(item[1][0]["version_label"]),
+                _rank_of(item[1][0]["version_label"],
+                         types.get((item[1][0]["version_label"] or "").strip(), "none")),
                 max((record["mtime_ns"] or 0) for record in item[1]),
             ),
             reverse=True):
@@ -707,6 +822,51 @@ def family_members(conn: sqlite3.Connection, family_id: str) -> list[dict]:
                 ),
             })
     return members
+
+
+def audit(conn: sqlite3.Connection) -> dict:
+    """家族质量审计：给维护与回归测试用的通用体检，不依赖具体文件名。"""
+    records = _family_records(conn)
+    snapshot = conn.execute(
+        "SELECT value FROM app_settings WHERE key = 'document_families'").fetchone()
+    meta: dict = {}
+    if snapshot:
+        try:
+            meta = json.loads(snapshot["value"])
+        except ValueError:
+            meta = {}
+    grouped: dict[str, list[dict]] = {}
+    for record in records:
+        grouped.setdefault(record["family_id"], []).append(record)
+    mixed_roles = []
+    unlabeled = 0
+    for family_id, items in grouped.items():
+        roles = {
+            _doc_role(Path(item["path"]).name) or "unknown"
+            for item in items if item.get("path")
+        }
+        if len(roles) > 1:
+            mixed_roles.append({
+                "family_id": family_id,
+                "title": items[0].get("title"),
+                "roles": sorted(roles),
+            })
+        if not any((item["version_label"] or "").strip() for item in items):
+            unlabeled += 1
+    latest = _latest_versions(records)
+    return {
+        "families": len(grouped),
+        "members": len(records),
+        "built_at": meta.get("built_at"),
+        "rules_version": meta.get("rules_version"),
+        "mixed_roles": mixed_roles,
+        "unlabeled_families": unlabeled,
+        "low_confidence_families": sum(
+            1 for info in latest.values() if info.get("confidence") == "low"),
+    }
+
+
+TEXT_EXTS = _TEXT_EXTS
 
 
 DIFF_PAIR_LIMIT = 400
