@@ -16,6 +16,8 @@ from . import families, query
 CANDIDATE_LIMIT = 600
 PATH_MATCH_LIMIT = 20000
 PATH_ONLY_LIMIT = 8
+# LIKE 兜底的候选上限：见 find_chunks 里的说明。
+LIKE_FALLBACK_LIMIT = 5000
 
 # 这些词出现在文件夹/文件名里太常见，单独命中不足以构成证据。
 _GENERIC_PATH_TERMS = {
@@ -35,6 +37,49 @@ _GENERIC_PATH_TERMS = {
 
 def is_generic_term(term: str) -> bool:
     return term in _GENERIC_PATH_TERMS
+
+
+# 代码文件扩展名与「代码意图查询」的识别：retrieval 与 search 共用同一套规则，
+# 否则搜索结果和问答证据对代码文件的口径会不一致。
+CODE_EXTS = {
+    "py", "pl", "sh", "bat", "ps1", "js", "ts", "tsx", "jsx", "r", "java",
+    "c", "cc", "cpp", "h", "hpp", "go", "rs", "ipynb",
+}
+CODE_QUERY = re.compile(
+    r"(脚本|代码|程序|函数|源码|命令行|code|script|function|notebook|ipynb)",
+    re.IGNORECASE,
+)
+# 非代码查询时代码文件的强降权幅度。要盖过 focus/maximal 的任何组合，
+# 否则「package sample;」这类正文命中仍会挤占文档证据位。
+CODE_PENALTY = 1200
+
+
+def _file_ext(path: str) -> str:
+    name = (path or "").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def _strong_name_hit(path: str, analysis: dict) -> bool:
+    """代码文件的豁免判定：文件名里出现 ≥4 字符的具体查询词。
+
+    英文词必须整词匹配（primer 不能命中 PrimeRing.java、complete 不能命中
+    CompleteNumber.java），否则同义词撞名会让降权形同虚设；
+    下划线/连字符按空格处理，receipt_sorter 仍可命中 receipt_sorter.py。
+    """
+    name = re.sub(r"[_\\-]+", " ", (path or "")
+                  .rsplit("\\", 1)[-1].rsplit("/", 1)[-1].lower())
+    for concept in analysis["concepts"]:
+        for variant in concept["variants"]:
+            if len(variant) < 4:
+                continue
+            probe = re.sub(r"[_\\-]+", " ", variant)
+            if variant.isascii():
+                if re.search(r"(?<![a-z0-9])" + re.escape(probe)
+                             + r"(?![a-z0-9])", name):
+                    return True
+            elif probe in name:
+                return True
+    return False
 
 
 # 说明类文档（README / 使用说明）在「怎么用」问题里更相关；
@@ -61,7 +106,15 @@ _EXAM_NAME = re.compile(
 _EXAM_QUERY = re.compile(r"(试卷|试题|答案|题库|复习|期末|期中|真题|考试题|习题|模拟题)")
 # 问“结果/报告/汇总”时，处理报告、汇总表应该排在原始图片和脚本之前。
 _RESULT_NAME = re.compile(r"(报告|汇总|统计|结果|明细|report|summary|result)", re.IGNORECASE)
-_RESULT_QUERY = re.compile(r"(结果|报告|汇总|统计|概况|处理结果|明细|多少|数量)")
+# 「多少/数量」不能触发：计数问题（XX是多少）最常见，会给库里所有
+# 「报告/结果」命名的文件（课程报告、实习报告……）全体 +200，
+# 反而压过真正含答案的正文与数据文件。
+_RESULT_QUERY = re.compile(r"(结果|报告|汇总|统计|概况|处理结果|明细)")
+# 计数问题（XX 是多少）的答案通常在统计表/汇总表/结果清单里；
+# 但「报告」命名的多为课程报告/实习报告，是最大的噪声源，不加分。
+_COUNT_QUERY = re.compile(r"(多少|数量|几个)")
+_RESULT_NAME_COUNT = re.compile(r"(汇总|统计|结果|明细|report|summary|stat)",
+                                re.IGNORECASE)
 # 问“支持哪些输入格式”时，扫描/读取模块比命令行入口更有回答价值。
 _INPUT_QUERY = re.compile(r"(输入格式|支持格式|支持.{0,4}格式|输入文件|input format|supported)",
                           re.IGNORECASE)
@@ -85,6 +138,9 @@ def name_prior(path: str, analysis: dict) -> int:
         score -= 300
     if (_RESULT_QUERY.search(analysis.get("normalized") or "")
             and _RESULT_NAME.search(name)):
+        score += 200
+    if (_COUNT_QUERY.search(analysis.get("normalized") or "")
+            and _RESULT_NAME_COUNT.search(name)):
         score += 200
     if (_INPUT_QUERY.search(analysis.get("normalized") or "")
             and _INPUT_NAME.search(name)):
@@ -166,6 +222,8 @@ class ChunkHit:
     path_score: int = 0
     focus: int = 0
     maximal: int = 0
+    # 命中的语义单元按词长加权后的总分（maximal 是个数，供覆盖率计算）。
+    maximal_weight: int = 0
 
     @property
     def ocr(self) -> bool:
@@ -215,8 +273,12 @@ def _relative_path(path: str, root: str | None) -> str:
 
 
 def _term_in(value: str, variant: str) -> bool:
-    """路径里的词面匹配：两字母缩写只接受独立成词（fe 不应命中 different）。"""
-    if len(variant) == 2 and variant.isascii():
+    """路径里的词面匹配：短 ASCII 缩写只接受独立成词。
+
+    2-3 字母的缩写（fe/ont/rna）做子串匹配必然撞上普通英文单词
+    （fe→different、ont→Context、rna→journal），必须按整词匹配。
+    """
+    if variant.isascii() and len(variant) <= 3:
         return re.search(r"(?<![a-z0-9])" + re.escape(variant) + r"(?![a-z0-9])",
                          value) is not None
     return variant in value
@@ -435,15 +497,24 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
         where.append("l.ext = ?")
         params.append(ext.lower().lstrip("."))
 
-    fts_units = [variant for variant in variants if len(variant) >= 3]
-    short_units = [variant for variant in variants if len(variant) < 3]
+    # 2-3 字母的 ASCII 缩写（fe/ont/rna）不能进 FTS：trigram 是子串匹配，
+    # 「ont」会把所有含 Context/front 的块都召回来。改走 LIKE + 整词边界过滤。
+    def _ascii_short_unit(variant: str) -> bool:
+        return variant.isascii() and len(variant) <= 3
+
+    fts_units = [variant for variant in variants
+                 if len(variant) >= 3 and not _ascii_short_unit(variant)]
+    short_units = [variant for variant in variants
+                   if len(variant) < 3 or _ascii_short_unit(variant)]
     rows: list[sqlite3.Row] = []
     if fts_units:
         match = " OR ".join('"' + unit.replace('"', '""') + '"' for unit in fts_units)
+        # ORDER BY rank：按 bm25 相关性取前 limit 条。裸 LIMIT 按插入序截断，
+        # 最晚索引的数据源会被系统性挤出候选（新源里含答案的块整块消失）。
         sql = (
             f"{scope_prefix}{_SELECT} FROM chunk_fts{_JOINS}"
             " WHERE chunk_fts MATCH ? AND "
-            + " AND ".join(where) + f" LIMIT {limit}"
+            + " AND ".join(where) + f" ORDER BY rank LIMIT {limit}"
         )
         rows = conn.execute(sql, [*scope_params, match, *params]).fetchall()
     if short_units:
@@ -452,12 +523,18 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
         clauses = " OR ".join("instr(lower(c.text), ?) > 0" for _ in short_units)
         order = ""
         if analysis.get("howto") or analysis.get("intro"):
-            # 说明类文档的候选可能被大量数据文件挤出 600 条上限，优先保留它们。
+            # 说明类文档的候选可能被大量数据文件挤出候选上限，优先保留它们。
             order = (" ORDER BY (instr(lower(l.path), 'readme') > 0"
                      " OR instr(lower(l.path), 'quickstart') > 0) DESC")
+        # LIKE 兜底不能用与 FTS 相同的小上限：instr 按插入序返回，前几百条
+        # 会被早索引的源占满，晚索引的源里只命中 2 字词的块（如「注释」）
+        # 会整块消失。放宽到能覆盖常见 2 字词的全量匹配（实测 ~4k 行、
+        # 全表扫描 3-4s、Python 评分 0.04s）；库规模显著增长时需改用索引方案。
+        like_limit = max(limit, LIKE_FALLBACK_LIMIT)
         sql = (
             f"{scope_prefix}{_SELECT}{_JOINS_NO_FTS} WHERE "
-            + " AND ".join(where + [f"({clauses})"]) + f"{order} LIMIT {limit}"
+            + " AND ".join(where + [f"({clauses})"])
+            + f"{order} LIMIT {like_limit}"
         )
         extra = conn.execute(sql, [*scope_params, *params, *short_units]).fetchall()
         if not fts_units:
@@ -468,10 +545,11 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
                 merged.setdefault((row["chunk_id"], row["location_id"]), row)
             rows = list(merged.values())
 
-        # 两字母缩写（FE/RE/GO/GC）用 LIKE 会命中英文子串（fe → different），
-        # 候选里混满无关文档。这些短词只接受独立成词的出现，中文短词仍按子串。
+        # 2-3 字母缩写（FE/RE/GO/ONT/RNA）用 LIKE 会命中英文子串
+        # （fe → different、ont → Context），候选里混满无关文档。
+        # 这些短词只接受独立成词的出现，中文短词仍按子串。
         ascii_short = [unit for unit in short_units
-                       if re.fullmatch(r"[a-z0-9_]{2}", unit)]
+                       if re.fullmatch(r"[a-z0-9_]{2,3}", unit)]
         if ascii_short:
             boundary = [re.compile(r"(?<![a-z0-9])" + re.escape(unit) + r"(?![a-z0-9])")
                         for unit in ascii_short]
@@ -517,10 +595,14 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
         ))
         lowered = text_value.lower()
         matched_terms = [
-            concept["term"] for concept in maximal
+            concept for concept in maximal
             if any(variant in lowered for variant in concept["variants"])
         ]
         maximal_hit = len(matched_terms)
+        # 语义单元按词长加权：命中「样本采集自」这样的 5 字短语远强于命中
+        # 单个 2 字词，正文证据才有能力与路径命中（≤300）竞争。
+        maximal_weight = sum(10 + 10 * (len(concept["term"]) - 2)
+                             for concept in matched_terms)
         if not path_ok and maximal_hit < 1:
             # 只有 gram 命中时：说明类问题允许命中一个词，其余问题要求至少两个。
             if analysis.get("howto"):
@@ -545,6 +627,7 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             path_score=(path_match.score if path_match else 0)
                        + _path_only_bonus(path_match, path_only),
             maximal=maximal_hit,
+            maximal_weight=maximal_weight,
         ))
 
     seen = {hit.location_id for hit in hits}
@@ -595,8 +678,17 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
         ))
         added += 1
 
+    ext_filter = (ext or "").lower().lstrip(".")
+    code_query = bool(CODE_QUERY.search(text)) or ext_filter in CODE_EXTS
     for hit in hits:
         hit.path_score += name_prior(hit.path, analysis)
+        if not code_query and _file_ext(hit.path) in CODE_EXTS:
+            # 非代码查询时代码文件强降权：同义词很容易撞上代码正文
+            # （「样本→sample」命中 Java 的 package sample;）。文件名强命中
+            # （≥4 字符具体词、英文整词匹配，如 receipt_sorter.py）的代码
+            # 文件豁免——问「receipt_sorter 支持什么格式」时答案就在代码里。
+            if not _strong_name_hit(hit.path, analysis):
+                hit.path_score -= CODE_PENALTY
         if focus:
             lowered = hit.text.lower()
             hit.focus = min(3, sum(1 for term in focus
@@ -605,14 +697,14 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
     if path_only:
         # 位置问题只关心路径：正文里碰巧出现「结果」不该压过文件名命中。
         hits.sort(key=lambda hit: (
-            -(hit.focus * 120 + hit.maximal * 10 + hit.path_score),
+            -(hit.focus * 120 + hit.maximal_weight + hit.path_score),
             -hit.concepts,
             -hit.variants,
             -len(hit.text),
         ))
     else:
         hits.sort(key=lambda hit: (
-            -(hit.focus * 120 + hit.maximal * 10 + min(hit.path_score, 300)),
+            -(hit.focus * 120 + hit.maximal_weight + min(hit.path_score, 300)),
             -hit.concepts,
             -hit.variants,
             -len(hit.text),

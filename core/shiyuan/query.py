@@ -24,6 +24,12 @@ STOP_TERMS = {
     # 疑问代词与泛动词：留下会把「什么/哪些」当正文关键词，召回大量无关文档。
     "哪些", "哪个", "哪几", "多少", "几个", "什么", "怎么", "如何", "为什么",
     "写", "写了", "做", "做了", "跑", "跑了", "说", "讲", "看", "介绍", "总结", "概括",
+    # 高频泛词：单独出现时几乎不携带主题（「引物设计」的主语是「引物」），
+    # 但会把全部课程设计报告召回来挤占证据位。
+    # 长词组合（3-gram 展开）不受影响，只有该词独立成概念时被忽略。
+    # 注意：报告/实验/论文/项目这类词不能停用——「报告有哪些版本」「项目A」
+    # 这类问题以它们为主体词，停用会直接搜不到目标文件。
+    "设计",
 }
 
 # 英文虚词与高频词：都是子串匹配的噪声源（如 to 命中 photo、photoshop），
@@ -140,6 +146,8 @@ SYNONYMS = {
     "筛选": ["filter"],
     "鉴定": ["identify", "identification"],
     "比对": ["alignment", "align"],
+    "跨度": ["spanning", "span"],
+    "连接": ["join", "joins", "junction"],
     "参数": ["parameter", "param"],
     "脚本": ["script"],
     "微卫星": ["microsatellite", "ssr"],
@@ -209,7 +217,7 @@ def analyze(text: str, synonyms: dict[str, list[str]] | None = None) -> dict:
     table = synonyms if synonyms is not None else SYNONYMS
     seen: set[str] = set()
     concepts: list[dict] = []
-    def add(term: str) -> None:
+    def add(term: str, phrase: bool = False) -> None:
         term = term.strip()
         if not term or term in seen or term in STOP_TERMS or len(concepts) >= MAX_CONCEPTS:
             return
@@ -218,12 +226,15 @@ def analyze(text: str, synonyms: dict[str, list[str]] | None = None) -> dict:
         for extra in table.get(term, ()):
             if extra not in variants:
                 variants.append(extra)
-        concepts.append({"term": term, "variants": variants})
+        # phrase=True 表示这是完整的词/短语（英文单词、≤6 字的整段），
+        # 而不是从长句上切下来的 n-gram；maximal_terms 据此区分语义单元
+        # 与召回辅助词。
+        concepts.append({"term": term, "variants": variants, "phrase": phrase})
 
     for word in re.findall(r"[a-z0-9_]{2,}", core):
         if word in STOP_TERMS_EN:
             continue
-        add(word)
+        add(word, phrase=True)
     for run in re.findall(r"[\u4e00-\u9fff]+", core):
         # 「的」通常只是连接词，按它切开可避免「鱼的候选」这类跨词 gram。
         for part in re.split("的", run):
@@ -231,7 +242,7 @@ def analyze(text: str, synonyms: dict[str, list[str]] | None = None) -> dict:
             if not part:
                 continue
             if len(part) <= 6:
-                add(part)
+                add(part, phrase=True)
             for size in (2, 3):
                 for index in range(len(part) - size + 1):
                     add(part[index:index + size])
@@ -268,11 +279,19 @@ def rank(text: str, analysis: dict) -> tuple[int, int]:
 
 
 def maximal_terms(analysis: dict) -> list[dict]:
-    """去掉被更长词包含的 gram，只留语义单元。"""
+    """去掉被更长词包含的 gram，只留语义单元。
+
+    长句切出的 3-gram 多为跨词边界的噪声（「引物设」横跨「引物|设计」），
+    只作召回辅助，不参与语义单元判定；整段短语与 2 字词才是语义单元。
+    这样「引物」不会被「引物设」遮蔽，其英文同义词（primer）的命中也算
+    命中语义单元，含答案的块不会被证据门槛误杀。
+    """
     concepts = analysis["concepts"]
-    terms = [concept["term"] for concept in concepts]
+    candidates = [concept for concept in concepts
+                  if concept.get("phrase") or len(concept["term"]) <= 2]
+    terms = [concept["term"] for concept in candidates]
     return [
-        concept for concept in concepts
+        concept for concept in candidates
         if not any(concept["term"] != other and concept["term"] in other
                    for other in terms)
     ]

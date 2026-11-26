@@ -38,6 +38,8 @@ MAX_ATTEMPTS = 3
 
 CHUNK_CHARS = 800
 CHUNK_OVERLAP = 100
+# 单块上限：超长行（md 表格行可上千字符）整行入块，超过该上限才硬切。
+MAX_CHUNK_CHARS = 4000
 
 
 def _is_file_lock_error(exc: BaseException) -> bool:
@@ -85,6 +87,12 @@ def chunk_sections(sections) -> list[Chunk]:
                 cut = text.rfind("\n", start + CHUNK_CHARS // 2, end)
                 if cut > 0:
                     end = cut + 1
+                elif "\n" not in text[start + CHUNK_CHARS // 2:end]:
+                    # 超长行（如 md 表格行）中间没有换行：把整行留在一块里，
+                    # 避免 FTS/读取时行被拦腰切断。行本身超过上限才硬切。
+                    line_end = text.find("\n", end)
+                    if 0 <= line_end and line_end - start <= MAX_CHUNK_CHARS:
+                        end = line_end + 1
             piece = text[start:end]
             if piece.strip():
                 keep = [box for (box_start, box_end, box) in line_boxes

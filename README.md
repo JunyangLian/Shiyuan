@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/JunyangLian/SourceLoom)](https://github.com/JunyangLian/SourceLoom/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/JunyangLian/SourceLoom/total)](https://github.com/JunyangLian/SourceLoom/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
-![Version](https://img.shields.io/badge/version-0.3.0-005E9B)
+![Version](https://img.shields.io/badge/version-0.3.1-005E9B)
 
 [下载安装包](https://github.com/JunyangLian/SourceLoom/releases/latest) · [产品需求](docs/PRD.md) · [项目知识空间](docs/PROJECTS.md) · [解析说明](docs/INGESTION.md) · [开发断点](docs/BREAKPOINT.md)
 
@@ -290,7 +290,7 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 273 passed（另需 pip install pytest httpx）
+cd core; python -m pytest -q          # 284 passed（另需 pip install pytest httpx）
 cd desktop; npm test                  # 17 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
@@ -298,6 +298,14 @@ cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
 
 检索基线（120 篇文档 / 140 道题）：R@1 = 1.000、R@5 = 1.000、MRR = 1.000（合成唯一标记语料）。
 扫描基线：2000 个文件首次扫描约 2.1s（约 940 files/s），二次对账约 0.56s。
+
+md 提取全流程评测（真实库 13,012 资产 / 12 道真实问答对，逐板块对账）：
+
+- 解析：218 个 md 全量覆盖，无空块 / 超限块；超长表格行整行入块
+- 分块与读取：`get_document_text` 拼接结果与磁盘原文去空白后逐字一致
+- 检索：词面可回答 10/12（修复代码文件撞词、跨词 3-gram 遮蔽、候选按插入序截断后）
+- 端到端：回答可回答 11/12，12/12 的答案数值都能在被引证据全文里找到（零编造）
+- MCP：外部 Agent 流（`search_knowledge` → `get_document_text`）12/12 可读到答案
 
 真实库（13,012 资产 / 382,678 chunk）：Project / Expanded / Global 三档检索中位约 1.9 / 2.0 / 2.3 秒；
 空项目直接返回；项目列表 3ms、资料首页 11ms、项目知识 16ms、普通项目统计 29ms。

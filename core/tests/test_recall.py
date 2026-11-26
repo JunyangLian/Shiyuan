@@ -6,7 +6,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from shiyuan import answer, db, embeddings, indexer, query, retrieval, scanner, search, store
+from shiyuan import answer, db, embeddings, families, indexer, query, retrieval, scanner, search, store
 
 
 @pytest.fixture()
@@ -172,6 +172,129 @@ def test_custom_synonyms_are_used(conn, tmp_path):
     hits = search.search(conn, "入组")
     assert hits["total"] == 1
     assert hits["items"][0]["name"] == "记录.md"
+
+
+def test_long_run_3gram_does_not_shadow_core_word():
+    """长句切出的 3-gram 是跨词噪声，不能把真正的 2 字核心词挤出语义单元。"""
+    analysis = query.analyze("引物设计产生了多少对引物")
+    terms = [concept["term"] for concept in query.maximal_terms(analysis)]
+
+    assert "引物" in terms
+    assert "引物设" not in terms
+
+
+def test_generic_design_is_stopped_but_report_stays_alive():
+    stopped = query.analyze("设计")
+    alive = query.analyze("报告有哪些版本")
+
+    assert "设计" not in [c["term"] for c in stopped["concepts"]]
+    # 报告/实验/论文/项目 是常见问题主体词，停用会让「报告有哪些版本」搜不到。
+    assert "报告" in [c["term"] for c in alive["concepts"]]
+
+
+def test_synonym_only_hit_passes_evidence_gate(conn, tmp_path):
+    """答案块只命中英文同义词（primer）时也要能通过证据门槛被召回。"""
+    _source(conn, tmp_path, {"结果.md": "Designed primer pairs: 115,407 and 19,867.\n"})
+
+    hits = retrieval.find_chunks(conn, "引物设计产生了多少对引物")
+
+    assert any("115,407" in hit.text for hit in hits)
+
+
+def test_code_files_demoted_for_non_code_query(conn, tmp_path):
+    """非代码查询时，正文撞上同义词的代码文件（package sample）要沉底。"""
+    _source(conn, tmp_path, {
+        "a.md": "样本 采集 分开出现，各一次。\n",
+        "helper.java": "package sample; import sample.util; // 样本采集\n",
+    })
+
+    hits = retrieval.find_chunks(conn, "样本采集自哪里")
+
+    assert hits, "应至少召回 md 文件"
+    assert hits[0].path.endswith("a.md")
+
+
+def test_code_file_named_after_topic_is_not_demoted(conn, tmp_path):
+    """文件名强命中主题的代码文件不降权：答案就在这个文件里。"""
+    _source(conn, tmp_path, {
+        "receipt_sorter.py": "# receipt_sorter 入口\nSUPPORTED_EXTENSIONS = ['.jpg', '.png']\n",
+        "手册.md": "receipt_sorter 支持的格式与安装说明。\n",
+    })
+
+    hits = retrieval.find_chunks(conn, "receipt_sorter 支持什么格式")
+
+    assert hits[0].path.endswith("receipt_sorter.py")
+
+
+def test_code_file_substring_name_match_still_demoted(conn, tmp_path):
+    """primer 撞上 PrimeRing.java 属于子串巧合，不构成豁免。"""
+    _source(conn, tmp_path, {
+        "引物.md": "引物设计结果：共 300 对。\n",
+        "PrimeRing.java": "// PrimeRing 数据结构课程作业\n",
+    })
+
+    hits = retrieval.find_chunks(conn, "引物设计产生了多少对引物")
+
+    assert hits[0].path.endswith("引物.md")
+
+
+def test_three_letter_acronym_matches_whole_word_only(conn, tmp_path):
+    """三字母缩写（ONT）做子串匹配会撞上 Context/front，必须整词匹配。"""
+    _source(conn, tmp_path, {
+        "ui.md": "Context menu and front-end widgets.\n",
+        "platform.md": "ONT 与 Illumina 双平台测序。\n",
+    })
+
+    hits = retrieval.find_chunks(conn, "ONT 测序平台")
+
+    names = [hit.path for hit in hits]
+    assert any(p.endswith("platform.md") for p in names)
+    assert not any(p.endswith("ui.md") for p in names)
+
+
+def test_count_query_bonus_skips_generic_report_names(conn, tmp_path):
+    """「多少」问题给统计/结果命名的文件加分，但不给课程/实习报告加分。"""
+    _source(conn, tmp_path, {
+        "实习报告.md": "工作中产生了大量连接记录。\n",
+        "统计结果.md": "满足阈值的连接共 93 个。\n",
+    })
+
+    hits = retrieval.find_chunks(conn, "满足阈值的连接有多少个")
+
+    assert hits[0].path.endswith("统计结果.md")
+    assert any("93" in hit.text for hit in hits[:3])
+
+
+def test_phrase_hit_outranks_scattered_words(conn, tmp_path):
+    """命中完整短语（样本采集自）的块应排在只散落单词的块之前。"""
+    _source(conn, tmp_path, {
+        "大纲.md": "样本采集自北部湾海域。\n",
+        "清单.md": "样本清单与采集工具、采集点分布说明。\n",
+    })
+
+    hits = retrieval.find_chunks(conn, "样本采集自哪里")
+
+    assert hits[0].path.endswith("大纲.md")
+
+
+def test_same_name_tsv_copies_form_one_family(conn, tmp_path):
+    """版本目录里同名 tsv 的副本要聚成一个家族，避免重复吃掉证据位。"""
+    root = tmp_path / "修订"
+    (root / "v1").mkdir(parents=True)
+    (root / "v2").mkdir(parents=True)
+    table = "join_id\tchr\tposition\nJ001\tChr01\t12345\n"
+    (root / "v1" / "Supplementary_Table_S6.tsv").write_text(table, encoding="utf-8")
+    (root / "v2" / "Supplementary_Table_S6.tsv").write_text(table, encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+
+    families.rebuild(conn)
+    mapping = families.family_map(conn)
+
+    ids = [info["family_id"] for info in mapping.values() if info["family_id"]]
+    assert len(ids) == 2
+    assert len(set(ids)) == 1
 
 
 def test_answer_citation_includes_version_and_mtime(conn, tmp_path):

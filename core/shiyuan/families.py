@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import db, indexer, inventory, knowledge, store
 
-RULES_VERSION = "family.v2"
+RULES_VERSION = "family.v3"
 TEXT_LIMIT = 20_000
 SHINGLE_SAMPLE = 600
 STRICT_DISTANCE = 8
@@ -66,6 +66,9 @@ _FAMILY_EXTS = {
     "ppt", "pptx", "pptm", "odp",
     "xls", "xlsx", "xlsm", "ods", "csv",
     "md", "markdown", "txt", "tex", "wps",
+    # tsv：论文修订目录里同名表格的版本副本（v0.4/v0.5/v0.6 各一份）
+    # 若不进家族，检索证据位会被同一张表重复吃掉。
+    "tsv",
 }
 
 _MARKER_WORDS = (
@@ -1071,7 +1074,7 @@ def dedupe_chunk_hits(conn: sqlite3.Connection, hits: list, *,
     def sort_key(hit) -> tuple:
         # 位置问题按完整路径分排序；其它问题保留原来的 300 分上限。
         path_score = hit.path_score if path_only else min(hit.path_score, 300)
-        return (-(hit.focus * 120 + hit.maximal * 10 + path_score),
+        return (-(hit.focus * 120 + hit.maximal_weight + path_score),
                 -hit.concepts, -hit.variants, -len(hit.text))
 
     mapping = family_map(conn)

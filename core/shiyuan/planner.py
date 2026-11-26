@@ -32,7 +32,10 @@ class Mode:
 
 
 MODES: dict[str, Mode] = {
-    "precision": Mode("precision", "精确查找", 4, 1, 1, 1,
+    # 精确查找的预算从 4 提到 8：per_asset/per_family 配额常让同主题的数据文件
+    # （六七个「引物」命名的表）填满小预算，语义补位（含答案但词面匹配不上
+    # 的正文块）永远轮不上。8 = 词面 6 + 语义 2。
+    "precision": Mode("precision", "精确查找", 8, 1, 1, 1,
                       "direct_answer_with_citations"),
     "explain": Mode("explain", "知识解释", 6, 2, 1, 2,
                     "explanation_with_citations"),

@@ -189,6 +189,24 @@ def test_chunk_sections_aligns_ocr_line_boxes():
     assert chunks[0].boxes == [[0, 0, 10, 5], [0, 10, 20, 5]]
 
 
+def test_chunk_sections_keeps_long_table_row_intact():
+    """md 超长表格行不拦腰切断：行内容必须完整出现在单块中。"""
+    long_row = "|" + "x" * 300 + "| 说明 |" + "y" * 500 + "|"
+    text = "# 标题\n\n普通段落。\n\n" + long_row + "\n\n结尾段落。\n"
+
+    def section(body):
+        return type("_S", (), {"text": body, "page": None, "sheet": None,
+                               "boxes": None})()
+
+    chunks = indexer.chunk_sections([section(text)])
+    assert any(long_row in chunk.text for chunk in chunks)
+
+    # 超过单块上限的行仍硬切，块大小有界。
+    huge = "开头\n|" + "z" * (indexer.MAX_CHUNK_CHARS + 500) + "|\n结尾\n"
+    huge_chunks = indexer.chunk_sections([section(huge)])
+    assert all(len(c.text) <= indexer.MAX_CHUNK_CHARS for c in huge_chunks)
+
+
 def test_ocr_marks_empty_when_nothing_recognized(conn, tmp_path, monkeypatch):
     _fake_engine(monkeypatch)
     monkeypatch.setattr(ocr, "extract_image", lambda path: [])

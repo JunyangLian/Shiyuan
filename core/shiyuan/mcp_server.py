@@ -694,7 +694,8 @@ class MCPServer:
             conditions.append("c.sheet = ?")
             params.append(sheet)
         rows = self.conn.execute(
-            "SELECT c.page, c.sheet, c.ordinal, c.text, a.parser_signature"
+            "SELECT c.page, c.sheet, c.ordinal, c.text, c.char_start, c.char_end,"
+            " a.parser_signature"
             " FROM chunks c JOIN parse_artifacts a ON a.artifact_id = c.artifact_id"
             f" WHERE {' AND '.join(conditions)}",
             params,
@@ -706,6 +707,8 @@ class MCPServer:
                 "sheet": row["sheet"],
                 "ordinal": row["ordinal"],
                 "text": row["text"],
+                "char_start": row["char_start"],
+                "char_end": row["char_end"],
                 "stage": _stage_of(row["parser_signature"]),
             }
             for row in rows
@@ -723,12 +726,22 @@ class MCPServer:
         sections: list[dict] = []
         for chunk in selected:
             key = (chunk["page"], chunk["sheet"])
+            text = chunk["text"]
             if sections and sections[-1]["_key"] == key:
-                sections[-1]["parts"].append(chunk["text"])
+                previous = sections[-1]["chunks"][-1]
+                # 相邻块的重叠区（CHUNK_OVERLAP）只保留一份，读取结果才与原文件一致。
+                if (previous["char_end"] > chunk["char_start"] > 0
+                        and chunk["char_start"] >= previous["char_start"]):
+                    overlap = previous["char_end"] - chunk["char_start"]
+                    if 0 < overlap < len(text):
+                        text = text[overlap:]
+                sections[-1]["chunks"].append(chunk)
+                sections[-1]["parts"].append(text)
                 sections[-1]["stages"].add(chunk["stage"])
             else:
                 sections.append(
-                    {"_key": key, "parts": [chunk["text"]], "stages": {chunk["stage"]}}
+                    {"_key": key, "chunks": [chunk], "parts": [text],
+                     "stages": {chunk["stage"]}}
                 )
 
         artifacts = [

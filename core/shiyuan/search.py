@@ -22,14 +22,9 @@ SEMANTIC_BASE = 60
 SEMANTIC_Z_WEIGHT = 60
 SEMANTIC_Z_CAP = 4.0
 STRONG_RATIO = 0.5
-CODE_EXTS = {
-    "py", "pl", "sh", "bat", "ps1", "js", "ts", "tsx", "jsx", "r", "java",
-    "c", "cc", "cpp", "h", "hpp", "go", "rs", "ipynb",
-}
-_CODE_QUERY = re.compile(
-    r"(脚本|代码|程序|函数|源码|命令行|code|script|function|notebook|ipynb)",
-    re.IGNORECASE,
-)
+# 代码文件识别在 retrieval 层定义（answer/ask 的证据召回共用同一套口径）。
+CODE_EXTS = retrieval.CODE_EXTS
+_CODE_QUERY = retrieval.CODE_QUERY
 _LATEST_QUERY = re.compile(
     r"(最新|当前版本|最新版|目前版本|latest|current version)", re.IGNORECASE)
 _VERSION_HISTORY_QUERY = re.compile(

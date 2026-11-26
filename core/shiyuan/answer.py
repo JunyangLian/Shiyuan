@@ -29,6 +29,13 @@ MAX_PROMPT_CHARS = 8000
 # 没有任何词面证据时，语义片段要达到这个相似度才单独算证据（bge-m3 实测：
 # 相关问题 0.61+，无关问题 0.47~0.60）。
 MIN_SEMANTIC_ONLY = 0.62
+# 语义换位阈值：词面证据占满预算时，达到该相似度的语义命中可以换掉
+# 最弱的词面证据。「摘要的主要结论」的答案在摘要文本里，词面永远匹配
+# 不上，但 README/结果文件这类弱命中会先把预算占满，语义层没有出场机会。
+# 阈值要明显高于常规相关块（实测相关正文 0.52-0.59），只放行强语义命中，
+# 否则会把恰好含答案的弱词面证据（如只命中一个同义词的块）换掉。
+SEMANTIC_SWAP = 0.60
+SEMANTIC_SWAP_MAX = 2
 
 DEFAULT_SETTINGS = {
     "provider": "extractive",
@@ -243,7 +250,8 @@ def _specific_analysis(analysis: dict) -> dict:
         variants = [variant for variant in concept.get("variants", [])
                     if len(variant) >= 2 and not retrieval.is_generic_term(variant)]
         if variants:
-            concepts.append({"term": concept["term"], "variants": variants})
+            concepts.append({"term": concept["term"], "variants": variants,
+                             "phrase": concept.get("phrase", False)})
     variants: list[str] = []
     for concept in concepts:
         for variant in concept["variants"]:
@@ -411,8 +419,7 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
             used_chunks.add(hit.chunk_id)
 
     embed_settings = embeddings.load_settings(conn)
-    if (embeddings.enabled(embed_settings) and len(evidence) < limit
-            and not rerank_empty):
+    if (embeddings.enabled(embed_settings) and not rerank_empty):
         try:
             semantic_hits = embeddings.semantic_chunks(
                 conn, question, source_id=source_id, ext=ext,
@@ -435,20 +442,10 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
             semantic_hits = sorted(
                 semantic_hits,
                 key=lambda hit: 0 if hit.get("asset_id") in priority_assets else 1)
-        for hit in semantic_hits:
-            if len(evidence) >= limit:
-                break
-            if hit["chunk_id"] in used_chunks:
-                continue
-            # 没有任何词面证据时，语义命中必须足够强才算证据；
-            # 否则「明天会下雨」这类无关问题也会被弱相似片段硬凑出答案。
-            if not evidence and hit["similarity"] < MIN_SEMANTIC_ONLY:
-                continue
-            if not take(hit["asset_id"], hit.get("family_id"), hit["text"],
-                        allow_second=True):
-                continue
+
+        def semantic_evidence(hit) -> Evidence:
             name = hit["path"].rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
-            evidence.append(Evidence(
+            return Evidence(
                 chunk_id=hit["chunk_id"],
                 asset_id=hit["asset_id"],
                 location_id=hit["location_id"],
@@ -468,8 +465,48 @@ def retrieve(conn: sqlite3.Connection, question: str, *, source_id: str | None =
                 family_title=hit.get("family_title", ""),
                 version_label=hit.get("version_label", ""),
                 sources=hit.get("sources", []),
-            ))
-            used_chunks.add(hit["chunk_id"])
+            )
+
+        if len(evidence) < limit:
+            for hit in semantic_hits:
+                if len(evidence) >= limit:
+                    break
+                if hit["chunk_id"] in used_chunks:
+                    continue
+                # 没有任何词面证据时，语义命中必须足够强才算证据；
+                # 否则「明天会下雨」这类无关问题也会被弱相似片段硬凑出答案。
+                if not evidence and hit["similarity"] < MIN_SEMANTIC_ONLY:
+                    continue
+                if not take(hit["asset_id"], hit.get("family_id"), hit["text"],
+                            allow_second=True):
+                    continue
+                evidence.append(semantic_evidence(hit))
+                used_chunks.add(hit["chunk_id"])
+        else:
+            # 语义换位：弱词面证据（README/结果文件等一两个概念命中）
+            # 占满预算时，让强语义命中换掉它们，给「词面匹配不上但语义
+            # 直接命中」的证据（如英文摘要之于中文提问）留出位置。
+            swapped = 0
+            for hit in semantic_hits:
+                if swapped >= SEMANTIC_SWAP_MAX:
+                    break
+                if hit["similarity"] < SEMANTIC_SWAP:
+                    break
+                if hit["chunk_id"] in used_chunks:
+                    continue
+                weak_index = next(
+                    (index for index in range(len(evidence) - 1, -1, -1)
+                     if not evidence[index].semantic
+                     and evidence[index].matches <= 2),
+                    None)
+                if weak_index is None:
+                    break
+                if not take(hit["asset_id"], hit.get("family_id"), hit["text"],
+                            allow_second=True):
+                    continue
+                evidence[weak_index] = semantic_evidence(hit)
+                used_chunks.add(hit["chunk_id"])
+                swapped += 1
 
     # 衍生知识证据：解释/综合模式补充摘要、FAQ，关系类问题叠加知识关系。
     knowledge_used = 0
