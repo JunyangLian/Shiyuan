@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/JunyangLian/SourceLoom)](https://github.com/JunyangLian/SourceLoom/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/JunyangLian/SourceLoom/total)](https://github.com/JunyangLian/SourceLoom/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
-![Version](https://img.shields.io/badge/version-0.2.2-005E9B)
+![Version](https://img.shields.io/badge/version-0.2.3-005E9B)
 
 [下载安装包](https://github.com/JunyangLian/SourceLoom/releases/latest) · [产品需求](docs/PRD.md) · [项目知识空间](docs/PROJECTS.md) · [解析说明](docs/INGESTION.md) · [开发断点](docs/BREAKPOINT.md)
 
@@ -79,6 +79,8 @@
 - 问「最新版本 / 当前版本」时补齐各大家族的最新稿；点名旧版本（如「v0.2 的 BUSCO」）时
   即使词面召回被同名笔记挤占也会补回该版本，并标记 `is_latest_version=false`，不会把旧稿当成当前数据
 - 没有版本标签的家族只是重复副本：`is_latest_version` 返回 `null`（未知），不冒充“最新版本”
+- 正文 / 图形摘要 / 投稿信 / 亮点 / 补充材料 / 回复按角色分开，不会因为同目录、
+  同版本号被并进正文族；标题相同但正文大面积重合的修订稿仍能归为一家
 - 版本差异视图：共享 / 仅左 / 仅右 / 近似修改（SimHash 预筛 + 序列相似度），可对比 `v0.12 → v0.13`
 - 引用里同家族的多个版本折叠成一组，点开可看全部成员
 
@@ -210,7 +212,7 @@ core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            scanner · watcher · ingest · extractors · ocr · indexer
                       projects · query · retrieval · families · rerank · answer · chat
                       external · mcp_server · inventory · maintenance · api
-  tests/              266 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 项目 / 外部接口 / 安全 / 基线）
+  tests/              269 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 项目 / 外部接口 / 安全 / 基线）
   benchmarks/         目录级扫描基准
 desktop/              Tauri v2 + React + TypeScript
   src/                项目（含外部接口）· 对话 · 数据 · 更新 四个模块
@@ -284,7 +286,7 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 266 passed（另需 pip install pytest httpx）
+cd core; python -m pytest -q          # 269 passed（另需 pip install pytest httpx）
 cd desktop; npm test                  # 17 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR

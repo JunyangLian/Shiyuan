@@ -112,6 +112,13 @@ external_clients(..., project_id)                 -- 令牌绑定的项目
 - 没有版本标签的家族不判断“最新版本”（`is_latest_version=null`），但会额外给出
   `newest_asset_id / newest_mtime`（最后修改的成员），供外部 Agent 如实回答“哪个文件更新过”。
 - `list_document_families` 返回 `built_at`（家族快照时间）；扫描后家族会重建，版本结论以该时间为准。
+  无版本标签的重复副本族也会列出，但 `has_versions=false`、`latest_version_label=null`，
+  并按“有版本优先”排序放在后面。
+- 家族聚类按文件名区分角色：正文 / 图形摘要 / 投稿信 / 亮点 / 补充材料 / 回复不会
+  因为同目录、同版本号被并进同一个家族；图形摘要等会各自成族。
+- 标题相同、正文大面积重合（8 字 shingle Jaccard ≥ 0.08）的修订稿会合并，
+  修复 simhash 距离略超阈值导致“同一篇的中英稿/修订稿丢族”；仅标题相同的不同文档
+  （如课件同一模板的章节）不会合并。
 - 问「最新版本 / 当前版本」时，检索会补上各大家族的最新版本，并优先展示；
   问「历史版本 / 改了什么 / v0.12」时，不提升最新版本，允许同一家族的不同版本分别出现。
 - `search_knowledge` 的每条结果都带版本字段；`list_document_families` 用于先确定

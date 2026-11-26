@@ -475,10 +475,11 @@ class MCPServer:
                 "description": (
                     "List multi-version document families in the shared project, with "
                     "the latest version first. Use this to answer 'which version is "
-                    "current' before reading a specific document. Families with no "
-                    "version label (plain duplicates) are excluded. Items also carry "
-                    "newest_asset_id / newest_mtime: the last modified member, useful "
-                    "when labels are absent or mixed. built_at is the family snapshot time."
+                    "current' before reading a specific document. Items carry "
+                    "has_versions / latest_version_label: when has_versions is false the "
+                    "family is a duplicate set with no version labels, so use newest_* "
+                    "(last modified member) and never call it the latest version. "
+                    "built_at is the family snapshot time."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1143,9 +1144,8 @@ class MCPServer:
             ]
             if len(members) < 2:
                 continue
-            if not any((member["version_label"] or "").strip() for member in members):
-                # 没有任何版本标记的只是重复副本，不属于“多版本文档”。
-                continue
+            has_versions = any(
+                (member["version_label"] or "").strip() for member in members)
             title = (info_map.get(asset_ids[0]) or {}).get("family_title") or ""
             family_info = info_map.get(asset_ids[0]) or {}
             newest_id = family_info.get("family_newest_asset_id")
@@ -1170,8 +1170,9 @@ class MCPServer:
                 "family_id": family_id,
                 "title": title,
                 "size": len(members),
+                "has_versions": has_versions,
                 "latest_asset_id": latest["asset_id"],
-                "latest_version_label": latest["version_label"],
+                "latest_version_label": latest["version_label"] or None,
                 "latest_mtime": (
                     datetime.fromtimestamp(latest_ns / 1e9).astimezone()
                     .isoformat(timespec="seconds") if latest_ns else None
@@ -1214,7 +1215,9 @@ class MCPServer:
         # 指定 query 时只返回命中的家族；不做“查不到就退回全部”的兜底，
         # 否则外部 Agent 会以为过滤生效，实际拿到的是全量列表。
         selected = matched if query else items
-        selected.sort(key=lambda item: (-item["size"], -item["latest_mtime_ns"]))
+        # 有版本标签的家族优先；重复副本族排在后面，避免抢占“最新版本”的位置。
+        selected.sort(key=lambda item: (
+            not item["has_versions"], -item["size"], -item["latest_mtime_ns"]))
         snapshot = self.conn.execute(
             "SELECT value FROM app_settings WHERE key = 'document_families'").fetchone()
         built_at = None

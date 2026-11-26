@@ -346,6 +346,57 @@ def test_compare_versions_output_is_capped(conn, tmp_path):
     assert all(value <= 1 for value in payload["returned"].values())
 
 
+def test_doc_roles_keep_auxiliary_files_out_of_main_family():
+    assert families._doc_role("CBPD_graphical_abstract_v0.13.pdf") == "graphical_abstract"
+    assert families._doc_role("CBPD_cover_letter_v0.13.md") == "cover_letter"
+    assert families._doc_role("CBPD_highlights_v0.13.docx") == "highlights"
+    assert families._doc_role("CBPD_Supplementary_Tables_v0.13.pdf") == "supplementary"
+    assert families._doc_role("Siganus_fuscescens_CBPD_clean_v0.13.md") == "main"
+    assert families._doc_role("导师批注原件.docx") is None
+
+    assert not families._merge_roles_compatible(
+        {"name": "xxx_clean_v1.md"}, {"name": "xxx_graphical_abstract_v1.pdf"})
+    assert not families._merge_roles_compatible(
+        {"name": "xxx_cover_letter_v1.md"}, {"name": "xxx_highlights_v1.md"})
+    # 正文与未标注文件仍可合并（例如导师批注、旧命名稿件）。
+    assert families._merge_roles_compatible(
+        {"name": "xxx_clean_v1.md"}, {"name": "导师批注原件.docx"})
+
+
+def test_text_overlap_distinguishes_revision_from_template():
+    base = "本文以广东省地级市为样本，构建综合评价指标体系并做稳健性检验。" * 120
+    revised = base + "新增政策建议一节，讨论跨区域协同。" * 15
+    other = "第9章 排序：快速排序、堆排序与归并排序的时间复杂度分析。" * 120
+
+    assert families._text_overlap(base, revised) >= families.TEXT_OVERLAP_MIN
+    assert families._text_overlap(base, other) < families.TEXT_OVERLAP_MIN
+
+
+def test_graphical_abstract_stays_out_of_manuscript_family(conn, tmp_path):
+    root = tmp_path / "论文"
+    root.mkdir()
+    title = "Improved chromosome-level genome of Siganus fuscescens\n"
+    body = "The mottled rabbitfish is a marine teleost with economic value. " * 90
+    (root / "paper_clean_v1.md").write_text(title + body, encoding="utf-8")
+    (root / "paper_graphical_abstract_v1.md").write_text(
+        title + body[: len(body) // 4] + "\nGraphical summary of the assembly.\n",
+        encoding="utf-8")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+    indexer.index_pending(conn, source["source_id"])
+    families.rebuild(conn)
+
+    mapping = families.family_map(conn)
+    manuscript = conn.execute(
+        "SELECT asset_id FROM asset_locations WHERE path LIKE '%paper_clean_v1.md'"
+    ).fetchone()["asset_id"]
+    graphic = conn.execute(
+        "SELECT asset_id FROM asset_locations WHERE path LIKE '%graphical_abstract_v1.md'"
+    ).fetchone()["asset_id"]
+    left, right = mapping.get(manuscript), mapping.get(graphic)
+    assert not (left and right and left["family_id"] == right["family_id"])
+
+
 def test_version_rank_prefers_final_and_orders_numbers():
     assert families._version_rank("终稿 10") > families._version_rank("终稿 9")
     assert families._version_rank("终稿 10") > families._version_rank("4.22")
@@ -398,4 +449,8 @@ def test_unlabeled_duplicate_family_has_unknown_latest(conn, tmp_path):
         "params": {"name": "list_document_families", "arguments": {}},
     })
     payload = json.loads(response["result"]["content"][0]["text"])
-    assert payload["total"] == 0
+    assert payload["total"] == 1
+    item = payload["items"][0]
+    assert item["has_versions"] is False
+    assert item["latest_version_label"] is None
+    assert item["newest_asset_id"]

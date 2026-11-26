@@ -24,11 +24,29 @@ from pathlib import Path
 
 from . import db, indexer, inventory, knowledge, store
 
-RULES_VERSION = "family.v1"
+RULES_VERSION = "family.v2"
 TEXT_LIMIT = 20_000
 SHINGLE_SAMPLE = 600
 STRICT_DISTANCE = 8
+# 标题相同但正文有修改的版本（例如“英文版”与“-new”）：放宽 simhash 距离，
+# 再用文本 shingle 重合度确认是同一篇的修订，而不是同模板的另一份文档。
+TITLE_PAIR_DISTANCE = 16
+TITLE_PAIR_RATIO = 0.95
+TEXT_OVERLAP_MIN = 0.08
 MAX_FAMILY_SIZE = 60
+
+# 同一篇论文的不同角色（正文 / 图形摘要 / 投稿信 / 亮点 / 补充材料 / 回复）
+# 不能因为同目录、同版本号就被并进一个家族。
+_ROLE_PATTERNS = (
+    ("graphical_abstract", re.compile(r"graphical[\s_-]*abstract|图形摘要", re.IGNORECASE)),
+    ("cover_letter", re.compile(r"cover[\s_-]*letter|投稿信", re.IGNORECASE)),
+    ("highlights", re.compile(r"highlights?", re.IGNORECASE)),
+    ("supplementary", re.compile(r"supplement|补充材料|附录", re.IGNORECASE)),
+    ("response", re.compile(r"response|rebuttal|审稿意见|回复", re.IGNORECASE)),
+)
+_MAIN_ROLE = re.compile(
+    r"manuscript|(?:^|[_\W])clean(?:[_\W]|$)|正文|论文|paper|thesis", re.IGNORECASE)
+_AUX_ROLES = {name for name, _ in _ROLE_PATTERNS}
 
 # 这些名字去掉日期后只剩工具/通用词，不能据此把几百个无关文件并成一家。
 _GENERIC_KEYS = {
@@ -160,6 +178,37 @@ def _same_title(a: dict, b: dict) -> bool:
     return difflib.SequenceMatcher(None, a["title"], b["title"]).ratio() >= 0.6
 
 
+def _doc_role(name: str) -> str | None:
+    """按文件名判断文档角色：正文 / 图形摘要 / 投稿信 / 亮点 / 补充材料 / 回复。"""
+    for role, pattern in _ROLE_PATTERNS:
+        if pattern.search(name or ""):
+            return role
+    return "main" if _MAIN_ROLE.search(name or "") else None
+
+
+def _merge_roles_compatible(first: dict, second: dict) -> bool:
+    left, right = _doc_role(first["name"]), _doc_role(second["name"])
+    if left == right:
+        return True
+    # 正文与未标注文件仍可合并；图形摘要等辅助角色只与同角色合并。
+    return left not in _AUX_ROLES and right not in _AUX_ROLES
+
+
+def _shingle_set(text: str, size: int = 8) -> set[int]:
+    compact = re.sub(r"\s+", "", (text or "").lower())
+    if len(compact) <= size:
+        return set()
+    return {hash(compact[index:index + size]) for index in range(len(compact) - size + 1)}
+
+
+def _text_overlap(left: str, right: str) -> float:
+    """8 字 shingle 的 Jaccard：同一篇的修订约 0.15–0.3，不同文档通常 < 0.02。"""
+    left_shingles, right_shingles = _shingle_set(left), _shingle_set(right)
+    if not left_shingles or not right_shingles:
+        return 0.0
+    return len(left_shingles & right_shingles) / len(left_shingles | right_shingles)
+
+
 def _text_for_version(conn: sqlite3.Connection, version_id: str) -> str:
     parts: list[str] = []
     total = 0
@@ -243,6 +292,15 @@ def rebuild(conn: sqlite3.Connection) -> dict:
         if root_a != root_b:
             parent[root_b] = root_a
 
+    text_cache: dict[str, str] = {}
+
+    def asset_text(asset: dict) -> str:
+        text = text_cache.get(asset["asset_id"])
+        if text is None:
+            text = _text_for_version(conn, asset["version_id"])
+            text_cache[asset["asset_id"]] = text
+        return text
+
     by_hash: dict[str, list[dict]] = {}
     for asset in assets:
         if asset["hash"]:
@@ -289,8 +347,19 @@ def rebuild(conn: sqlite3.Connection) -> dict:
                     continue
                 if not first["simhash"] or not second["simhash"]:
                     continue
-                if _hamming(first["simhash"], second["simhash"]) <= STRICT_DISTANCE \
-                        and _same_title(first, second):
+                if not _merge_roles_compatible(first, second):
+                    continue
+                distance = _hamming(first["simhash"], second["simhash"])
+                if distance <= STRICT_DISTANCE and _same_title(first, second):
+                    union(first["asset_id"], second["asset_id"])
+                    continue
+                # 同一篇的修订（标题相同、正文大面积重合）允许更宽的 simhash 距离；
+                # 同模板的另一份文档（如课件章节）标题也相同，但 shingle 重合度极低。
+                if (distance <= TITLE_PAIR_DISTANCE
+                        and min(first["chars"], second["chars"]) >= SHINGLE_SAMPLE
+                        and difflib.SequenceMatcher(
+                            None, first["title"], second["title"]).ratio() >= TITLE_PAIR_RATIO
+                        and _text_overlap(asset_text(first), asset_text(second)) >= TEXT_OVERLAP_MIN):
                     union(first["asset_id"], second["asset_id"])
 
     clusters: dict[str, list[dict]] = {}
