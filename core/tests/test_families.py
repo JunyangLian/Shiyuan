@@ -299,6 +299,53 @@ def test_explicit_version_query_returns_that_version(conn, tmp_path):
     assert first["family_latest_version_label"] == "0.3"
 
 
+def test_list_document_families_query_filters(conn, tmp_path):
+    """query 必须真正过滤；查不到就返回空，而不是退回全量列表。"""
+    _seed_versions(conn, tmp_path)
+    families.rebuild(conn)
+    server = MCPServer(conn)
+
+    def call(query: str) -> dict:
+        response = server.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "list_document_families", "arguments": {"query": query}},
+        })
+        return json.loads(response["result"]["content"][0]["text"])
+
+    assert call("论文")["total"] >= 1
+    assert call("zzzqqq 不存在的关键词")["total"] == 0
+
+
+def test_compare_versions_output_is_capped(conn, tmp_path):
+    _seed_versions(conn, tmp_path)
+    families.rebuild(conn)
+    family = conn.execute("SELECT family_id FROM document_families").fetchone()
+    members = families.family_members(conn, family["family_id"])
+    by_name = {member["name"]: member["asset_id"] for member in members}
+
+    server = MCPServer(conn)
+    response = server.handle({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "compare_versions", "arguments": {
+            "family_id": family["family_id"],
+            "left_asset_id": by_name["论文初稿.md"],
+            "right_asset_id": by_name["论文终稿.md"],
+            "limit": 1,
+            "max_chars": 100,
+        }},
+    })
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["limit"] == 1
+    assert payload["max_chars"] == 100
+    assert all(len(item["text"]) <= 100 for item in payload["shared"])
+    assert all(len(item["text"]) <= 100 for item in payload["removed"])
+    assert all(len(item["text"]) <= 100 for item in payload["added"])
+    for item in payload["modified"]:
+        assert len(item["left"]["text"]) <= 100
+        assert len(item["right"]["text"]) <= 100
+    assert all(value <= 1 for value in payload["returned"].values())
+
+
 def test_unlabeled_duplicate_family_has_unknown_latest(conn, tmp_path):
     """只有重复副本、没有版本标记的家族不能声称存在“最新版本”。"""
     root = tmp_path / "重复"

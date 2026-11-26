@@ -439,8 +439,19 @@ def scan_source(conn: sqlite3.Connection, source_id: str) -> dict:
     except Exception:  # noqa: BLE001 - 项目联动失败不应让扫描整体失败
         pass
 
+    # Office 锁文件（~$xxx.docx）不是用户内容：早期版本可能把它们收进了索引，
+    # 这里直接移除，避免每次扫描都把它们算成“磁盘上不见了”。
+    lock_locations = [
+        row["location_id"] for row in existing
+        if Path(row["path"]).name.startswith("~$")
+    ]
+    if lock_locations:
+        store.drop_locations(conn, lock_locations)
+    ignored = set(lock_locations)
     counters["missing"] = store.mark_missing(
-        conn, [row["location_id"] for row in existing if row["location_id"] not in seen]
+        conn,
+        [row["location_id"] for row in existing
+         if row["location_id"] not in seen and row["location_id"] not in ignored],
     )
     conn.execute(
         "UPDATE sources SET health = 'ok', last_scan_at = ? WHERE source_id = ?",

@@ -421,7 +421,9 @@ class MCPServer:
                 "title": "Compare two versions",
                 "description": (
                     "Compare two assets in the same document family: shared, left-only, "
-                    "right-only and modified content groups."
+                    "right-only and modified content groups. Returns a capped sample per "
+                    "category (summary always has the full counts); raise limit or "
+                    "max_chars only when the sample is not enough."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -429,6 +431,16 @@ class MCPServer:
                         "family_id": {"type": "string"},
                         "left_asset_id": {"type": "string"},
                         "right_asset_id": {"type": "string"},
+                        "limit": {
+                            "type": "integer", "minimum": 1, "maximum": 100,
+                            "default": 10,
+                            "description": "Max content groups per category.",
+                        },
+                        "max_chars": {
+                            "type": "integer", "minimum": 100, "maximum": 2000,
+                            "default": 400,
+                            "description": "Max characters of each paragraph text.",
+                        },
                     },
                     "required": ["family_id", "left_asset_id", "right_asset_id"],
                 },
@@ -988,12 +1000,34 @@ class MCPServer:
         family_id = _string(args, "family_id")
         left = _string(args, "left_asset_id")
         right = _string(args, "right_asset_id")
+        limit = _integer(args, "limit", 10, 1, 100)
+        max_chars = _integer(args, "max_chars", 400, 100, 2000)
         self._ensure_visible(left)
         self._ensure_visible(right)
         try:
-            return families.diff_versions(self.conn, family_id, left, right)
+            result = families.diff_versions(self.conn, family_id, left, right, limit=limit)
         except Exception as exc:  # noqa: BLE001 - 参数错误原样返回
             raise ToolError(f"无法比较版本：{exc}") from exc
+
+        def clip(item: dict) -> dict:
+            text = item.get("text") or ""
+            if len(text) > max_chars:
+                return {**item, "text": text[:max_chars], "text_truncated": True}
+            return item
+
+        result["shared"] = [clip(item) for item in result["shared"]]
+        result["removed"] = [clip(item) for item in result["removed"]]
+        result["added"] = [clip(item) for item in result["added"]]
+        result["modified"] = [
+            {**item, "left": clip(item["left"]), "right": clip(item["right"])}
+            for item in result["modified"]
+        ]
+        result["returned"] = {
+            key: len(result[key]) for key in ("shared", "removed", "added", "modified")
+        }
+        result["limit"] = limit
+        result["max_chars"] = max_chars
+        return result
 
     def _related_documents(self, args: dict) -> dict:
         asset_id = _string(args, "asset_id", required=False)
@@ -1146,7 +1180,9 @@ class MCPServer:
                 ).lower()
                 if query in haystack:
                     matched.append(item)
-        selected = matched if query and matched else items
+        # 指定 query 时只返回命中的家族；不做“查不到就退回全部”的兜底，
+        # 否则外部 Agent 会以为过滤生效，实际拿到的是全量列表。
+        selected = matched if query else items
         selected.sort(key=lambda item: (-item["size"], -item["latest_mtime_ns"]))
         return {"total": len(selected), "items": selected[:limit]}
 

@@ -270,6 +270,44 @@ def _purge_content_cache(conn: sqlite3.Connection, asset_id: str) -> None:
     )
 
 
+def drop_locations(conn: sqlite3.Connection, location_ids: list[str]) -> int:
+    """删除指定位置；资产没有其他位置时一并清掉派生缓存。
+
+    用于策略性排除的文件（如 Office 锁文件）从索引中移除。
+    """
+    if not location_ids:
+        return 0
+    asset_ids: set[str] = set()
+    with conn:
+        for location_id in location_ids:
+            row = conn.execute(
+                "SELECT asset_id FROM asset_locations WHERE location_id = ?",
+                (location_id,),
+            ).fetchone()
+            if row is None:
+                continue
+            asset_ids.add(row["asset_id"])
+            conn.execute(
+                "DELETE FROM asset_locations WHERE location_id = ?", (location_id,))
+        for asset_id in asset_ids:
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM asset_locations WHERE asset_id = ?", (asset_id,)
+            ).fetchone()[0]
+            if remaining:
+                continue
+            conn.execute("DELETE FROM project_assets WHERE asset_id = ?", (asset_id,))
+            _purge_content_cache(conn, asset_id)
+            conn.execute(
+                "DELETE FROM document_family_members WHERE asset_id = ?", (asset_id,))
+            conn.execute(
+                "DELETE FROM family_content_sources WHERE asset_id = ?", (asset_id,))
+            conn.execute(
+                "DELETE FROM chunk_embeddings WHERE asset_id = ?", (asset_id,))
+            conn.execute("DELETE FROM content_versions WHERE asset_id = ?", (asset_id,))
+            conn.execute("DELETE FROM assets WHERE asset_id = ?", (asset_id,))
+    return len(location_ids)
+
+
 def remove_source(conn: sqlite3.Connection, source_id: str) -> dict[str, int]:
     """撤销授权：删除该数据源的全部派生记录，缓存不能绕过权限继续暴露。"""
     source = get_source(conn, source_id)

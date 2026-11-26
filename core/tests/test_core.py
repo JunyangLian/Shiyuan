@@ -43,6 +43,38 @@ def test_l0_scan_and_search_by_name(conn, tree):
     assert hits["items"][0]["index_level"] == "L0"
 
 
+def test_scan_drops_legacy_office_lock_rows(conn, tmp_path):
+    root = tmp_path / "大学"
+    root.mkdir()
+    (root / "笔记.md").write_text("正常内容，样本量 42\n", encoding="utf-8")
+    (root / "~$论文.docx").write_bytes(b"owner-lock")
+    source = store.add_source(conn, root)
+    scanner.scan_source(conn, source["source_id"])
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM asset_locations WHERE path LIKE '%~$%'").fetchone()[0] == 0
+
+    # 模拟旧版本遗留的锁文件记录：它不应在下次扫描时变成 MISSING。
+    note = conn.execute("SELECT * FROM asset_locations LIMIT 1").fetchone()
+    conn.execute(
+        "INSERT INTO asset_locations (location_id, asset_id, source_id, path, rel_path,"
+        " native_file_id, availability, size, mtime_ns, ext, first_seen_at, last_seen_at)"
+        " VALUES ('loc_legacy_lock', ?, ?, ?, '~$论文.docx', NULL, 'AVAILABLE', 10, 1,"
+        " 'docx', ?, ?)",
+        (note["asset_id"], source["source_id"],
+         str(root / "~$论文.docx"), note["first_seen_at"], note["last_seen_at"]),
+    )
+    conn.commit()
+
+    result = scanner.scan_source(conn, source["source_id"])
+    assert result["missing"] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM asset_locations WHERE location_id = 'loc_legacy_lock'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM asset_locations WHERE availability = 'MISSING'").fetchone()[0] == 0
+
+
 def test_search_supports_cjk_tokens_and_path(conn, tree):
     source = store.add_source(conn, tree)
     _scan(conn, source["source_id"])
