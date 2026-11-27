@@ -117,14 +117,34 @@
 
 - 系统：Windows 10 / 11（x64）
 - 安装目录：`%LOCALAPPDATA%\SourceLoom\`
-- 数据目录：安装目录下 `data\`（数据库、向量、令牌与日志都在这里，跟随安装位置；
-  可用 `SHIYUAN_HOME` 覆盖为任意目录）
-- 卸载或升级不会删除 `data\`：卸载器只清理安装清单内的文件，知识库与授权记录都保留
+- 数据目录：安装目录下的 `data\`（见下节），跟随安装位置，卸载或升级都不会删除
 - 安装版启动时自动拉起核心进程，窗口关闭时结束；若 8737 端口已有核心在跑则直接复用
 
-> **命名与兼容**：英文名是 SourceLoom，但为了不破坏已有数据目录、MCP 配置与命令行，
-> 内部仍沿用 `shiyuan`：数据目录 `ShiyuanData`、核心 `shiyuan-core.exe`、MCP 服务名 `shiyuan-mcp`、
-> 数据库 `shiyuan.db`。改名只影响窗口、安装包与品牌展示。
+### 数据目录
+
+从 v0.3.3 起，安装版的数据**跟着安装位置走**，不再固定写到 `%LOCALAPPDATA%\ShiyuanData\`：
+
+| 路径 | 内容 |
+| --- | --- |
+| `data\shiyuan.db` | SQLite 主库：文件资产、正文分块、FTS 索引、向量、文档家族、项目关系与设置（WAL 模式，运行时会伴随 `-wal` / `-shm`） |
+| `data\api-token` | 本机进程级访问令牌（核心每次启动重写，桌面端与 MCP 都读这里） |
+| `data\core.log` | 核心运行日志 |
+| `data\evals\` | 本地评测集（放进去才会用到） |
+
+目录解析按优先级：
+
+1. `SHIYUAN_HOME` 环境变量：指向哪里就用哪里（适合把库放到另一块盘或网盘）
+2. 安装版：`<安装目录>\data\`
+3. 源码运行（`python -m shiyuan` / `npm run tauri dev`）：`%LOCALAPPDATA%\ShiyuanData\`
+
+> **从 0.3.2 及更早版本升级**：旧库在 `%LOCALAPPDATA%\ShiyuanData\`。升级前退出拾源，
+> 把该目录下的 `shiyuan.db`、`shiyuan.db-wal`、`shiyuan.db-shm`（存在才复制）复制到
+> `<安装目录>\data\`，或直接设置 `SHIYUAN_HOME` 指向旧目录。
+> 备份 / 迁移同理：整体复制 `data\` 即可，路径变化不会改变文件资产的原件位置。
+
+> **命名与兼容**：英文名是 SourceLoom，但为了不破坏已有命令行与 MCP 配置，
+> 内部仍沿用 `shiyuan`：核心 `shiyuan-core.exe`、数据库 `shiyuan.db`、MCP 服务名 `shiyuan-mcp`；
+> 源码运行的数据目录仍叫 `ShiyuanData`。改名只影响窗口、安装包与品牌展示。
 
 ## 五分钟上手
 
