@@ -30,7 +30,8 @@ core/build/
 # Tauri sidecar 产物（由 core/dist 复制而来，不入库）
 desktop/src-tauri/binaries/
 
-# 本地数据
+# 本地数据（知识库、向量、令牌、日志都放这里，不入库）
+data/
 *.db
 *.db-wal
 *.db-shm

@@ -15,14 +15,14 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 291 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 294 passed | `cd core && python -m pytest -q` |
 | 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
 | 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
 | 前端单元测试 | 17 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `SourceLoom_0.3.2_x64-setup.exe`（约 138MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），打包后核心 MCP 握手约 1.6 秒 |
+| 桌面端安装包 | 完成 | `SourceLoom_0.3.3_x64-setup.exe`（138.6MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI）；安装版数据目录为 `<安装根>\data`，静默安装后实测核心在该目录写令牌并启动，`SHIYUAN_HOME` 覆盖仍生效 |
 
 ## 二、已实现范围（M1）
 
@@ -98,9 +98,9 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 - **CORS 收紧**：只允许 `http://localhost:1420`、`http://127.0.0.1:1420`、
   `http://tauri.localhost`、`https://tauri.localhost`、`tauri://localhost`；CORS 作为最外层，
   401 也带跨域头。测试覆盖无令牌、错令牌、两种头、允许/拒绝来源与 401 的 ACAO。
-- **前端取令牌**：Tauri 新增 `api_token` 命令按 `SHIYUAN_HOME` / `LOCALAPPDATA\ShiyuanData`
-  读取文件；`api.ts` 缓存令牌，401 时清缓存重取一次；浏览器开发模式由 Vite
-  `/__shiyuan_token` 读取同一文件。首次启动最多重试 30 秒。
+- **前端取令牌**：Tauri `api_token` 命令按 `SHIYUAN_HOME` → 安装目录 `data\`（release）→
+  `LOCALAPPDATA\ShiyuanData`（源码调试）读取文件；`api.ts` 缓存令牌，401 时清缓存重取一次；
+  浏览器开发模式由 Vite `/__shiyuan_token` 读取同一文件。首次启动最多重试 30 秒。
 - **单实例**：`shiyuan/instance.py` 用命名互斥量 `Local\ShiyuanHttpCore-{port}` 防止两个 HTTP
   核心同时写令牌；sidecar 与 `python -m shiyuan` 共用，MCP 模式不受影响。
 - **API Key / DPAPI**：`secrets_store.py` 用 `CryptProtectData`（固定 entropy，绑定当前 Windows 用户）
@@ -127,8 +127,12 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 3. **强制结束桌面端会残留核心**：任务管理器结束进程不触发 `RunEvent::Exit`，sidecar 会继续
    监听 8737；下次启动会复用它（不重复拉起）。命名互斥量已避免同一端口出现两个 HTTP 核心，
    但用户仍无法从界面关闭该后台进程。
-4. **数据目录与安装目录分离**：`APP_DIR_NAME` 改为 `ShiyuanData`，避免 NSIS 卸载处理
-   `%LOCALAPPDATA%\Shiyuan` 时波及知识库；README 与文档中的路径已同步。
+4. ~~**数据目录与安装目录分离**~~：v0.3.3 起改为「数据跟着安装位置走」。安装版
+   `config.app_home()` 在冻结环境解析 `<安装根>\data`（`sys.executable` 向上三级），
+   Rust `api_token` 同步改读 `resource_dir()\data`；`SHIYUAN_HOME` 仍是最高优先级覆盖。
+   实测 Tauri v2 NSIS 卸载器（`/S` 静默）**不递归删除 `$INSTDIR`**，只删安装清单内文件，
+   因此 `<安装根>\data` 在卸载/升级中天然保留（测试用 `C:\SLTest` + marker 文件验证）。
+   源码运行仍用 `%LOCALAPPDATA%\ShiyuanData`，避免开发时污染安装目录。
 5. **扫描进度不可见**：`_running` 与 follow-up 都是进程内状态，界面只能看到"扫描中"与上次结果；
    重启会丢失运行态；若进程在 follow-up 前崩溃，仍要等周期对账补齐。
 6. **API 默认端口写死 8737**：仅 `SHIYUAN_PORT` 可改，前端代理与 sidecar 探测未同步。

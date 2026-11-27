@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from shiyuan import db, scanner, search, store
+from shiyuan import config, db, scanner, search, store
 
 
 @pytest.fixture()
@@ -247,3 +248,29 @@ def test_api_pause_and_events(client, tree):
     events = client.get("/api/events").json()["items"]
     assert events[0]["type"] == "source_state"
     assert client.post(f"/api/sources/{source_id}/state", params={"state": "bogus"}).status_code == 422
+
+
+def test_app_home_prefers_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHIYUAN_HOME", str(tmp_path / "home"))
+    assert config.app_home() == tmp_path / "home"
+
+
+def test_app_home_follows_install_dir_when_frozen(tmp_path, monkeypatch):
+    """安装版把数据写在 <安装根>\\data，跟随安装位置而不是固定到 LOCALAPPDATA。"""
+    monkeypatch.delenv("SHIYUAN_HOME", raising=False)
+    install = tmp_path / "SourceLoom"
+    exe = install / "binaries" / "shiyuan-core" / "shiyuan-core.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"stub")
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe))
+
+    assert config.app_home() == install / "data"
+    assert (install / "data").is_dir()
+
+
+def test_app_home_uses_localappdata_for_source_runs(tmp_path, monkeypatch):
+    monkeypatch.delenv("SHIYUAN_HOME", raising=False)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    assert config.app_home() == tmp_path / "local" / config.APP_DIR_NAME

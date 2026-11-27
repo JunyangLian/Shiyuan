@@ -3,21 +3,43 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
-# 不能与安装目录同名：NSIS 默认装到 %LOCALAPPDATA%\Shiyuan，卸载会递归删除该目录，
-# 若知识库也在其中，用户数据会随卸载一起丢失。
+# 源码运行时数据目录名（%LOCALAPPDATA%\ShiyuanData）。
+# 安装版改写到安装根目录下的 data\，数据库、向量、令牌都跟着安装位置走。
 APP_DIR_NAME = "ShiyuanData"
 
 
+def _frozen_data_dir() -> Path | None:
+    """安装版的数据目录：<安装根>\\data。
+
+    核心可执行文件位于 <安装根>\\binaries\\shiyuan-core\\shiyuan-core.exe，
+    向上三级即安装根；桌面端 Rust 侧按同一规则解析 api-token。
+    """
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = Path(sys.executable).resolve()
+    if len(exe.parents) < 3:
+        return None
+    return exe.parents[2] / "data"
+
+
 def app_home() -> Path:
-    """应用数据目录。测试通过 SHIYUAN_HOME 覆盖，避免污染真实用户目录。"""
+    """应用数据目录，优先级：SHIYUAN_HOME > 安装目录 data\\ > %LOCALAPPDATA%\\ShiyuanData。
+
+    测试通过 SHIYUAN_HOME 覆盖，避免污染真实用户目录。
+    """
     override = os.environ.get("SHIYUAN_HOME")
     if override:
         base = Path(override)
     else:
-        local_appdata = os.environ.get("LOCALAPPDATA")
-        base = Path(local_appdata) / APP_DIR_NAME if local_appdata else Path.home() / f".{APP_DIR_NAME.lower()}"
+        frozen = _frozen_data_dir()
+        if frozen is not None:
+            base = frozen
+        else:
+            local_appdata = os.environ.get("LOCALAPPDATA")
+            base = Path(local_appdata) / APP_DIR_NAME if local_appdata else Path.home() / f".{APP_DIR_NAME.lower()}"
     base.mkdir(parents=True, exist_ok=True)
     return base
 

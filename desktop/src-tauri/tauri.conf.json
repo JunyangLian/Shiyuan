@@ -2,7 +2,7 @@
   "$schema": "../../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "SourceLoom",
   "mainBinaryName": "SourceLoom",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "identifier": "app.shiyuan.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",

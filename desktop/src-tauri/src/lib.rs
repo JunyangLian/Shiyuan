@@ -29,10 +29,17 @@ fn core_executable(app: &tauri::AppHandle) -> Option<PathBuf> {
 }
 
 /// 读取核心启动时写入的进程级访问令牌，交给前端放进 Authorization 头。
+/// 数据目录规则与核心 config.app_home() 保持一致：
+/// SHIYUAN_HOME > 安装目录 data\（release）> %LOCALAPPDATA%\ShiyuanData（源码调试）。
 #[tauri::command]
-fn api_token() -> Result<String, String> {
+fn api_token(app: tauri::AppHandle) -> Result<String, String> {
     let base = if let Ok(home) = std::env::var("SHIYUAN_HOME") {
         PathBuf::from(home)
+    } else if !cfg!(debug_assertions) {
+        app.path()
+            .resource_dir()
+            .map_err(|err| format!("无法确定安装目录：{err}"))?
+            .join("data")
     } else if let Ok(local) = std::env::var("LOCALAPPDATA") {
         PathBuf::from(local).join("ShiyuanData")
     } else {
