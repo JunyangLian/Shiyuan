@@ -256,7 +256,7 @@ def pending_rows(conn: sqlite3.Connection, source_id: str | None = None,
         "AND NOT EXISTS (SELECT 1 FROM parse_artifacts a"
         " WHERE a.version_id = v.version_id AND a.parser_signature = ?)",
     ]
-    params: list[str] = [*exts, PARSER_SIGNATURE]
+    params: list = [*exts, PARSER_SIGNATURE]
     if source_id:
         sql.append("AND l.source_id = ?")
         params.append(source_id)
@@ -285,7 +285,7 @@ def pending_count(conn: sqlite3.Connection, source_id: str | None = None,
         "AND NOT EXISTS (SELECT 1 FROM parse_artifacts a"
         " WHERE a.version_id = v.version_id AND a.parser_signature = ?)",
     ]
-    params: list[str] = [*exts, PARSER_SIGNATURE]
+    params: list = [*exts, PARSER_SIGNATURE]
     if source_id:
         sql.append("AND l.source_id = ?")
         params.append(source_id)

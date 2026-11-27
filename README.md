@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/JunyangLian/SourceLoom)](https://github.com/JunyangLian/SourceLoom/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/JunyangLian/SourceLoom/total)](https://github.com/JunyangLian/SourceLoom/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
-![Version](https://img.shields.io/badge/version-0.3.1-005E9B)
+![Version](https://img.shields.io/badge/version-0.3.2-005E9B)
 
 [下载安装包](https://github.com/JunyangLian/SourceLoom/releases/latest) · [产品需求](docs/PRD.md) · [项目知识空间](docs/PROJECTS.md) · [解析说明](docs/INGESTION.md) · [开发断点](docs/BREAKPOINT.md)
 
@@ -42,8 +42,12 @@
 
 - 授权本地目录后自动扫描，记录文件名、路径、大小、修改时间与稳定文件 ID，支持增量对账
 - 实时监听（1.5s 去抖 + 10s 封顶），同盘移动 / 改名沿用同一 `asset_id`；周期对账兜住休眠与事件丢失
-- 解析 TXT/MD/代码、DOCX、PPTX、PDF 文本层、XLSX（值 + 公式）、旧版 Office（经 LibreOffice）、
-  EML/MSG、DXF；音视频只取元数据；超过 64MB 的纯文本按前 8MB 头部采样，不再整文件跳过
+- 解析 **TXT / MD / RST / 配置与源码**（ini·cfg·conf·toml·yaml·properties·py·js·ts·java·vue 等）、
+  **CSV / TSV**、**DOCX**、**PPTX**、**PDF 文本层**、**XLSX**（值 + 公式）、
+  **旧版 Office 与开放文档格式**（DOC / PPT / XLS / ODT / RTF / ODS / ODP / PPTM，经 LibreOffice）、
+  **EML / MSG / MBOX**、**DXF**；音视频只取元数据；超过 64MB 的纯文本按前 8MB 头部采样，不再整文件跳过
+- **支持格式是显式清单**：未知后缀一律「仅登记」，不按内容猜格式；`.assembly` 这类流程中间产物不会被当成正文。
+  生信等专用格式计划以可插拔的「增强包」提供（见 [docs/BREAKPOINT.md](docs/BREAKPOINT.md) 待办）
 - 压缩包（ZIP/7Z/RAR）默认「仅登记」：只记录文件名、路径与大小，不解压；确有需要时可在盘点策略里
   改为标准解析（临时目录解压，限制条目数、单文件与总量）
 - 解析结果区分「待解析 / 仅登记 / 暂不支持」，策略性跳过不会显示成处理积压
@@ -290,7 +294,7 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 284 passed（另需 pip install pytest httpx）
+cd core; python -m pytest -q          # 291 passed（另需 pip install pytest httpx）
 cd desktop; npm test                  # 17 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR

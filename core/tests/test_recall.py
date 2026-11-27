@@ -297,6 +297,29 @@ def test_same_name_tsv_copies_form_one_family(conn, tmp_path):
     assert len(set(ids)) == 1
 
 
+def test_identifier_token_outranks_topic_words(conn, tmp_path):
+    """查询带编号（JL1）时，含该编号的数据文件要压过只命中中文主题词的旧文档。"""
+    _source(conn, tmp_path, {
+        "褐篮子鱼基因组组装统计.md":
+            "染色体水平基因组组装统计，scaffold N50 与总长度见附表。" * 3,
+        "Genome_Assembly_Stats.csv":
+            "Sample,Type,N50,Total_length\nJL1,Scaffold,30500180,3103712985\n",
+    })
+    question = "JL1 染色体级组装的 scaffold N50 是多少"
+
+    chunks = retrieval.find_chunks(conn, question)
+    assert chunks[0].path.endswith("Genome_Assembly_Stats.csv")
+
+    results = search.search(conn, question)
+    assert results["items"][0]["name"] == "Genome_Assembly_Stats.csv"
+
+
+def test_generic_metric_names_are_not_identifiers():
+    """N50 这类通用指标名不算编号，否则所有组装统计都会被同等加权。"""
+    assert query.query_identifiers("scaffold N50 是多少") == []
+    assert query.query_identifiers("JL1 hap1 的 N50") == ["jl1", "hap1"]
+
+
 def test_answer_citation_includes_version_and_mtime(conn, tmp_path):
     _source(conn, tmp_path, {"记录.md": "本次样本量 42 例\n"})
 

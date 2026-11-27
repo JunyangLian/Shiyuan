@@ -148,6 +148,12 @@ SYNONYMS = {
     "比对": ["alignment", "align"],
     "跨度": ["spanning", "span"],
     "连接": ["join", "joins", "junction"],
+    # 中文问题、英文文件名/正文的常见对应（组装与共线性图谱类数据）。
+    "热图": ["heatmap", "heat map", "hic"],
+    "分辨率": ["resolution"],
+    "金鱼": ["goldfish", "carassius"],
+    "鲫鱼": ["goldfish", "carassius", "crucian"],
+    "鲤鱼": ["carp", "cyprinus"],
     "参数": ["parameter", "param"],
     "脚本": ["script"],
     "微卫星": ["microsatellite", "ssr"],
@@ -185,6 +191,26 @@ MAX_CONCEPTS = 24
 SETTINGS_KEY = "query"
 MAX_CUSTOM_GROUPS = 50
 MAX_TERM_LEN = 32
+
+# 查询里的编号/标识符（JL1、hap1、Chr41、GCF_000951615）是最强的区分信号：
+# 不含该标识符的文档即使命中更多中文泛词，也不该压过含它的数据文件。
+_IDENTIFIER = re.compile(
+    r"(?<![a-z0-9])([a-z][a-z0-9_]{1,15}\d[a-z0-9_]*)(?![a-z0-9])")
+# N10-N90 是每份组装统计都有的通用指标名，不构成区分。
+_IDENTIFIER_GENERIC = {"n10", "n20", "n30", "n40", "n50", "n60", "n70", "n80", "n90"}
+IDENTIFIER_BONUS = 400
+MAX_IDENTIFIERS = 6
+
+
+def query_identifiers(text: str) -> list[str]:
+    """抽取查询里的编号型标识符；纯数字、纯字母与通用指标名都排除。"""
+    found: list[str] = []
+    for match in _IDENTIFIER.finditer(normalize(text)):
+        token = match.group(1)
+        if token in _IDENTIFIER_GENERIC or token in found:
+            continue
+        found.append(token)
+    return found[:MAX_IDENTIFIERS]
 
 
 def normalize(text: str) -> str:

@@ -33,15 +33,22 @@ TEXT_EXTS = {
     "toml", "ini", "cfg", "conf", "xml", "html", "htm", "css", "js", "jsx",
     "ts", "tsx", "py", "ipynb", "java", "c", "h", "cpp", "hpp", "cs", "go",
     "rs", "rb", "php", "sh", "bat", "ps1", "sql", "r", "m", "tex", "bib", "pl",
+    # 盘点策略里声明为标准解析的纯文本/源码类型，必须与解析器能力一致，
+    # 否则会显示「可解析」却永远解析失败。
+    "rst", "cmd", "jsp", "kt", "kts", "scala", "lua", "svelte", "vue",
 }
 PDF_EXTS = {"pdf"}
 DOCX_EXTS = {"docx"}
 PPTX_EXTS = {"pptx"}
 SHEET_EXTS = {"xlsx", "xlsm"}
-# 旧版 Office 由 LibreOffice 转成 OOXML 后再走同一套解析；转换产物只写临时目录。
-LEGACY_EXTS = {"doc": "docx", "ppt": "pptx", "xls": "xlsx"}
+# 旧版 Office 与开放文档格式统一由 LibreOffice 转成 OOXML 后再走同一套解析；
+# 转换产物只写临时目录。未安装 LibreOffice 时明确报错，不静默当成无文本。
+LEGACY_EXTS = {
+    "doc": "docx", "ppt": "pptx", "xls": "xlsx",
+    "odt": "docx", "rtf": "docx", "ods": "xlsx", "odp": "pptx", "pptm": "pptx",
+}
 ARCHIVE_EXTS = {"zip", "7z", "rar"}
-EMAIL_EXTS = {"eml", "msg"}
+EMAIL_EXTS = {"eml", "msg", "mbox"}
 CAD_EXTS = {"dxf", "dwg"}
 AUDIO_EXTS = {"mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma", "aiff"}
 VIDEO_EXTS = {"mp4", "m4v", "mov", "wmv", "avi", "mkv", "webm", "flv"}
@@ -1096,7 +1103,8 @@ def extract(path: str | Path, ext: str) -> list[Section]:
     elif suffix in ARCHIVE_EXTS:
         sections = _read_archive(target, suffix)
     elif suffix in EMAIL_EXTS:
-        sections = _read_eml(target) if suffix == "eml" else _read_msg(target)
+        # mbox 是 RFC 822 文本归档，与 eml 同一套解析；只有 msg 走 Outlook 容器。
+        sections = _read_eml(target) if suffix in {"eml", "mbox"} else _read_msg(target)
     elif suffix in CAD_EXTS:
         sections = _read_dxf(target) if suffix == "dxf" else _read_dwg(target)
     elif suffix in MEDIA_EXTS:

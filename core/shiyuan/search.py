@@ -82,7 +82,8 @@ def _content_hits(conn: sqlite3.Connection, text: str, analysis: dict, *,
                   source_id: str | None, ext: str | None,
                   allowed_assets: set[str] | None = None,
                   excluded_assets: set[str] | None = None,
-                  path_index: dict | None = None) -> dict[str, dict]:
+                  path_index: dict | None = None,
+                  identifiers: list[str] | None = None) -> dict[str, dict]:
     hits: dict[str, dict] = {}
     maximal = query.maximal_terms(analysis)
     total = max(1, len(maximal))
@@ -101,6 +102,10 @@ def _content_hits(conn: sqlite3.Connection, text: str, analysis: dict, *,
             "concepts": hit.concepts,
             "variants": hit.variants,
             "coverage": hit.maximal / total,
+            # 只统计正文命中的编号：文件路径里带 JL1 的分组文件很多，
+            # 但真正含数值的是正文恰好命中编号的统计文件。
+            "identifier_hits": retrieval.hit_identifier_hits(
+                hit.text, "", identifiers or []),
         }
     return hits
 
@@ -189,6 +194,7 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
 
     analysis = query.analyze(text, synonyms=query.synonym_map(conn))
     maximal = query.maximal_terms(analysis)
+    identifiers = query.query_identifiers(text)
     # 编号/文件名式查询靠精确词面，语义只会引入近义噪声。
     lookup = _is_lookup(text)
     latest_intent = bool(_LATEST_QUERY.search(text))
@@ -210,7 +216,8 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
     content_hits = _content_hits(conn, text, analysis, source_id=source_id, ext=ext,
                                  allowed_assets=allowed_assets,
                                  excluded_assets=excluded_assets,
-                                 path_index=path_index)
+                                 path_index=path_index,
+                                 identifiers=identifiers)
 
     vector_hits: dict[str, dict] = {}
     vector_used = False
@@ -286,6 +293,18 @@ def search(conn: sqlite3.Connection, q: str, *, limit: int = 50, offset: int = 0
         content = content_hits.get(location_id)
         semantic = vector_hits.get(location_id)
         name_matched = path_match is not None
+        if identifiers:
+            # 查询带编号（JL1 / hap1 / Chr41）时：正文含编号最可信，
+            # 仅路径含编号次之；完全不含编号的文档整体下沉，
+            # 避免被「染色体水平基因组组装」这类同主题文件名压住。
+            content_ids = (int(content.get("identifier_hits", 0))
+                           if content else 0)
+            lowered_path = (row["path"] or "").lower()
+            path_ids = sum(1 for token in identifiers if token in lowered_path)
+            if content_ids or path_ids:
+                score += 600 * content_ids + 250 * path_ids
+            else:
+                score -= 900 * len(identifiers)
         if content:
             # 正文候选必须保留 retrieval 的概念/变体命中数，否则同分后会被
             # mtime 排序淹没（例如唯一编号被近期文件挤出前 5）。

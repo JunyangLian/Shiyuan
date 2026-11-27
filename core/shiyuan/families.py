@@ -22,7 +22,7 @@ import threading
 from collections import Counter
 from pathlib import Path
 
-from . import db, indexer, inventory, knowledge, store
+from . import db, indexer, inventory, knowledge, query, store
 
 RULES_VERSION = "family.v3"
 TEXT_LIMIT = 20_000
@@ -1074,7 +1074,8 @@ def dedupe_chunk_hits(conn: sqlite3.Connection, hits: list, *,
     def sort_key(hit) -> tuple:
         # 位置问题按完整路径分排序；其它问题保留原来的 300 分上限。
         path_score = hit.path_score if path_only else min(hit.path_score, 300)
-        return (-(hit.focus * 120 + hit.maximal_weight + path_score),
+        return (-(hit.focus * 120 + hit.maximal_weight
+                  + hit.identifier_hits * query.IDENTIFIER_BONUS + path_score),
                 -hit.concepts, -hit.variants, -len(hit.text))
 
     mapping = family_map(conn)

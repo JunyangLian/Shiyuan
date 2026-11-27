@@ -63,6 +63,33 @@ def test_text_content_is_searchable(conn, tmp_path):
     assert "NovaSeq" in item["snippet"]
 
 
+def test_extra_text_formats_are_searchable(conn, tmp_path):
+    """盘点声明可解析的文本类型（.rst/.vue 等）必须真的能搜到。"""
+    root = tmp_path / "配置"
+    root.mkdir()
+    (root / "说明.rst").write_text("测序平台说明：NovaSeq\n", encoding="utf-8")
+    (root / "部件.vue").write_text(
+        "<template><div>KylinChart</div></template>\n", encoding="utf-8")
+    _scan_and_index(conn, root)
+
+    assert search.search(conn, "NovaSeq")["total"] == 1
+    assert search.search(conn, "KylinChart")["total"] == 1
+
+
+@pytest.mark.skipif(extractors.soffice_path() is None, reason="需要 LibreOffice")
+def test_rtf_is_converted_and_indexed(conn, tmp_path):
+    """RTF 属于通用文档格式：经 LibreOffice 转换后应能检索正文。"""
+    root = tmp_path / "旧文档"
+    root.mkdir()
+    (root / "记录.rtf").write_text(
+        r"{\rtf1\ansi Kylin sample size 42}", encoding="ascii")
+    _scan_and_index(conn, root)
+
+    hits = search.search(conn, "Kylin")
+    assert hits["total"] == 1
+    assert hits["items"][0]["name"] == "记录.rtf"
+
+
 def test_short_cjk_query_uses_like_fallback(conn, tmp_path):
     root = tmp_path / "资料"
     root.mkdir()

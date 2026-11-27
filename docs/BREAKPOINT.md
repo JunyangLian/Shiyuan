@@ -15,14 +15,14 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 284 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 291 passed | `cd core && python -m pytest -q` |
 | 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
 | 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
 | 前端单元测试 | 17 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `SourceLoom_0.3.1_x64-setup.exe`（约 138MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），打包后核心 MCP 握手约 1.6 秒 |
+| 桌面端安装包 | 完成 | `SourceLoom_0.3.2_x64-setup.exe`（约 138MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI），打包后核心 MCP 握手约 1.6 秒 |
 
 ## 二、已实现范围（M1）
 
@@ -526,3 +526,6 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
 4. 对话增强：更早轮次的记忆、引用跳转与对话导出。
 5. 预算与任务：按耗时/字符数计量、任务取消与优先级、低质量文本的二次解析器。
 6. 打包优化：按需下载 OCR 组件、安装体积与冷启动进一步压缩。
+7. 格式增强包（DLC，暂缓）：默认只解析通用文件格式；生信等专用格式（fai/bed/gff/vcf/paf 等）
+   以 `%SHIYUAN_HOME%\packs\<name>\pack.json` 形式声明 `扩展名 → 解析方式`，支持启停，
+   内核不内置、不执行包内代码。`.assembly` 这类流程中间产物不纳入。

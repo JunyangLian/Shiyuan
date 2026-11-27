@@ -32,7 +32,7 @@ def test_classify_key_categories(tmp_path):
     assert inventory.classify("photo.CR2")["content_policy"] == "metadata_only"
     assert inventory.classify("design.psd")["category"] == "design"
     assert inventory.classify("design.psd")["content_policy"] == "metadata_only"
-    assert inventory.classify("config.properties")["content_policy"] == "standard_parse"
+    assert inventory.classify("config.properties")["content_policy"] == "metadata_only"
     assert inventory.classify("tool.exe")["category"] == "software"
     assert inventory.classify("tool.exe")["content_policy"] == "metadata_only"
     assert inventory.classify("shot.png")["content_policy"] == "deep_parse"
@@ -41,6 +41,35 @@ def test_classify_key_categories(tmp_path):
     assert inventory.classify("~$lock.docx")["skip_reason"] == "non_knowledge_temp_file"
     assert inventory.classify("project/.metadata/settings.properties")["category"] == "ide_metadata"
     assert inventory.classify("project/.metadata/settings.properties")["content_policy"] == "exclude_content"
+
+
+def test_config_and_subtitle_default_to_metadata_only():
+    """工具配置与字幕属于非知识内容，默认不进正文索引。"""
+    assert inventory.classify("app.properties")["content_policy"] == "metadata_only"
+    assert inventory.classify("movie.ass")["content_policy"] == "metadata_only"
+
+
+def test_declared_parse_formats_are_really_parseable():
+    """声明「标准解析」的扩展名必须真的能被解析器处理，防止能力清单漂移。"""
+    from shiyuan import extractors, ocr
+
+    declared: set[str] = set()
+    for name in ("_DOCUMENT_EXT", "_SHEET_EXT", "_PRESENTATION_EXT",
+                 "_TEXT_EXT", "_CODE_EXT", "_EMAIL_EXT", "_CAD_EXT"):
+        declared |= getattr(inventory, name)
+    unsupported = sorted(
+        ext for ext in declared
+        if ext not in extractors.SUPPORTED_EXTS and ext not in ocr.OCR_EXTS)
+    assert unsupported == []
+
+
+def test_unknown_extension_is_metadata_only(tmp_path):
+    """未知后缀默认只登记不解析：支持哪些格式是显式契约，不做内容嗅探。"""
+    text_file = tmp_path / "JL1_groups.assembly"
+    text_file.write_text(">ptg000001l 1 12345678\n", encoding="utf-8")
+    info = inventory.classify(text_file, text_file.stat().st_size)
+    assert info["content_policy"] == "metadata_only"
+    assert info["skip_reason"] == "unknown_format"
 
 
 def test_non_knowledge_extensions_default_to_metadata_only():

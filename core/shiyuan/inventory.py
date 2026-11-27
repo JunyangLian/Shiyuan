@@ -65,13 +65,15 @@ _ARCHIVE_OTHER_EXT = {"tar", "gz", "bz2", "xz"}
 _NON_KNOWLEDGE_EXT = {
     "html", "htm", "css", "xml", "xsl", "xslt", "svg", "top", "json", "ipynb",
     "js", "jsx", "ts", "tsx", "log", "zip", "7z", "rar",
+    # 工具/项目配置与字幕：默认只登记，避免把 IDE、Tomcat、字幕塞进正文索引。
+    "properties", "ass",
 }
 
 _DOCUMENT_EXT = {"pdf", "doc", "docx", "odt", "rtf"}
 _SHEET_EXT = {"xls", "xlsx", "xlsm", "csv", "tsv", "ods"}
 _PRESENTATION_EXT = {"ppt", "pptx", "pptm", "odp"}
 _TEXT_EXT = {
-    "txt", "md", "markdown", "rst", "properties", "ass",
+    "txt", "md", "markdown", "rst",
     "ini", "cfg", "conf", "toml", "yaml", "yml",
 }
 _CODE_EXT = {

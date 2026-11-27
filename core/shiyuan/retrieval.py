@@ -59,6 +59,16 @@ def _file_ext(path: str) -> str:
     return name.rsplit(".", 1)[-1].lower() if "." in name else ""
 
 
+def hit_identifier_hits(hit_text: str, path: str, identifiers: list[str]) -> int:
+    """命中的标识符个数：正文或路径里出现都算。"""
+    if not identifiers:
+        return 0
+    lowered_text = (hit_text or "").lower()
+    lowered_path = (path or "").lower()
+    return sum(1 for token in identifiers
+               if token in lowered_text or token in lowered_path)
+
+
 def _strong_name_hit(path: str, analysis: dict) -> bool:
     """代码文件的豁免判定：文件名里出现 ≥4 字符的具体查询词。
 
@@ -224,6 +234,8 @@ class ChunkHit:
     maximal: int = 0
     # 命中的语义单元按词长加权后的总分（maximal 是个数，供覆盖率计算）。
     maximal_weight: int = 0
+    # 命中的查询标识符个数（JL1/hap1/Chr41），用于区分同主题的不同样本。
+    identifier_hits: int = 0
 
     @property
     def ocr(self) -> bool:
@@ -481,6 +493,7 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
                 path_index: dict[str, PathMatch] | None = None) -> list[ChunkHit]:
     analysis = analysis or query.analyze(text)
     variants: list[str] = analysis["variants"]
+    identifiers = query.query_identifiers(text)
     if not variants or (allowed_assets is not None and not allowed_assets):
         return []
 
@@ -628,6 +641,7 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
                        + _path_only_bonus(path_match, path_only),
             maximal=maximal_hit,
             maximal_weight=maximal_weight,
+            identifier_hits=hit_identifier_hits(text_value, row["path"], identifiers),
         ))
 
     seen = {hit.location_id for hit in hits}
@@ -675,6 +689,8 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
             mtime_ns=row["mtime_ns"] or 0,
             bbox=_parse_bbox(row["bbox"]),
             path_score=match.score + _path_only_bonus(match, path_only),
+            identifier_hits=hit_identifier_hits(
+                row["text"] or "", match.path, identifiers),
         ))
         added += 1
 
@@ -697,14 +713,17 @@ def find_chunks(conn: sqlite3.Connection, text: str, *, analysis: dict | None = 
     if path_only:
         # 位置问题只关心路径：正文里碰巧出现「结果」不该压过文件名命中。
         hits.sort(key=lambda hit: (
-            -(hit.focus * 120 + hit.maximal_weight + hit.path_score),
+            -(hit.focus * 120 + hit.maximal_weight
+              + hit.identifier_hits * query.IDENTIFIER_BONUS + hit.path_score),
             -hit.concepts,
             -hit.variants,
             -len(hit.text),
         ))
     else:
         hits.sort(key=lambda hit: (
-            -(hit.focus * 120 + hit.maximal_weight + min(hit.path_score, 300)),
+            -(hit.focus * 120 + hit.maximal_weight
+              + hit.identifier_hits * query.IDENTIFIER_BONUS
+              + min(hit.path_score, 300)),
             -hit.concepts,
             -hit.variants,
             -len(hit.text),
