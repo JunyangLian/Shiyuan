@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/JunyangLian/SourceLoom)](https://github.com/JunyangLian/SourceLoom/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/JunyangLian/SourceLoom/total)](https://github.com/JunyangLian/SourceLoom/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
-![Version](https://img.shields.io/badge/version-0.3.5-005E9B)
+![Version](https://img.shields.io/badge/version-0.3.6-005E9B)
 
 [下载安装包](https://github.com/JunyangLian/SourceLoom/releases/latest) · [产品需求](docs/PRD.md) · [项目知识空间](docs/PROJECTS.md) · [解析说明](docs/INGESTION.md) · [开发断点](docs/BREAKPOINT.md)
 
@@ -125,7 +125,7 @@
 
 ### 数据目录
 
-从 v0.3.5 起，安装版的数据**跟着安装位置走**，不再固定写到 `%LOCALAPPDATA%\ShiyuanData\`：
+从 v0.3.6 起，安装版的数据**跟着安装位置走**，不再固定写到 `%LOCALAPPDATA%\ShiyuanData\`：
 
 | 路径 | 内容 |
 | --- | --- |

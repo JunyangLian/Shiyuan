@@ -18,8 +18,13 @@ export async function pickDirectory(): Promise<string | null> {
 
 export async function openFile(path: string): Promise<void> {
   if (isTauri()) {
-    const { openPath } = await import("@tauri-apps/plugin-opener");
-    await openPath(path);
+    // 走 Rust 命令：默认关联打不开时回退到 Windows「打开方式」，不再静默失败。
+    const { invoke } = await import("@tauri-apps/api/core");
+    try {
+      await invoke("open_original", { path });
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : String(err));
+    }
     return;
   }
   await navigator.clipboard.writeText(path);

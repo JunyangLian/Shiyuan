@@ -50,13 +50,31 @@ fn api_token(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|err| format!("读取本地访问令牌失败：{err}"))
 }
 
+/// 用系统默认关联打开原件；关联缺失（例如 .md 指向已卸载的应用）时
+/// 交给 Windows「打开方式」，而不是静默失败。
+#[tauri::command]
+fn open_original(path: String) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    if !target.exists() {
+        return Err("文件不存在或已被移动".to_string());
+    }
+    match tauri_plugin_opener::open_path(&target, None::<&str>) {
+        Ok(()) => Ok(()),
+        Err(err) => std::process::Command::new("rundll32.exe")
+            .args(["shell32.dll,OpenAs_RunDLL", &path])
+            .spawn()
+            .map(|_| ())
+            .map_err(|_| format!("无法打开原件：{err}")),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![api_token])
+        .invoke_handler(tauri::generate_handler![api_token, open_original])
         .setup(|app| {
             // 调试模式下由开发者自行启动核心（npm run core），安装包运行时才托管核心进程；
             // 若已有核心在监听（例如上一进程残留），则直接复用，不重复拉起。
