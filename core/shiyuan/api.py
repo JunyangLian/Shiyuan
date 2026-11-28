@@ -1085,6 +1085,21 @@ def source_parse_results(source_id: str, status: str | None = None,
     )
 
 
+@app.get("/api/document/text")
+def document_text(location_id: str = Query(min_length=1),
+                  max_chars: int = indexer.PREVIEW_MAX_CHARS,
+                  conn: sqlite3.Connection = Depends(get_conn)) -> dict:
+    """解析结果预览：返回该文件已解析的正文（按页 / 工作表拼接，去掉分块重叠）。"""
+    try:
+        return indexer.location_text(
+            conn, location_id, max(1000, min(max_chars, 1_000_000)),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc.args[0])) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/jobs/{job_id}/retry")
 def retry_index_job(job_id: str, conn: sqlite3.Connection = Depends(get_conn)) -> dict:
     """单文件重试：只重跑这一条任务，不影响同数据源的其他文件。"""

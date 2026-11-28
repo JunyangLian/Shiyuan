@@ -920,6 +920,79 @@ def parse_results(conn: sqlite3.Connection, source_id: str, *,
     }
 
 
+PREVIEW_MAX_CHARS = 200_000
+
+
+def location_text(conn: sqlite3.Connection, location_id: str,
+                  max_chars: int = PREVIEW_MAX_CHARS) -> dict:
+    """读取单个文件的解析正文，供桌面端预览。
+
+    按页 / 工作表顺序拼接，并去掉相邻分块的重叠区，结果与原文基本一致。
+    """
+    row = conn.execute(
+        "SELECT l.location_id, l.asset_id, l.path, l.rel_path, l.ext, l.availability,"
+        " s.state AS source_state"
+        " FROM asset_locations l JOIN sources s ON s.source_id = l.source_id"
+        " WHERE l.location_id = ?",
+        (location_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError("未找到该文件")
+    if row["availability"] != "AVAILABLE":
+        raise ValueError(f"文件当前无法读取：{row['availability']}")
+    if row["source_state"] != "active":
+        raise ValueError("所属数据源已暂停，恢复后才能预览")
+
+    version = conn.execute(
+        "SELECT version_id FROM content_versions WHERE asset_id = ? AND is_current = 1"
+        " ORDER BY observed_at DESC LIMIT 1",
+        (row["asset_id"],),
+    ).fetchone()
+    if version is None:
+        raise KeyError("该文件还没有内容版本，请先扫描")
+    chunks = conn.execute(
+        "SELECT page, sheet, ordinal, text, char_start, char_end FROM chunks"
+        " WHERE version_id = ?"
+        " ORDER BY COALESCE(page, 0), COALESCE(sheet, ''), ordinal",
+        (version["version_id"],),
+    ).fetchall()
+    if not chunks:
+        raise KeyError("该文件还没有可预览的正文")
+
+    parts: list[str] = []
+    current: tuple[int | None, str | None] | None = None
+    prev_end = 0
+    for chunk in chunks:
+        key = (chunk["page"], chunk["sheet"])
+        text = chunk["text"] or ""
+        if key != current:
+            if current is not None:
+                label = f"第 {chunk['page']} 页" if chunk["page"] else (chunk["sheet"] or "")
+                if label:
+                    parts.append(f"\n\n—— {label} ——\n\n")
+            current = key
+            prev_end = 0
+        elif prev_end > chunk["char_start"]:
+            # 分块之间有 CHUNK_OVERLAP 字重叠，预览时只保留一份。
+            text = text[prev_end - chunk["char_start"]:]
+        if text:
+            parts.append(text)
+        prev_end = int(chunk["char_end"] or 0)
+
+    full = "".join(parts)
+    truncated = len(full) > max_chars
+    return {
+        "location_id": row["location_id"],
+        "name": Path(row["path"]).name,
+        "path": row["path"],
+        "rel_path": row["rel_path"],
+        "ext": (row["ext"] or "").lower(),
+        "chars": len(full),
+        "truncated": truncated,
+        "text": full[:max_chars] if truncated else full,
+    }
+
+
 def parse_progress(conn: sqlite3.Connection, source_id: str) -> dict:
     """数据源的深度解析进度：只统计文件数，供数据源卡片上的进度条使用。"""
     rows = conn.execute(

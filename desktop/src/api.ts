@@ -343,6 +343,17 @@ export interface ParseResults {
   generated_at: string;
 }
 
+export interface DocumentText {
+  location_id: string;
+  name: string;
+  path: string;
+  rel_path: string;
+  ext: string;
+  chars: number;
+  truncated: boolean;
+  text: string;
+}
+
 export interface ExternalTestResult {
   client_id: string;
   ok: boolean;
@@ -1151,6 +1162,13 @@ export const api = {
     return request<ParseResults>(
       `/api/sources/${sourceId}/parse-results?${params.toString()}`,
     );
+  },
+  documentText: (locationId: string, maxChars = 200_000) => {
+    const params = new URLSearchParams({
+      location_id: locationId,
+      max_chars: String(maxChars),
+    });
+    return request<DocumentText>(`/api/document/text?${params.toString()}`);
   },
   externalClients: (projectId?: string) =>
     request<{ items: ExternalClient[] }>(

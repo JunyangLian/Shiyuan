@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/JunyangLian/SourceLoom)](https://github.com/JunyangLian/SourceLoom/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/JunyangLian/SourceLoom/total)](https://github.com/JunyangLian/SourceLoom/releases)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
-![Version](https://img.shields.io/badge/version-0.3.3-005E9B)
+![Version](https://img.shields.io/badge/version-0.3.4-005E9B)
 
 [下载安装包](https://github.com/JunyangLian/SourceLoom/releases/latest) · [产品需求](docs/PRD.md) · [项目知识空间](docs/PROJECTS.md) · [解析说明](docs/INGESTION.md) · [开发断点](docs/BREAKPOINT.md)
 
@@ -51,6 +51,7 @@
 - 压缩包（ZIP/7Z/RAR）默认「仅登记」：只记录文件名、路径与大小，不解压；确有需要时可在盘点策略里
   改为标准解析（临时目录解压，限制条目数、单文件与总量）
 - 解析结果区分「待解析 / 仅登记 / 暂不支持」，策略性跳过不会显示成处理积压
+- 解析成功的文件可在应用内直接**预览正文**（按页 / 工作表拼接，去掉分块重叠），不依赖系统文件关联
 - OCR 双引擎：随包 PP-OCRv6 small（扫描 PDF，离线）与 Windows 本机 OCR（图片、混合版式 PDF、PPTX 位图），
   结果带页码与行坐标；无文本层的扫描件会被显式标记，而不是当成“内容为空”
 
@@ -122,7 +123,7 @@
 
 ### 数据目录
 
-从 v0.3.3 起，安装版的数据**跟着安装位置走**，不再固定写到 `%LOCALAPPDATA%\ShiyuanData\`：
+从 v0.3.4 起，安装版的数据**跟着安装位置走**，不再固定写到 `%LOCALAPPDATA%\ShiyuanData\`：
 
 | 路径 | 内容 |
 | --- | --- |
@@ -242,10 +243,10 @@ core/                 Knowledge Core（Python + FastAPI + SQLite）
   shiyuan/            scanner · watcher · ingest · extractors · ocr · indexer
                       projects · query · retrieval · families · rerank · answer · chat
                       external · mcp_server · inventory · maintenance · api
-  tests/              294 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 项目 / 外部接口 / 安全 / 基线）
+  tests/              295 项用例（扫描 / 监听 / 检索 / 问答 / OCR / 家族 / 召回 / 项目 / 外部接口 / 安全 / 基线）
   benchmarks/         目录级扫描基准
 desktop/              Tauri v2 + React + TypeScript
-  src/                项目（含外部接口）· 对话 · 数据 · 更新 四个模块
+  src/                数据 · 项目（含外部接口）· 对话 · 更新 四个模块
   src-tauri/          Rust 外壳（dialog / opener / shell）
 docs/                 PRD、项目知识空间、解析说明、开发断点
 ```
@@ -316,8 +317,8 @@ npm run tauri build
 ## 验证
 
 ```powershell
-cd core; python -m pytest -q          # 294 passed（另需 pip install pytest httpx）
-cd desktop; npm test                  # 17 passed（Vitest + jsdom）
+cd core; python -m pytest -q          # 295 passed（另需 pip install pytest httpx）
+cd desktop; npm test                  # 18 passed（Vitest + jsdom）
 cd desktop; npm run build             # tsc --noEmit + vite build
 cd desktop/src-tauri; cargo check     # 先设置 CARGO_TARGET_DIR
 ```

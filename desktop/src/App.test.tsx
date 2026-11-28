@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => ({
   externalClients: vi.fn(),
   inventoryFileTypes: vi.fn(),
   sourceParseResults: vi.fn(),
+  documentText: vi.fn(),
   updatesOverview: vi.fn(),
   checkUpdates: vi.fn(),
   rebuildFamilies: vi.fn(),
@@ -278,7 +279,7 @@ describe("页面整合", () => {
     const labels = [...container.querySelectorAll(".nav .nav-label")].map(
       (element) => element.textContent,
     );
-    expect(labels).toEqual(["项目", "对话", "数据", "更新"]);
+    expect(labels).toEqual(["数据", "项目", "对话", "更新"]);
   });
 
   it("项目页展示全局项目与项目内外部接口", async () => {
@@ -502,6 +503,59 @@ describe("页面整合", () => {
     expect(await screen.findByText("坏文档.docx")).toBeTruthy();
     expect(await screen.findByText("解析失败")).toBeTruthy();
     expect(await screen.findByText(/返回数据源/)).toBeTruthy();
+  });
+
+  it("解析结果可应用内预览正文，不依赖系统文件关联", async () => {
+    mocks.sources.mockResolvedValue({ items: [SOURCE_CARD] });
+    mocks.sourceParseResults.mockResolvedValue({
+      source_id: "src_1",
+      summary: { total: 1, parsed: 1, failed: 0, empty: 0, pending: 0, locked: 0, unsupported: 0 },
+      items: [
+        {
+          location_id: "loc_1",
+          version_id: "ver_1",
+          name: "报告.md",
+          path: "D:\\资料\\报告.md",
+          rel_path: "资料/报告.md",
+          ext: "md",
+          size: 10,
+          status: "ok",
+          stage: "L1",
+          chars: 12,
+          pages: 0,
+          quality: "good",
+          message: null,
+          error: null,
+          attempts: 0,
+          updated_at: "2026-11-22T10:00:00+08:00",
+        },
+      ],
+      total: 1,
+      limit: 100,
+      offset: 0,
+      generated_at: "2026-11-22T10:02:00+08:00",
+    });
+    mocks.documentText.mockResolvedValue({
+      location_id: "loc_1",
+      name: "报告.md",
+      path: "D:\\资料\\报告.md",
+      rel_path: "资料/报告.md",
+      ext: "md",
+      chars: 18,
+      truncated: false,
+      text: "# 报告\n\n样本量 42",
+    });
+    await renderApp();
+    fireEvent.click(screen.getByRole("button", { name: /^数据/ }));
+    await settle();
+
+    fireEvent.click(await screen.findByRole("button", { name: "解析结果" }));
+    fireEvent.click(await screen.findByRole("button", { name: "预览" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "报告.md 的正文预览" });
+    expect(within(dialog).getByText(/样本量 42/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("更新作为独立模块", async () => {

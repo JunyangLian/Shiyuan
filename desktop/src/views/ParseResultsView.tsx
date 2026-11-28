@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, formatTime } from "../api";
-import type { ParseResultStatus, ParseResults } from "../api";
+import type { DocumentText, ParseResultStatus, ParseResults, ParseResultItem } from "../api";
 import { openFile } from "../tauri";
 import type { InventorySource } from "./InventoryView";
 import Icon from "../Icon";
@@ -66,6 +66,11 @@ export default function ParseResultsView({
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<ParseResultItem | null>(null);
+  const [previewText, setPreviewText] = useState<DocumentText | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const previewToken = useRef(0);
 
   const load = useCallback(async (nextFilter: Filter) => {
     setLoading(true);
@@ -104,6 +109,33 @@ export default function ParseResultsView({
     } finally {
       setLoadingMore(false);
     }
+  };
+
+  const openPreview = async (item: ParseResultItem) => {
+    const token = previewToken.current + 1;
+    previewToken.current = token;
+    setPreview(item);
+    setPreviewText(null);
+    setPreviewError(null);
+    setPreviewLoading(true);
+    try {
+      const result = await api.documentText(item.location_id);
+      if (previewToken.current !== token) return;
+      setPreviewText(result);
+    } catch (err) {
+      if (previewToken.current !== token) return;
+      setPreviewError(err instanceof Error ? err.message : String(err));
+    } finally {
+      if (previewToken.current === token) setPreviewLoading(false);
+    }
+  };
+
+  const closePreview = () => {
+    previewToken.current += 1;
+    setPreview(null);
+    setPreviewText(null);
+    setPreviewError(null);
+    setPreviewLoading(false);
   };
 
   const summary = data?.summary;
@@ -223,12 +255,19 @@ export default function ParseResultsView({
                     </div>
                   )}
                 </div>
-                <button
-                  className="ghost small"
-                  onClick={() => void openFile(item.path)}
-                >
-                  打开
-                </button>
+                <div className="parse-item-actions">
+                  {item.status === "ok" && (
+                    <button className="ghost small" onClick={() => void openPreview(item)}>
+                      预览
+                    </button>
+                  )}
+                  <button
+                    className="ghost small"
+                    onClick={() => void openFile(item.path)}
+                  >
+                    打开
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
@@ -246,6 +285,45 @@ export default function ParseResultsView({
           </button>
         )}
       </section>
+
+      {preview && (
+        <div
+          className="family-modal-backdrop"
+          role="presentation"
+          onClick={closePreview}
+        >
+          <div
+            className="family-modal preview-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${preview.name} 的正文预览`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="family-modal-head">
+              <div>
+                <h3>{preview.name}</h3>
+                <p className="muted small-text">
+                  {previewText
+                    ? `${previewText.chars} 字${previewText.truncated ? "（已截断）" : ""} · `
+                    : ""}
+                  {preview.rel_path || preview.path}
+                </p>
+              </div>
+              <button className="ghost small" onClick={closePreview}>
+                关闭
+              </button>
+            </div>
+            {previewError && <div className="alert error">{previewError}</div>}
+            {previewLoading ? (
+              <p className="muted small-text family-modal-loading">正在读取正文…</p>
+            ) : previewText ? (
+              <pre className="preview-text">{previewText.text}</pre>
+            ) : (
+              <p className="muted small-text family-modal-loading">没有可预览的正文。</p>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

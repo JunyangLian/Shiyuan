@@ -424,6 +424,39 @@ def test_api_scan_indexes_content_before_finishing(client, tmp_path):
     assert hits["items"][0]["match"] == "content"
     assert client.get("/api/stats").json()["coverage"]["content_indexed"] == 1
 
+    item = client.get(f"/api/sources/{source_id}/parse-results").json()["items"][0]
+    preview = client.get("/api/document/text", params={"location_id": item["location_id"]})
+    assert preview.status_code == 200
+    assert "NovaSeq" in preview.json()["text"]
+    assert client.get(
+        "/api/document/text", params={"location_id": "missing"}).status_code == 404
+
+
+def test_location_text_previews_parsed_markdown(conn, tmp_path):
+    root = tmp_path / "资料"
+    root.mkdir()
+    body = "# 实验记录\n\n" + "样本量 42，重复三次；" * 120 + "\n"
+    (root / "实验记录.md").write_text(body, encoding="utf-8")
+    _scan_and_index(conn, root)
+    location = conn.execute("SELECT location_id FROM asset_locations").fetchone()
+
+    preview = indexer.location_text(conn, location["location_id"])
+
+    assert preview["name"] == "实验记录.md"
+    assert preview["ext"] == "md"
+    assert preview["text"].startswith("# 实验记录")
+    assert "样本量 42，重复三次；" in preview["text"]
+    assert preview["chars"] == len(preview["text"])
+    assert preview["truncated"] is False
+
+    cut = indexer.location_text(conn, location["location_id"], max_chars=50)
+    assert cut["truncated"] is True
+    assert len(cut["text"]) == 50
+
+    with pytest.raises(KeyError):
+        indexer.location_text(conn, "missing")
+
+
 def test_large_text_file_is_sampled_instead_of_failed(conn, tmp_path, monkeypatch):
     monkeypatch.setattr(extractors, "MAX_FILE_BYTES", 200)
     monkeypatch.setattr(extractors, "MAX_TEXT_SAMPLE_BYTES", 64)

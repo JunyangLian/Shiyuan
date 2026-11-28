@@ -12,9 +12,9 @@ type View = "chat" | "projects" | "library" | "health";
 const SIDEBAR_COLLAPSED_KEY = "shiyuan.sidebar.collapsed";
 
 const NAV: { key: View; label: string; hint: string; icon: IconName }[] = [
+  { key: "library", label: "数据", hint: "授权 · 同步", icon: "library" },
   { key: "projects", label: "项目", hint: "知识空间 · 外部接口", icon: "library" },
   { key: "chat", label: "对话", hint: "知识库问答", icon: "chat" },
-  { key: "library", label: "数据", hint: "授权 · 同步", icon: "library" },
   { key: "health", label: "更新", hint: "索引 · 覆盖", icon: "updates" },
 ];
 

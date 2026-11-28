@@ -2868,6 +2868,32 @@ button:disabled {
   padding: 18px 20px;
 }
 
+/* 解析结果正文预览：只读已解析文本，不依赖系统文件关联 */
+.preview-modal {
+  width: min(880px, 100%);
+}
+
+.preview-text {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 60vh;
+  margin: 0;
+  padding: 16px 20px 20px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+.parse-item-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
 .family-version-list {
   display: flex;
   flex-direction: column;
