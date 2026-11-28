@@ -17,9 +17,10 @@ from . import budget, db, extractors, ingest, inventory, knowledge, ocr, store
 
 # 解析器与切块策略的版本签名；改动提取逻辑或分块参数时必须同步升级。
 PARSER_SIGNATURE = (
-    "l1.v4:pdf=pymupdf+fallback,docx=python-docx+header+comment,"
+    "l1.v5:pdf=pymupdf+fallback,docx=python-docx+header+comment,"
     "pptx=python-pptx,xlsx=openpyxl+formula,office=libreoffice,"
-    "archive=zip/7z/rar,email=eml/msg,cad=dxf/dwg,av=metadata,chunk=800/100"
+    "archive=zip/7z/rar,email=eml/msg,cad=dxf/dwg,av=metadata,"
+    "table=markdown,chunk=800/100"
 )
 OCR_SIGNATURES = {
     "windows": f"l2.v2:windows-ocr:maxpages={ocr.MAX_PDF_PAGES}:mixed=pages",

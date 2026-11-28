@@ -182,22 +182,70 @@ def _paragraph_lines(paragraphs) -> list[str]:
     ]
 
 
+def _md_cell(value) -> str:
+    """单元格文本：压平换行与制表符，转义竖线，避免破坏 markdown 表格列。"""
+    text = " ".join(str(value or "").split())
+    return text.replace("|", "\\|")
+
+
+def _md_table(rows) -> list[str]:
+    """把二维单元格转成 GitHub 风格 markdown 表格：首行为表头，补分隔行与空列。"""
+    normalized = []
+    for row in rows:
+        cells: list[str] = []
+        for cell in row:
+            # 常见情况：整行带制表符的表格被粘进一个单元格，按制表符还原成多列。
+            cells.extend(str(cell or "").split("\t"))
+        cells = [_md_cell(cell) for cell in cells]
+        if any(cells):
+            normalized.append(cells)
+    if not normalized:
+        return []
+    width = max(len(row) for row in normalized)
+    normalized = [row + [""] * (width - len(row)) for row in normalized]
+    header, *body = normalized
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * width) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    return lines
+
+
 def _table_lines(tables) -> list[str]:
-    lines = []
+    """多个表格之间留空行，每个表格都带表头与分隔行，便于 md 渲染与预览。"""
+    lines: list[str] = []
     for table in tables:
-        for row in table.rows:
-            cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
-            if any(cells):
-                lines.append(" | ".join(cells))
+        block = _md_table([[cell.text for cell in row.cells] for row in table.rows])
+        if not block:
+            continue
+        if lines:
+            lines.append("")
+        lines.extend(block)
     return lines
 
 
 def _read_docx(path: Path) -> list[Section]:
     import docx
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
 
     document = docx.Document(str(path))
-    lines = [paragraph.text for paragraph in document.paragraphs]
-    lines.extend(_table_lines(document.tables))
+    # 按正文顺序读取段落与表格，避免把所有表格堆到文末、彼此首尾相接。
+    lines: list[str] = []
+    for child in document.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            text = Paragraph(child, document).text
+            if text.strip():
+                lines.append(text)
+        elif child.tag == qn("w:tbl"):
+            block = _table_lines([Table(child, document)])
+            if block:
+                if lines:
+                    lines.append("")
+                lines.extend(block)
+                lines.append("")
 
     for section in document.sections:
         for part in (section.header, section.footer):
@@ -238,16 +286,17 @@ def _read_pptx(path: Path) -> list[Section]:
     presentation = Presentation(str(path))
     sections = []
     for index, slide in enumerate(presentation.slides, start=1):
-        lines = []
+        # 每个形状自成一个块、块之间空行：表格不会被前后文字挤在一起。
+        blocks: list[str] = []
         for shape in slide.shapes:
-            for line in _shape_lines(shape):
-                if line not in lines:
-                    lines.append(line)
+            chunk = "\n".join(_shape_lines(shape)).strip()
+            if chunk and chunk not in blocks:
+                blocks.append(chunk)
         if slide.has_notes_slide:
             notes = (slide.notes_slide.notes_text_frame.text or "").strip()
             if notes:
-                lines.append(f"[备注] {notes.replace(chr(10), ' ')}")
-        sections.append(Section(text="\n".join(lines), page=index))
+                blocks.append(f"[备注] {notes.replace(chr(10), ' ')}")
+        sections.append(Section(text="\n\n".join(blocks), page=index))
     return sections
 
 
@@ -400,15 +449,15 @@ def _read_xls(path: Path) -> list[Section]:
         raise ExtractError(f"XLS 备用解析失败：{exc}") from exc
     sections = []
     for sheet in book.sheets():
-        lines = []
+        rows = []
         for row_index in range(sheet.nrows):
             cells = [
                 _cell_text(sheet.cell_value(row_index, col))
                 for col in range(sheet.ncols)
             ]
             if any(cells):
-                lines.append(" | ".join(cells))
-        sections.append(Section(text="\n".join(lines), sheet=sheet.name))
+                rows.append(cells)
+        sections.append(Section(text="\n".join(_md_table(rows)), sheet=sheet.name))
     return sections
 
 
@@ -1032,6 +1081,7 @@ def _read_sheet(path: Path) -> list[Section]:
                 lines = []
                 if sheet.title in protected:
                     lines.append("[工作表受保护，当前仅建立只读索引]")
+                rows = []
                 for row in sheet.iter_rows(values_only=True):
                     formula_row = next(formula_rows, ())
                     cells = []
@@ -1047,7 +1097,11 @@ def _read_sheet(path: Path) -> list[Section]:
                                 text = f"〔公式：{formula}〕"
                         cells.append(text)
                     if any(cells):
-                        lines.append(" | ".join(cells))
+                        rows.append(cells)
+                if rows:
+                    if lines:
+                        lines.append("")
+                    lines.extend(_md_table(rows))
                 sections.append(Section(text="\n".join(lines), sheet=sheet.title))
             return sections
         finally:

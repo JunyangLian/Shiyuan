@@ -121,6 +121,54 @@ def test_docx_paragraphs_and_tables_are_indexed(conn, tmp_path):
     assert hits["items"][0]["match"] == "content"
 
 
+def test_docx_tables_keep_markdown_format(conn, tmp_path):
+    import docx
+
+    root = tmp_path / "资料"
+    root.mkdir()
+    document = docx.Document()
+    document.add_paragraph("表格前后各有一段说明")
+    first = document.add_table(rows=2, cols=2)
+    first.cell(0, 0).text = "样本编号"
+    first.cell(0, 1).text = "测序深度"
+    first.cell(1, 0).text = "S001"
+    first.cell(1, 1).text = "30"
+    document.add_paragraph("第二张表：质控")
+    second = document.add_table(rows=2, cols=2)
+    second.cell(0, 0).text = "指标"
+    second.cell(0, 1).text = "数值"
+    second.cell(1, 0).text = "Q30"
+    second.cell(1, 1).text = "95%"
+    document.save(str(root / "表格报告.docx"))
+    _scan_and_index(conn, root)
+
+    text = conn.execute("SELECT text FROM chunks ORDER BY ordinal LIMIT 1").fetchone()[0]
+    assert "| 样本编号 | 测序深度 |" in text
+    assert "| --- | --- |" in text
+    assert "| S001 | 30 |" in text
+    # 表格保持正文顺序，两张表之间有空行与说明段，不会首尾相接
+    assert "| S001 | 30 |\n\n第二张表：质控\n\n| 指标 |" in text
+
+
+def test_xlsx_sheet_keeps_markdown_table(conn, tmp_path):
+    import openpyxl
+
+    root = tmp_path / "资料"
+    root.mkdir()
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "汇总"
+    sheet.append(["样本编号", "测序深度"])
+    sheet.append(["S001", 30])
+    workbook.save(str(root / "结果表.xlsx"))
+    _scan_and_index(conn, root)
+
+    text = conn.execute("SELECT text FROM chunks ORDER BY ordinal LIMIT 1").fetchone()[0]
+    assert "| 样本编号 | 测序深度 |" in text
+    assert "| --- | --- |" in text
+    assert "| S001 | 30 |" in text
+
+
 def test_docx_header_footer_and_comments_are_indexed(conn, tmp_path):
     import docx
 

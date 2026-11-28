@@ -15,14 +15,14 @@ PyInstaller sidecar 与 Tauri 安装包。
 | 项 | 状态 | 证据 |
 | --- | --- | --- |
 | PRD 落地 | 完成 | `docs/PRD.md`（v0.1 原文 + 表格化） |
-| Core 单元/集成测试 | 295 passed | `cd core && python -m pytest -q` |
+| Core 单元/集成测试 | 297 passed | `cd core && python -m pytest -q` |
 | 检索基线 | 140 题 R@1/R@5/MRR = 1.000 | `python -m pytest tests/test_retrieval_benchmark.py -q -s`（合成唯一标记语料） |
 | 扫描基线 | 2000 文件首次 2.12s，二次 0.56s | `python benchmarks/scan_benchmark.py --files 2000` |
 | 前端类型检查与构建 | 通过 | `cd desktop && npm run build` |
 | 前端单元测试 | 18 passed | `cd desktop && npm test`（Vitest + jsdom + Testing Library） |
 | Tauri 壳编译 | 通过 | `cd desktop/src-tauri && cargo check` / `cargo build`（需 `CARGO_TARGET_DIR` 指向 ASCII 路径，见 README） |
 | 桌面端启动 | 通过 | 安装版窗口显示「本地核心已就绪」，WebView2 经 Tauri `api_token` 命令取令牌后调用 `/api/health`、`/api/stats` |
-| 桌面端安装包 | 完成 | `SourceLoom_0.3.4_x64-setup.exe`（138.6MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI）；安装版数据目录为 `<安装根>\data`，静默安装后实测核心在该目录写令牌并启动，`SHIYUAN_HOME` 覆盖仍生效；包内 `/api/document/text` 已用真实 md（431 字）验证 |
+| 桌面端安装包 | 完成 | `SourceLoom_0.3.5_x64-setup.exe`（138.6MiB，onedir 核心随包分发，含项目知识空间、多格式解析、OCR 双引擎、MCP `--mcp`、API 令牌与 DPAPI）；安装版数据目录为 `<安装根>\data`；包内解析签名为 `l1.v5`（安装后 pending 自动升高即证明生效），`/api/document/text` 与表格 markdown 输出均已验证 |
 
 ## 二、已实现范围（M1）
 
@@ -88,7 +88,11 @@ SQLite WAL + 外键。表：`sources`、`assets`、`asset_locations`、`content_
   通过 `SHIYUAN_ODA_CONVERTER` 指定后自动转 DXF。
 - 音视频：mutagen 读取时长、码率、采样率、分辨率与常用标签，**不转写**；上限 2GB。
   支持 MP3/FLAC/WAV/M4A/AAC/OGG/OPUS/WMA/AIFF 与 MP4/MOV/WMV 等，其他容器显式报错。
-- 解析签名升级为 `l1.v4`，旧索引在下次「重建正文索引」或重新扫描时自动重解析。
+- 解析签名升级为 `l1.v5`：DOCX / PPTX / XLSX / XLS 的表格改为 GitHub 风格 markdown 表格
+  （首行表头 + `---` 分隔行、空列补齐、单元格内竖线转义与制表符还原成列）。
+  DOCX 改为按正文顺序输出段落与表格（不再把表格堆到文末、彼此首尾相接）；PPTX 每个形状
+  独立成块并用空行分隔。旧索引在下次「重建正文索引」或重新扫描时自动重解析
+  （`pending_rows` 以签名判断）。
 - 依赖新增：`pymupdf`、`python-pptx`、`xlrd`、`py7zr`、`rarfile`、`extract-msg`、`ezdxf`、`mutagen`。
 
 ### 本机安全与评测基线（2026-11-22）
